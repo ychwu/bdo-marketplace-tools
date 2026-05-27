@@ -1,3 +1,4 @@
 requests
 bitstring
 colorama
+keyring

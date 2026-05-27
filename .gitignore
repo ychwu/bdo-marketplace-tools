@@ -156,3 +156,4 @@ cython_debug/
 test.py
 response.py
 ping.py
+.codex-local-notes.md

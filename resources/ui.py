@@ -1,8 +1,13 @@
 import os
-from colorama import Fore, Back, Style
+from colorama import Fore, Style
 import asyncio
-import json
 import random
+from getpass import getpass
+from resources.credentials import (
+    CredentialStoreError,
+    load_credentials,
+    save_credentials,
+)
 
 class mainMenu():
     def __init__(self, task_manager, api_handler):
@@ -45,7 +50,7 @@ class mainMenu():
         }
         self.task_manager = task_manager
         self.api_handler = api_handler
-        self.loginMenu = loginMenu()
+        self.loginMenu = loginMenu(api_handler)
         self.choices = {
             "1": self.loginMenu.run,
             "2": self.task_manager.login,
@@ -93,17 +98,19 @@ class mainMenu():
     # Load credentials
     async def load_credentials(self):
         try:
-            with open('resources/info.json', 'r') as file:
-                data = json.load(file)
-                if data['email'] and data['password']:
-                    self.api_handler.email = data['email']
-                    self.api_handler.password = data['password']
-                    return ("Credential Status:    " + Fore.GREEN + "Set" + Style.RESET_ALL)
-                else:
-                    return ("Credential Status: " + Back.RED + "Not Set" + Style.RESET_ALL)
-        except FileNotFoundError:
-            return ("Credential Status:    " + Fore.RED + "Not Set" + Style.RESET_ALL)
-        except json.JSONDecodeError:
+            email, password = load_credentials()
+        except CredentialStoreError as exc:
+            return ("Credential Status:    " + Fore.RED + str(exc) + Style.RESET_ALL)
+
+        if email and password:
+            self.api_handler.email = email
+            self.api_handler.password = password
+            return ("Credential Status:    " + Fore.GREEN + "Set" + Style.RESET_ALL)
+        elif email:
+            self.api_handler.email = email
+            self.api_handler.password = None
+            return ("Credential Status:    " + Fore.RED + "Password Not Set" + Style.RESET_ALL)
+        else:
             return ("Credential Status:    " + Fore.RED + "Not Set" + Style.RESET_ALL)
 
 
@@ -124,7 +131,7 @@ class mainMenu():
 
 
 class loginMenu():
-    def __init__(self):
+    def __init__(self, api_handler):
         self.login_menu = {
             "1": "Set Email",
             "2": "Set Password",
@@ -136,6 +143,7 @@ class loginMenu():
             "3": self.back_to_main
         }
 
+        self.api_handler = api_handler
         self.email = None
         self.password = None
       
@@ -150,7 +158,6 @@ class loginMenu():
     async def run(self):
         while True:
             await self.display_menu()
-            await self.update_credentials()
             choice = await asyncio.to_thread(input, "Enter your choice: ")
             action = self.choices.get(choice)
             if action:
@@ -167,17 +174,28 @@ class loginMenu():
     async def get_email(self):
         email = await asyncio.to_thread(input, "Enter your email: ")
         self.email = email
+        self.api_handler.email = email
+        try:
+            save_credentials(email)
+        except CredentialStoreError as exc:
+            print(f"Unable to save email: {exc}")
     
     # Get the password from the user
     async def get_password(self):
-        password = await asyncio.to_thread(input, "Enter your password: ")
-        self.password = password
+        if not self.email:
+            self.email = self.api_handler.email
 
-    # Update the credentials
-    async def update_credentials(self):
-        with open('resources/info.json', 'w') as file:
-            if self.email and self.password:
-                json.dump({"email": self.email, "password": self.password}, file)
+        if not self.email:
+            print("Please set your email first.")
+            return
+
+        password = await asyncio.to_thread(getpass, "Enter your password: ")
+        self.password = password
+        self.api_handler.password = password
+        try:
+            save_credentials(self.email, password)
+        except CredentialStoreError as exc:
+            print(f"Unable to save password: {exc}")
 
 class backgroundTasks():
     def __init__(self, api_handler):
@@ -275,7 +293,7 @@ class backgroundTasks():
     # Login to the marketplace
     async def login(self):
         status = await self.api_handler.is_session_expired()
-        if status == 1:
+        if status == 0:
             print("Last session is still valid.")
             self.api_handler.login_status = True
             asyncio.create_task(self.login_status_checker())
