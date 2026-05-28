@@ -1,41 +1,67 @@
+# Marketplace Tools
+
 ![315768101-a578d909-45c4-4cb6-b385-7274a47d1659](https://github.com/Moo-ware/BDO-OutfitBot/assets/56319809/23157a97-7b80-4274-80c0-68b406f92ec2)
 
-## DISCLAIMER
-I mainly made this as a proof of concept, and it is for educational purposes only. Therefore, I am **NOT** responsible if you use it and get banned.
+## Disclaimer
 
-## **Supported Versions**
-WORKING AS OF 7/14/25. If you are having problems, please message me on Discord (see below)
+This project is a personal proof of concept for learning authenticated web sessions, HTTP requests, and marketplace-style API integration. Use it only in environments where automation is permitted by the relevant terms of service. The project does not handle CAPTCHA challenges or other access-control interruptions.
 
-Currently, Steam accounts and OTP enabled accounts are **NOT SUPPORTED**. Only launcher accounts with no OTP are supported. Steam is WIP.
+## Supported Versions
 
-## About the project
-Program I made for the game *Black Desert Online*, that will automatically and instantly buy any outfits listed on the central marketplace. I am still learning, so there probably will be plenty of bugs :)
+Last verified: July 14, 2025. If you are having problems, please message me on Discord (see below).
 
+Currently, Steam accounts and OTP-enabled accounts are not supported. Only launcher accounts without OTP are supported. Steam support is a work in progress.
 
-### How it works
-When enabled, the program will continuously check the outfit category for stock, with a preset delay. If a stock or stocks are detected, the program will automatically buy them for you.
+## About the Project
 
+Marketplace Tools is a Python command-line app for monitoring the *Black Desert Online* marketplace from an authenticated session. It demonstrates how to maintain a login session, inspect marketplace availability through HTTP requests, decode marketplace responses, and run a configurable long-lived monitor.
 
-For the buying to work, the program will need your login credentials to log in to the [official](https://na-trade.naeu.playblackdesert.com/Intro/) BDO web marketplace. Your credentials are then saved locally, and the program will auto-relogin for you if the login expires. This means that the program will work indefinitely (though not recommended) as long as you keep it running.
+The project began as a practical exercise in browser network analysis, request payload debugging, session persistence, and resilient CLI design.
+
+## How It Works
+
+When enabled, the CLI periodically checks outfit marketplace categories using a configurable delay. The default mode is watch-only, which reports availability without submitting purchase requests and can run without logging in. A separate buy mode can be enabled from settings and requires an authenticated session plus confirmation before the monitor starts.
+
+The CLI uses your login credentials to authenticate with the official [BDO web marketplace](https://na-trade.naeu.playblackdesert.com/Intro/). The email is stored locally, while the password is stored through the operating system keyring. The app can also persist and reuse marketplace sessions, then re-authenticate when a session expires.
+
+## Technical Highlights
+
+- Python async CLI with long-running background tasks.
+- Rich-powered terminal dashboard with structured status panels and event logging.
+- Authenticated HTTP session management with `requests`.
+- Marketplace response decoding using a Huffman decoder.
+- Configurable polling intervals.
+- Watch-only mode, buy mode, and spend caps.
+- Local session persistence and automatic re-login flow.
+- Local dashboard statistics for successful purchases and silver spent.
+- OS keyring integration for safer password storage.
 
 ## Known Issues
-If your IP reputation is low, you will encounter CAPTCHAs that the program currently will not bypass. If you are having issues logging in, this is most likely the issue. To confirm, try logging in manually on [BDO website](https://www.naeu.playblackdesert.com/en-US/Main/Index) and see if you get prompted by CAPTCHA.
 
-If you encounter `unexpected result code 34` when attempting to make a purchase, it is normal. It simply means that the outfit has gone out of stock, and it is trying to place a pre-order for it when you already have an existing pre-order.
+If your IP reputation is low, the official login flow may present a CAPTCHA. This project does not handle CAPTCHA challenges. To confirm whether that is the issue, try logging in manually on the [BDO website](https://www.naeu.playblackdesert.com/en-US/Main/Index).
 
-`unexpected result code -14` means price mismatch; it is trying to buy an outfit at a non-existent price. This error will appear either when PA raises the max price of outfits or when an outfit that hasn't reached its max price yet is listed. 
+If you encounter `unexpected result code 34` when attempting to make a purchase, it usually means the outfit went out of stock before the request completed, or the request would create a duplicate pre-order.
+
+`unexpected result code -14` means price mismatch. This can happen when Pearl Abyss changes max prices or when an item has not reached its max price yet.
+
+## Resume-Friendly Summary
+
+**Marketplace Tools | Python, HTTP Requests, REST APIs**
+
+- Built a Python CLI for authenticated marketplace monitoring using HTTP requests, configurable polling intervals, safety limits, and long-running background tasks.
+- Analyzed browser network traffic to identify API endpoints, request payloads, response formats, and authentication/session patterns.
+- Implemented session persistence, automatic re-authentication, compressed response decoding, terminal dashboards, event logging, and safer local credential handling through the OS keyring.
 
 ## Credits
-decoder.py is by [shrddr](https://github.com/shrddr/huffman_heap)
 
-## Contact me
-For questions or bug reports, please message me on Discord: `._.__.__._._.__._____.__._.___.` (Yes this is the username)
+`decoder.py` is based on work by [shrddr](https://github.com/shrddr/huffman_heap).
 
-## WIP / TODO ##
-- Better security
-- Steam account compatibility
-- Spending limit
-- Better UI
+## Contact Me
 
+For questions or bug reports, please message me on Discord: `._.__.__._._.__._____.__._.___.`
 
+## WIP / TODO
 
+- Steam account compatibility.
+- Request timeouts and stronger exception handling.
+- More configurable marketplace categories.

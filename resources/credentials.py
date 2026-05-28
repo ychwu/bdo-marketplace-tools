@@ -3,11 +3,14 @@ from pathlib import Path
 
 try:
     import keyring
-    from keyring.errors import KeyringError
+    from keyring.errors import KeyringError, PasswordDeleteError
 except ImportError:  # pragma: no cover - exercised only when dependency is missing
     keyring = None
 
     class KeyringError(Exception):
+        pass
+
+    class PasswordDeleteError(Exception):
         pass
 
 
@@ -78,3 +81,18 @@ def save_credentials(email, password=None):
         keyring.set_password(SERVICE_NAME, email, password)
     except KeyringError as exc:
         raise CredentialStoreError("OS keyring is unavailable") from exc
+
+
+def clear_credentials():
+    data = _read_info()
+    email = data.get("email")
+
+    if email and keyring is not None:
+        try:
+            keyring.delete_password(SERVICE_NAME, email)
+        except PasswordDeleteError:
+            pass
+        except KeyringError as exc:
+            raise CredentialStoreError("OS keyring is unavailable") from exc
+
+    _write_info({})

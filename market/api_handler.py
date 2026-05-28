@@ -1,222 +1,510 @@
-import requests
-import os
-import pickle
 import asyncio
+import json
+import pickle
 import random
+from pathlib import Path
+
+import requests
+
 from market.decoder import unpack
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SESSION_COOKIE_PATH = PROJECT_ROOT / "resources" / "session.json"
+LEGACY_SESSION_PATHS = (
+    PROJECT_ROOT / "resources" / "session.pkl",
+    PROJECT_ROOT / "session.pkl",
+)
+REQUEST_TIMEOUT = (5, 20)
+
+
+class MarketplaceAPIError(RuntimeError):
+    pass
+
+
+class MarketplaceNetworkError(MarketplaceAPIError):
+    pass
+
+
+class MarketplaceResponseError(MarketplaceAPIError):
+    pass
+
+
+PURCHASE_RESULT_REASONS = {
+    34: "item was unavailable or would create a duplicate pre-order",
+    -14: "price mismatch",
+    2000: "login session expired",
+}
+
+
+def purchase_result_message(result_code, item_id, price):
+    if result_code == 0:
+        return f"Purchase request succeeded for {item_id} at {price} silver."
+
+    reason = PURCHASE_RESULT_REASONS.get(result_code)
+    if reason:
+        return f"Purchase failed for {item_id} at {price} silver: {reason}."
+    return f"Purchase failed for {item_id} at {price} silver: resultCode {result_code}."
 
 
 class APIHandler:
     def __init__(self):
-        self.trade_url = 'https://na-trade.naeu.playblackdesert.com'
-        self.login_url = 'https://account.pearlabyss.com/en-US/Member/Login/LoginProcess'
+        self.trade_url = "https://na-trade.naeu.playblackdesert.com"
+        self.login_url = "https://account.pearlabyss.com/en-US/Member/Login/LoginProcess"
         self.session = requests.Session()
         self.login_status = False
         self.email = None
         self.password = None
+        self._session_lock = asyncio.Lock()
 
-        if self.load_session() == -1:
-            print("Session file not found. Please login.")
+        self.load_session()
+
+    async def _request(self, client, method, url, context, **kwargs):
+        request_kwargs = dict(kwargs)
+        request_kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+
+        def send_request():
+            try:
+                response = client.request(method, url, **request_kwargs)
+                response.raise_for_status()
+                return response
+            except requests.Timeout as exc:
+                raise MarketplaceNetworkError(f"{context} timed out") from exc
+            except requests.RequestException as exc:
+                raise MarketplaceNetworkError(f"{context} failed: {exc}") from exc
+
+        return await asyncio.to_thread(send_request)
+
+    async def _session_request(self, method, url, context, **kwargs):
+        async with self._session_lock:
+            return await self._request(self.session, method, url, context, **kwargs)
+
+    def _json_response(self, response, context):
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise MarketplaceResponseError(f"{context} returned invalid JSON") from exc
+
+        if not isinstance(data, dict):
+            raise MarketplaceResponseError(f"{context} returned an unexpected JSON shape")
+        return data
+
+    def _extract_cookie_dict(self, response=None):
+        cookies = {}
+        cookies.update(self.session.cookies.get_dict())
+
+        if response is not None:
+            request_cookies = getattr(response.request, "_cookies", None)
+            if request_cookies is not None:
+                cookies.update(request_cookies.get_dict())
+            cookies.update(response.cookies.get_dict())
+
+        return cookies
 
     async def check_stock(self):
-        # This function will check the stock of all items in the marketplace, and return a list of item_ID that are in stock.
-        url = 'https://na-trade.naeu.playblackdesert.com/Trademarket/GetWorldMarketList'
+        url = "https://na-trade.naeu.playblackdesert.com/Trademarket/GetWorldMarketList"
         headers = {
-        "Content-Type": "application/json",
-        "User-Agent": "BlackDesert"
+            "Content-Type": "application/json",
+            "User-Agent": "BlackDesert",
         }
-        payload_Male = {
-        "keyType": 0,
-        "mainCategory": 55,
-        "subCategory": 1
+        payload_male = {
+            "keyType": 0,
+            "mainCategory": 55,
+            "subCategory": 1,
         }
-        payload_Female = {
-        "keyType": 0,
-        "mainCategory": 55,
-        "subCategory": 2
+        payload_female = {
+            "keyType": 0,
+            "mainCategory": 55,
+            "subCategory": 2,
         }
-        buyList = []
 
-        response_Male = requests.request('POST', url, json=payload_Male, headers=headers)
-        response_Female = requests.request('POST', url, json=payload_Female, headers=headers)
+        response_male, response_female = await asyncio.gather(
+            self._request(
+                requests,
+                "POST",
+                url,
+                "male outfit stock check",
+                json=payload_male,
+                headers=headers,
+            ),
+            self._request(
+                requests,
+                "POST",
+                url,
+                "female outfit stock check",
+                json=payload_female,
+                headers=headers,
+            ),
+        )
 
-        for i in unpack(response_Male.content).split('|')[:-1]:
-            j = i.split('-')
-            if j[1] != '0':      # if item is in stock
-                buyList.append([j[0], j[1], j[3]])
+        return (
+            self._parse_world_market_response(response_male.content, "male outfit stock")
+            + self._parse_world_market_response(response_female.content, "female outfit stock")
+        )
 
-        for i in unpack(response_Female.content).split('|')[:-1]:
-            j = i.split('-')
-            if j[1] != '0':      # if item is in stock
-                buyList.append([j[0], j[1], j[3]])
+    def _parse_world_market_response(self, content, context):
+        try:
+            decoded = unpack(content)
+        except Exception as exc:
+            raise MarketplaceResponseError(f"{context} response could not be decoded") from exc
 
-        return buyList
-    
+        buy_list = []
+        for row in decoded.split("|"):
+            if not row:
+                continue
+
+            parts = row.split("-")
+            if len(parts) <= 3:
+                raise MarketplaceResponseError(f"{context} row had an unexpected shape: {row}")
+
+            item_id, stock, price = parts[0], parts[1], parts[3]
+            try:
+                stock_count = int(stock)
+            except ValueError as exc:
+                raise MarketplaceResponseError(f"{context} row had invalid stock: {row}") from exc
+
+            if stock_count > 0:
+                buy_list.append([item_id, str(stock_count), price])
+
+        return buy_list
+
     async def check_stock_test(self):
-        # THIS IS A TESTING FUNCTION ONLY
         headers = {
-        "Content-Type": "application/json",
-        "User-Agent": "BlackDesert"
+            "Content-Type": "application/json",
+            "User-Agent": "BlackDesert",
         }
-        
-        url = 'https://na-trade.naeu.playblackdesert.com/Trademarket/GetWorldMarketSubList'
-        
-        payload={
+        url = "https://na-trade.naeu.playblackdesert.com/Trademarket/GetWorldMarketSubList"
+        payload = {
             "keyType": "0",
-            "mainKey": "13771"
+            "mainKey": "13771",
         }
-        
-        response = requests.request('POST', url, json=payload, headers=headers)
 
-        response_split = response.json()['resultMsg'].split('-')
-        
-        buyList = []
-        if response_split[4] != '0':
-            buyList.append([response_split[0], response_split[4], '25200'])
+        response = await self._request(
+            requests,
+            "POST",
+            url,
+            "test stock check",
+            json=payload,
+            headers=headers,
+        )
+        response_json = self._json_response(response, "test stock check")
+        result_msg = response_json.get("resultMsg")
+        if not isinstance(result_msg, str):
+            raise MarketplaceResponseError("test stock check response did not include resultMsg")
 
-        return buyList
+        response_split = result_msg.split("-")
+        if len(response_split) <= 4:
+            raise MarketplaceResponseError("test stock check resultMsg had an unexpected shape")
 
+        buy_list = []
+        if response_split[4] != "0":
+            buy_list.append([response_split[0], response_split[4], "25200"])
+
+        return buy_list
 
     async def login(self):
-        # This function will attempt to log in to the marketplace using the provided email and password.
-        # Get the PA-STATE cookie from the login page, which is needed for the login payload.
-        self.session = requests.Session()
+        new_session = requests.Session()
         headers_pastate = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
             "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Accept-Language": "en-US,en;q=0.9"
-        }
-        response_loginPage = self.session.get(self.trade_url, headers=headers_pastate)
-        loginPage = response_loginPage.request._cookies.get_dict()
-        pastate = loginPage['PA-STATE']
-
-        # Create the login payload using the PA-STATE
-        login_payload = {
-            "hdAccountUrl": "https://account.pearlabyss.com",
-            "_isLinkingLogin": "false",
-            "_returnUrl": f"https://account.pearlabyss.com/en-US/Member/Login/AuthorizeOauth?response_type=code&scope=profile&state={pastate}&client_id=client_id&redirect_uri=https://na-trade.naeu.playblackdesert.com/Pearlabyss/Oauth2CallBack",
-            "_joinType": 1,
-            "_email": self.email,
-            "_password": self.password,
-            "_isIpCheck": "false"
-        }
-
-        headers_login = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Origin": "https://account.pearlabyss.com"
         }
 
-        response_login = self.session.post(url=self.login_url, data=login_payload, headers=headers_login)
-        login_cookie = response_login.request._cookies.get_dict()
+        async with self._session_lock:
+            response_login_page = await self._request(
+                new_session,
+                "GET",
+                self.trade_url,
+                "login page request",
+                headers=headers_pastate,
+            )
+            self.session = new_session
+            login_page_cookies = self._extract_cookie_dict(response_login_page)
+            pastate = login_page_cookies.get("PA-STATE")
+            if not pastate:
+                raise MarketplaceResponseError("login page did not provide PA-STATE")
 
+            login_payload = {
+                "hdAccountUrl": "https://account.pearlabyss.com",
+                "_isLinkingLogin": "false",
+                "_returnUrl": f"https://account.pearlabyss.com/en-US/Member/Login/AuthorizeOauth?response_type=code&scope=profile&state={pastate}&client_id=client_id&redirect_uri=https://na-trade.naeu.playblackdesert.com/Pearlabyss/Oauth2CallBack",
+                "_joinType": 1,
+                "_email": self.email,
+                "_password": self.password,
+                "_isIpCheck": "false",
+            }
 
-        # Check if the login was successful by checking the cookies set by the server
-        if 'TradeAuth_Session' in login_cookie and '__RequestVerificationToken' in login_cookie:
-            return 1 # Login successful
-        else:
-            return 0 # Login failed
+            headers_login = {
+                "User-Agent": headers_pastate["User-Agent"],
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": headers_pastate["Accept"],
+                "Accept-Language": headers_pastate["Accept-Language"],
+                "Origin": "https://account.pearlabyss.com",
+            }
+
+            response_login = await self._request(
+                self.session,
+                "POST",
+                self.login_url,
+                "login request",
+                data=login_payload,
+                headers=headers_login,
+            )
+            login_cookies = self._extract_cookie_dict(response_login)
+
+        if "TradeAuth_Session" in login_cookies and "__RequestVerificationToken" in login_cookies:
+            self.login_status = True
+            return 1
+
+        self.login_status = False
+        return 0
+
+    async def ensure_session_valid(self):
+        status = await self.is_session_expired()
+        if status == 0:
+            self.login_status = True
+            return True
+
+        self.login_status = False
+        if not self.email or not self.password:
+            return False
+
+        if await self.login() == 1:
+            self.login_status = True
+            self.save_session()
+            return True
+
+        self.login_status = False
+        return False
 
     async def buy_item(self, buyList):
-        # This function will buy the items in the buyList.
-        # buyList is of format [(item_id, stock, price), ...]
-        
-        url = 'https://na-game-trade.naeu.playblackdesert.com/GameTradeMarket/BuyItem'
+        url = "https://na-game-trade.naeu.playblackdesert.com/GameTradeMarket/BuyItem"
         headers = {
             "Accept": "*/*",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
             "Accept-Language": "en-US,en;q=0.9,ko;q=0.8,zh-CN;q=0.7,zh;q=0.6",
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         }
-        
+
+        summary = {
+            "attempted": 0,
+            "purchased": 0,
+            "events": [],
+            "purchase_records": [],
+            "results": [],
+        }
+
+        try:
+            session_valid = await self.ensure_session_valid()
+        except MarketplaceAPIError as exc:
+            summary["events"].append({"level": "error", "message": f"Purchase aborted: {exc}"})
+            return summary
+
+        if not session_valid:
+            summary["events"].append(
+                {
+                    "level": "error",
+                    "message": "Purchase aborted: login session is invalid and re-authentication failed.",
+                }
+            )
+            return summary
 
         for item in buyList:
-            i = 0
-            while i < int(item[1]):
+            item_id, stock, price = item[0], item[1], item[2]
+            try:
+                stock_count = int(stock)
+            except ValueError as exc:
+                raise MarketplaceResponseError(f"purchase row had invalid stock: {item}") from exc
+
+            for _ in range(stock_count):
                 payload = {
-                    "buyMainKey": item[0],
+                    "buyMainKey": item_id,
                     "buySubKey": "0",
                     "buyKeyType": "0",
                     "isWaitItem": "false",
                     "otp": "",
                     "retryBiddingNo": "",
-                    "buyPrice": item[2],
+                    "buyPrice": price,
                     "buyCount": "1",
-                    "buyChooseKey" : "0"
+                    "buyChooseKey": "0",
                 }
-                response = self.session.post(url, headers=headers, data=payload)
-                response_json = response.json()
+                summary["attempted"] += 1
+                response = await self._session_request(
+                    "POST",
+                    url,
+                    "purchase request",
+                    headers=headers,
+                    data=payload,
+                )
+                response_json = self._json_response(response, "purchase request")
+                result_code = self._purchase_result_code(response_json)
 
-                if response_json['resultCode'] == 0:
-                    print(f"Bought {item[0]} for {item[2]} silver.")
-                    i += 1
-                elif response_json['resultCode'] == 2000:
-                    print("Login session expired. Attempting to login again...")
-                    success = await self.login()
-                    if success == 1:
-                        print("Re-login successful.")
+                result_record = {
+                    "item_id": item_id,
+                    "price": int(price),
+                    "count": 1,
+                    "result_code": result_code,
+                    "response": response_json,
+                }
+                summary["results"].append(result_record)
+
+                if result_code == 0:
+                    summary["purchased"] += 1
+                    purchase_record = {
+                        "item_id": item_id,
+                        "price": int(price),
+                        "count": 1,
+                        "result_code": result_code,
+                    }
+                    summary["purchase_records"].append(purchase_record)
+                    summary["events"].append(
+                        {
+                            "level": "success",
+                            "message": purchase_result_message(result_code, item_id, price),
+                        }
+                    )
+                    await asyncio.sleep(random.uniform(1, 2.5))
+                    continue
+
+                if result_code == 2000:
+                    summary["events"].append(
+                        {"level": "warning", "message": "Login session expired. Attempting to re-authenticate."}
+                    )
+                    try:
+                        reauthenticated = await self.ensure_session_valid()
+                    except MarketplaceAPIError as exc:
+                        summary["events"].append({"level": "error", "message": f"Re-authentication failed: {exc}"})
+                        return summary
+
+                    if reauthenticated:
+                        summary["events"].append({"level": "success", "message": "Re-authentication succeeded."})
                         continue
-                    else:
-                        print("Re-login failed.")
-                        break
-                else:
-                    print(f"Unexpected resultCode: {response_json} when trying to buy {item[0]} for {item[2]} silver.")
-                    break  # Break from the while loop if unexpected resultCode
 
-                await asyncio.sleep(random.uniform(1, 2.5))  # Sleep for 1 - 2.5 second between each buy to avoid looking suspicious.
+                    summary["events"].append({"level": "error", "message": "Re-authentication failed."})
+                    return summary
 
+                summary["events"].append(
+                    {
+                        "level": "warning",
+                        "message": purchase_result_message(result_code, item_id, price),
+                    }
+                )
+                break
+
+        return summary
+
+    def _purchase_result_code(self, response_json):
+        if "resultCode" not in response_json:
+            raise MarketplaceResponseError("purchase response did not include resultCode")
+        try:
+            return int(response_json["resultCode"])
+        except (TypeError, ValueError) as exc:
+            raise MarketplaceResponseError("purchase response had an invalid resultCode") from exc
 
     async def is_session_expired(self):
-        # This function will check if the session is expired, by using the AppSessionRefresh endpoint.
-        # If the session is not expired, _resultCode will be 0, else it will be -1.
+        if not self.session.cookies:
+            return -1
 
-        url = 'https://na-trade.naeu.playblackdesert.com/Home/AppSessionRefresh'
+        url = "https://na-trade.naeu.playblackdesert.com/Home/AppSessionRefresh"
         headers = {
             "Accept": "*/*",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
             "Accept-Language": "en-US,en;q=0.9",
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "Origin": "https://na-trade.naeu.playblackdesert.com",
             "Referer": "https://na-trade.naeu.playblackdesert.com/Home/list/hot",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         }
-        
-        response = self.session.post(url, headers=headers)
-        status_code = response.json()['_resultCode']
 
-        if status_code == 0:
-            return 0   # session is not expired
-        else:    
-            return -1   # session is expired
+        response = await self._session_request("POST", url, "session refresh", headers=headers)
+        response_json = self._json_response(response, "session refresh")
+        if "_resultCode" not in response_json:
+            raise MarketplaceResponseError("session refresh response did not include _resultCode")
 
+        return 0 if response_json["_resultCode"] == 0 else -1
 
     def save_session(self):
-        # This function will save the current session to a file, so that we can load it later.
+        SESSION_COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "cookies": self._serialize_cookies(),
+        }
+        with SESSION_COOKIE_PATH.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2)
+            file.write("\n")
 
-        with open('session.pkl', 'wb') as f:
-            pickle.dump(self.session, f)
-    
-    
+    def _serialize_cookies(self):
+        cookies = []
+        for cookie in self.session.cookies:
+            cookies.append(
+                {
+                    "name": cookie.name,
+                    "value": cookie.value,
+                    "domain": cookie.domain,
+                    "path": cookie.path,
+                    "secure": cookie.secure,
+                    "expires": cookie.expires,
+                }
+            )
+        return cookies
+
     def load_session(self):
-        # This function will load the session from a file, so that we can use it later.
-        try:
-            with open('session.pkl', 'rb') as f:
-                self.session = pickle.load(f)
-            return 0
-        except FileNotFoundError:   # if the file does not exist
-            return -1
-    
+        self.session = requests.Session()
+        if SESSION_COOKIE_PATH.exists():
+            try:
+                with SESSION_COOKIE_PATH.open("r", encoding="utf-8-sig") as file:
+                    payload = json.load(file)
+                self._load_cookies(payload.get("cookies", []))
+                return 0
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
 
-    # Testing only
+        for legacy_path in LEGACY_SESSION_PATHS:
+            if not legacy_path.exists():
+                continue
+            try:
+                with legacy_path.open("rb") as file:
+                    legacy_session = pickle.load(file)
+                if isinstance(legacy_session, requests.Session):
+                    self.session = legacy_session
+                    self.save_session()
+                    return 0
+            except Exception:
+                return -1
+
+        return -1
+
+    def _load_cookies(self, cookies):
+        jar = requests.cookies.RequestsCookieJar()
+        for cookie in cookies:
+            name = cookie.get("name")
+            value = cookie.get("value")
+            if not name or value is None:
+                continue
+
+            kwargs = {
+                "name": name,
+                "value": value,
+                "path": cookie.get("path") or "/",
+                "secure": bool(cookie.get("secure")),
+            }
+            if cookie.get("domain"):
+                kwargs["domain"] = cookie["domain"]
+            if cookie.get("expires"):
+                kwargs["expires"] = cookie["expires"]
+
+            jar.set_cookie(requests.cookies.create_cookie(**kwargs))
+
+        self.session.cookies.update(jar)
+
     async def get_mp_inventory(self):
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
         }
-        response = self.session.post(url='https://na-trade.naeu.playblackdesert.com/Home/GetMyWalletList', headers=headers)
-        return response.json()
+        response = await self._session_request(
+            "POST",
+            "https://na-trade.naeu.playblackdesert.com/Home/GetMyWalletList",
+            "marketplace wallet lookup",
+            headers=headers,
+        )
+        return self._json_response(response, "marketplace wallet lookup")
