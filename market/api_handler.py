@@ -168,40 +168,6 @@ class APIHandler:
 
         return buy_list
 
-    async def check_stock_test(self):
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "BlackDesert",
-        }
-        url = "https://na-trade.naeu.playblackdesert.com/Trademarket/GetWorldMarketSubList"
-        payload = {
-            "keyType": "0",
-            "mainKey": "13771",
-        }
-
-        response = await self._request(
-            requests,
-            "POST",
-            url,
-            "test stock check",
-            json=payload,
-            headers=headers,
-        )
-        response_json = self._json_response(response, "test stock check")
-        result_msg = response_json.get("resultMsg")
-        if not isinstance(result_msg, str):
-            raise MarketplaceResponseError("test stock check response did not include resultMsg")
-
-        response_split = result_msg.split("-")
-        if len(response_split) <= 4:
-            raise MarketplaceResponseError("test stock check resultMsg had an unexpected shape")
-
-        buy_list = []
-        if response_split[4] != "0":
-            buy_list.append([response_split[0], response_split[4], "25200"])
-
-        return buy_list
-
     async def login(self):
         new_session = requests.Session()
         headers_pastate = {
@@ -278,7 +244,7 @@ class APIHandler:
         self.login_status = False
         return False
 
-    async def buy_item(self, buyList):
+    async def buy_item(self, buy_list):
         url = "https://na-game-trade.naeu.playblackdesert.com/GameTradeMarket/BuyItem"
         headers = {
             "Accept": "*/*",
@@ -310,7 +276,7 @@ class APIHandler:
             )
             return summary
 
-        for item in buyList:
+        for item in buy_list:
             item_id, stock, price = item[0], item[1], item[2]
             try:
                 stock_count = int(stock)

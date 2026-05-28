@@ -14,20 +14,31 @@ Currently, Steam accounts and OTP-enabled accounts are not supported. Only launc
 
 ## About the Project
 
-Marketplace Tools is a Python command-line app for monitoring the *Black Desert Online* marketplace from an authenticated session. It demonstrates how to maintain a login session, inspect marketplace availability through HTTP requests, decode marketplace responses, and run a configurable long-lived monitor.
+Marketplace Tools is a Python terminal app for monitoring the *Black Desert Online* marketplace from an authenticated session. It demonstrates how to maintain a login session, inspect marketplace availability through HTTP requests, decode marketplace responses, and run a configurable long-lived monitor.
 
-The project began as a practical exercise in browser network analysis, request payload debugging, session persistence, and resilient CLI design.
+The project began as a practical exercise in browser network analysis, request payload debugging, session persistence, and resilient terminal-app design.
 
 ## How It Works
 
-When enabled, the CLI periodically checks outfit marketplace categories using a configurable delay. The default mode is watch-only, which reports availability without submitting purchase requests and can run without logging in. A separate buy mode can be enabled from settings and requires an authenticated session plus confirmation before the monitor starts.
+When enabled, the app periodically checks outfit marketplace categories using a configurable delay. The default mode is watch-only, which reports availability without submitting purchase requests and can run without logging in. A separate buy mode can be enabled from settings and requires an authenticated session plus confirmation before the monitor starts.
 
-The CLI uses your login credentials to authenticate with the official [BDO web marketplace](https://na-trade.naeu.playblackdesert.com/Intro/). The email is stored locally, while the password is stored through the operating system keyring. The app can also persist and reuse marketplace sessions, then re-authenticate when a session expires.
+The app uses your login credentials to authenticate with the official [BDO web marketplace](https://na-trade.naeu.playblackdesert.com/Intro/). The email is stored locally, while the password is stored through the operating system keyring. The app can also persist and reuse marketplace sessions, then re-authenticate when a session expires.
+
+## Launch Modes
+
+Default launch mode checks the saved marketplace session on startup. For UI work or local testing where you do not want that startup API call, launch with test mode:
+
+```powershell
+run.bat --test-mode
+py -3 main.py --test-mode
+```
+
+You can also set `BDO_MARKET_TEST_MODE=1`. Test mode skips only the automatic startup session check; explicit actions such as Login / Refresh, wallet refresh, or starting the monitor can still call live marketplace endpoints.
 
 ## Technical Highlights
 
-- Python async CLI with long-running background tasks.
-- Rich-powered terminal dashboard with structured status panels and event logging.
+- Python async terminal app with long-running background tasks.
+- Textual-powered terminal UI with live status widgets, sidebar navigation, and event logging.
 - Authenticated HTTP session management with `requests`.
 - Marketplace response decoding using a Huffman decoder.
 - Configurable polling intervals.
@@ -48,9 +59,9 @@ If you encounter `unexpected result code 34` when attempting to make a purchase,
 
 **Marketplace Tools | Python, HTTP Requests, REST APIs**
 
-- Built a Python CLI for authenticated marketplace monitoring using HTTP requests, configurable polling intervals, safety limits, and long-running background tasks.
+- Built a Python terminal app for authenticated marketplace monitoring using HTTP requests, configurable polling intervals, safety limits, and long-running background tasks.
 - Analyzed browser network traffic to identify API endpoints, request payloads, response formats, and authentication/session patterns.
-- Implemented session persistence, automatic re-authentication, compressed response decoding, terminal dashboards, event logging, and safer local credential handling through the OS keyring.
+- Implemented session persistence, automatic re-authentication, compressed response decoding, Textual terminal dashboards, event logging, and safer local credential handling through the OS keyring.
 
 ## Credits
 
@@ -63,5 +74,4 @@ For questions or bug reports, please message me on Discord: `._.__.__._._.__.___
 ## WIP / TODO
 
 - Steam account compatibility.
-- Request timeouts and stronger exception handling.
 - More configurable marketplace categories.

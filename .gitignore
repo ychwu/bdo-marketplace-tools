@@ -164,4 +164,6 @@ AGENTS.md
 test.py
 response.py
 ping.py
+run-test.bat
 .codex-local-notes.md
+.codex-pycache/

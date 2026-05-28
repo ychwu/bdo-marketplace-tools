@@ -3,3 +3,4 @@ bitstring
 colorama
 keyring
 rich
+textual
