@@ -16,6 +16,7 @@ DEFAULT_LOCAL_DATA = {
     "silver_spent": 0,
 }
 DEBUG_OUTFIT_LISTING = [["debug-premium-outfit", "1", "2020000000"]]
+MAX_ERROR_BACKOFF_MULTIPLIER = 6
 SIMULATED_SESSION_EMAIL = "test-session@example.local"
 
 
@@ -81,6 +82,7 @@ class BackgroundTasks:
         self.session_successful_purchases = 0
         self.session_silver_spent = 0
         self.simulated_session_enabled = False
+        self.consecutive_cycle_errors = 0
         self.lifetime_successful_purchases = local_data["successful_purchases"]
         self.lifetime_silver_spent = local_data["silver_spent"]
 
@@ -207,13 +209,23 @@ class BackgroundTasks:
                 try:
                     buy_list = await self.api_handler.check_stock()
                     await self.process_detected_outfits(buy_list)
+                    self.consecutive_cycle_errors = 0
                 except Exception as exc:
+                    self.consecutive_cycle_errors += 1
                     self.add_event(f"Monitor cycle failed: {exc}", "error")
 
-                sleep_duration = random.uniform(*self.current_delay_bounds())
+                sleep_duration = self.next_sleep_duration()
                 await asyncio.sleep(sleep_duration)
         except asyncio.CancelledError:
             raise
+
+    def next_sleep_duration(self):
+        low, high = self.current_delay_bounds()
+        if self.consecutive_cycle_errors <= 0:
+            return random.uniform(low, high)
+
+        multiplier = min(MAX_ERROR_BACKOFF_MULTIPLIER, 1 + self.consecutive_cycle_errors)
+        return random.uniform(low * multiplier, high * multiplier)
 
     async def process_detected_outfits(self, buy_list, allow_purchase=None):
         if not buy_list:

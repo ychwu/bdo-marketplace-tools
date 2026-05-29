@@ -2,6 +2,7 @@ import asyncio
 import json
 import pickle
 import random
+import stat
 from pathlib import Path
 
 import requests
@@ -16,6 +17,18 @@ LEGACY_SESSION_PATHS = (
     PROJECT_ROOT / "session.pkl",
 )
 REQUEST_TIMEOUT = (5, 20)
+TRADE_URL = "https://na-trade.naeu.playblackdesert.com"
+GAME_TRADE_URL = "https://na-game-trade.naeu.playblackdesert.com"
+ACCOUNT_URL = "https://account.pearlabyss.com"
+LOGIN_URL = f"{ACCOUNT_URL}/en-US/Member/Login/LoginProcess"
+FORM_CONTENT_TYPE = "application/x-www-form-urlencoded; charset=UTF-8"
+MARKET_ACCEPT_LANGUAGE = "en-US,en;q=0.9,ko;q=0.8,zh-CN;q=0.7,zh;q=0.6"
+MARKET_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/148.0.0.0 Safari/537.36"
+)
+MARKET_AJAX_HEADER = "XMLHttpRequest"
 
 
 class MarketplaceAPIError(RuntimeError):
@@ -47,10 +60,33 @@ def purchase_result_message(result_code, item_id, price):
     return f"Purchase failed for {item_id} at {price} silver: resultCode {result_code}."
 
 
+def marketplace_silver_balance(wallet_response):
+    if not isinstance(wallet_response, dict):
+        raise MarketplaceResponseError("marketplace wallet lookup returned an unexpected JSON shape")
+
+    wallet_items = wallet_response.get("myWalletList", [])
+    if wallet_items is None:
+        wallet_items = []
+    if not isinstance(wallet_items, list):
+        raise MarketplaceResponseError("marketplace wallet lookup returned an invalid myWalletList")
+
+    for item in wallet_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("mainKey") == 1 and item.get("subKey") == 0 and item.get("name") == "Silver":
+            try:
+                return int(item["count"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MarketplaceResponseError("marketplace wallet silver row had an invalid count") from exc
+
+    return None
+
+
 class APIHandler:
     def __init__(self):
-        self.trade_url = "https://na-trade.naeu.playblackdesert.com"
-        self.login_url = "https://account.pearlabyss.com/en-US/Member/Login/LoginProcess"
+        self.trade_url = TRADE_URL
+        self.game_trade_url = GAME_TRADE_URL
+        self.login_url = LOGIN_URL
         self.session = requests.Session()
         self.login_status = False
         self.email = None
@@ -58,6 +94,30 @@ class APIHandler:
         self._session_lock = asyncio.Lock()
 
         self.load_session()
+
+    def _trade_url(self):
+        return getattr(self, "trade_url", TRADE_URL).rstrip("/")
+
+    def _game_trade_url(self):
+        return getattr(self, "game_trade_url", GAME_TRADE_URL).rstrip("/")
+
+    def _market_headers(self, referer=None, *, origin=None, content_type=FORM_CONTENT_TYPE, ajax=False):
+        headers = {
+            "Accept": "*/*",
+            "Accept-Language": MARKET_ACCEPT_LANGUAGE,
+            "User-Agent": MARKET_USER_AGENT,
+        }
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        if origin is None:
+            origin = self._trade_url()
+        if origin:
+            headers["Origin"] = origin
+        if referer:
+            headers["Referer"] = referer
+        if ajax:
+            headers["X-Requested-With"] = MARKET_AJAX_HEADER
+        return headers
 
     async def _request(self, client, method, url, context, **kwargs):
         request_kwargs = dict(kwargs)
@@ -171,10 +231,10 @@ class APIHandler:
     async def login(self):
         new_session = requests.Session()
         headers_pastate = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "User-Agent": MARKET_USER_AGENT,
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Language": MARKET_ACCEPT_LANGUAGE,
         }
 
         async with self._session_lock:
@@ -192,9 +252,9 @@ class APIHandler:
                 raise MarketplaceResponseError("login page did not provide PA-STATE")
 
             login_payload = {
-                "hdAccountUrl": "https://account.pearlabyss.com",
+                "hdAccountUrl": ACCOUNT_URL,
                 "_isLinkingLogin": "false",
-                "_returnUrl": f"https://account.pearlabyss.com/en-US/Member/Login/AuthorizeOauth?response_type=code&scope=profile&state={pastate}&client_id=client_id&redirect_uri=https://na-trade.naeu.playblackdesert.com/Pearlabyss/Oauth2CallBack",
+                "_returnUrl": f"{ACCOUNT_URL}/en-US/Member/Login/AuthorizeOauth?response_type=code&scope=profile&state={pastate}&client_id=client_id&redirect_uri={self._trade_url()}/Pearlabyss/Oauth2CallBack",
                 "_joinType": 1,
                 "_email": self.email,
                 "_password": self.password,
@@ -206,7 +266,7 @@ class APIHandler:
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": headers_pastate["Accept"],
                 "Accept-Language": headers_pastate["Accept-Language"],
-                "Origin": "https://account.pearlabyss.com",
+                "Origin": ACCOUNT_URL,
             }
 
             response_login = await self._request(
@@ -245,13 +305,12 @@ class APIHandler:
         return False
 
     async def buy_item(self, buy_list):
-        url = "https://na-game-trade.naeu.playblackdesert.com/GameTradeMarket/BuyItem"
-        headers = {
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9,ko;q=0.8,zh-CN;q=0.7,zh;q=0.6",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        }
+        url = f"{self._game_trade_url()}/GameTradeMarket/BuyItem"
+        headers = self._market_headers(
+            f"{self._trade_url()}/",
+            origin=self._trade_url(),
+            ajax=False,
+        )
 
         summary = {
             "attempted": 0,
@@ -372,17 +431,16 @@ class APIHandler:
         if not self.session.cookies:
             return -1
 
-        url = "https://na-trade.naeu.playblackdesert.com/Home/AppSessionRefresh"
-        headers = {
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "Origin": "https://na-trade.naeu.playblackdesert.com",
-            "Referer": "https://na-trade.naeu.playblackdesert.com/Home/list/hot",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        }
+        url = f"{self._trade_url()}/Home/AppSessionRefresh"
+        headers = self._market_headers(f"{self._trade_url()}/Home/list/hot", ajax=True)
 
-        response = await self._session_request("POST", url, "session refresh", headers=headers)
+        response = await self._session_request(
+            "POST",
+            url,
+            "session refresh",
+            headers=headers,
+            data={"_isCalc": "false"},
+        )
         response_json = self._json_response(response, "session refresh")
         if "_resultCode" not in response_json:
             raise MarketplaceResponseError("session refresh response did not include _resultCode")
@@ -398,6 +456,13 @@ class APIHandler:
         with SESSION_COOKIE_PATH.open("w", encoding="utf-8") as file:
             json.dump(payload, file, indent=2)
             file.write("\n")
+        self._restrict_session_file_permissions()
+
+    def _restrict_session_file_permissions(self):
+        try:
+            SESSION_COOKIE_PATH.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
 
     def _serialize_cookies(self):
         cookies = []
@@ -468,12 +533,10 @@ class APIHandler:
         self.session.cookies.update(jar)
 
     async def get_mp_inventory(self):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-        }
+        headers = self._market_headers(f"{self._trade_url()}/Home/list/hot", ajax=True)
         response = await self._session_request(
             "POST",
-            "https://na-trade.naeu.playblackdesert.com/Home/GetMyWalletList",
+            f"{self._trade_url()}/Home/GetMyWalletList",
             "marketplace wallet lookup",
             headers=headers,
         )

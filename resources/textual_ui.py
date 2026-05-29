@@ -17,6 +17,7 @@ from textual.widget import Widget
 from textual.widgets import Button, Input, Label, ListItem, ListView, RichLog, Select, Static, Switch
 from textual.widgets._header import HeaderClock
 
+from market.api_handler import marketplace_silver_balance
 from resources.credentials import CredentialStoreError, clear_credentials, load_credentials, save_credentials
 from resources.display import (
     APP_TITLE,
@@ -1926,6 +1927,7 @@ class MarketplaceToolsApp(App[None]):
         self.set_status("Loading marketplace wallet...")
         try:
             response = await self.api_handler.get_mp_inventory()
+            silver_balance = marketplace_silver_balance(response)
         except Exception as exc:
             self.task_manager.add_event(f"Wallet lookup failed: {exc}", "error")
             self.set_status("Wallet lookup failed.")
@@ -1935,8 +1937,19 @@ class MarketplaceToolsApp(App[None]):
                 pass
             return
 
-        self.query_one("#wallet-output", Static).update(JSON.from_data(response))
-        self.set_status("Wallet loaded.", "success")
+        summary = Table.grid(padding=(0, 2))
+        summary.add_column(style="bold")
+        summary.add_column()
+        summary.add_row("Silver", format_compact_silver(silver_balance) if silver_balance is not None else "Not found")
+        summary.add_row("Value Pack", "Active" if response.get("useValuePackage") else "Inactive")
+        if response.get("totalWeight") is not None and response.get("maxWeight") is not None:
+            summary.add_row("Weight", f"{response.get('totalWeight')}/{response.get('maxWeight')}")
+
+        self.query_one("#wallet-output", Static).update(Group(summary, JSON.from_data(response)))
+        if silver_balance is not None:
+            self.set_status(f"Wallet loaded: {format_compact_silver(silver_balance)}.", "success")
+        else:
+            self.set_status("Wallet loaded.", "success")
 
     def action_show_dashboard(self) -> None:
         self.run_worker(self.show_view("dashboard"), name="show-dashboard", group="navigation", exclusive=True)

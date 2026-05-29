@@ -9,7 +9,14 @@ import main as app_main
 from rich.console import Console
 from textual.color import Color
 from textual.widgets import Button, Input, Static
-from market.api_handler import APIHandler, MarketplaceAPIError, MarketplaceResponseError, purchase_result_message
+from market.api_handler import (
+    APIHandler,
+    MARKET_AJAX_HEADER,
+    MarketplaceAPIError,
+    MarketplaceResponseError,
+    marketplace_silver_balance,
+    purchase_result_message,
+)
 from market.pricing import apply_price_rules, purchase_record_count, purchase_record_spend
 from resources import credentials as credentials_module
 from resources import task_manager as task_manager_module
@@ -145,6 +152,35 @@ class APIResultTests(unittest.TestCase):
             self.assertTrue(session_path.exists())
             self.assertEqual(json.loads(session_path.read_text(encoding="utf-8")), {"version": 1, "cookies": []})
 
+    def test_market_ajax_headers_keep_browser_like_shape_without_client_hints(self):
+        handler = object.__new__(APIHandler)
+
+        headers = APIHandler._market_headers(
+            handler,
+            "https://na-trade.naeu.playblackdesert.com/Home/list/hot",
+            ajax=True,
+        )
+
+        self.assertEqual(headers["Origin"], "https://na-trade.naeu.playblackdesert.com")
+        self.assertEqual(headers["Referer"], "https://na-trade.naeu.playblackdesert.com/Home/list/hot")
+        self.assertEqual(headers["X-Requested-With"], MARKET_AJAX_HEADER)
+        self.assertIn("Chrome/", headers["User-Agent"])
+        self.assertNotIn("Sec-Fetch-Site", headers)
+        self.assertNotIn("Sec-CH-UA", headers)
+
+    def test_marketplace_silver_balance_reads_silver_wallet_row(self):
+        wallet = {
+            "myWalletList": [
+                {"mainKey": 2, "subKey": 0, "name": "Other", "count": 5},
+                {"mainKey": 1, "subKey": 0, "name": "Silver", "count": "123456789"},
+            ]
+        }
+
+        self.assertEqual(marketplace_silver_balance(wallet), 123_456_789)
+        self.assertIsNone(marketplace_silver_balance({"myWalletList": []}))
+        with self.assertRaises(MarketplaceResponseError):
+            marketplace_silver_balance({"myWalletList": [{"mainKey": 1, "subKey": 0, "name": "Silver"}]})
+
 
 class LocalRuntimeFileTests(unittest.TestCase):
     def test_missing_credentials_file_is_initialized_empty(self):
@@ -191,6 +227,7 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_buy_item_returns_structured_purchase_records(self):
         handler = object.__new__(APIHandler)
+        session_requests = []
 
         async def valid_session():
             return True
@@ -200,6 +237,7 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
                 return {"resultCode": 0}
 
         async def fake_session_request(*args, **kwargs):
+            session_requests.append((args, kwargs))
             return FakeResponse()
 
         handler.ensure_session_valid = valid_session
@@ -219,6 +257,30 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
                 {"item_id": "item", "price": 100, "count": 1, "result_code": 0},
             ],
         )
+        headers = session_requests[0][1]["headers"]
+        self.assertEqual(headers["Origin"], "https://na-trade.naeu.playblackdesert.com")
+        self.assertEqual(headers["Referer"], "https://na-trade.naeu.playblackdesert.com/")
+        self.assertNotIn("X-Requested-With", headers)
+
+    async def test_session_refresh_uses_browser_observed_ajax_body(self):
+        handler = object.__new__(APIHandler)
+        handler.session = type("Session", (), {"cookies": {"session": "present"}})()
+        captured = {}
+
+        class FakeResponse:
+            def json(self):
+                return {"_resultCode": 0}
+
+        async def fake_session_request(method, url, context, **kwargs):
+            captured.update({"method": method, "url": url, "context": context, **kwargs})
+            return FakeResponse()
+
+        handler._session_request = fake_session_request
+        handler._json_response = APIHandler._json_response.__get__(handler, APIHandler)
+
+        self.assertEqual(await APIHandler.is_session_expired(handler), 0)
+        self.assertEqual(captured["data"], {"_isCalc": "false"})
+        self.assertEqual(captured["headers"]["X-Requested-With"], MARKET_AJAX_HEADER)
 
 
 class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
@@ -290,6 +352,16 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
                     await manager.checker()
 
         uniform_mock.assert_called_once_with(8, 13)
+
+    async def test_monitor_errors_back_off_from_normal_polling_window(self):
+        manager = self.make_task_manager()
+        manager.set_custom_delay_range(5, 10)
+        manager.consecutive_cycle_errors = 2
+
+        with patch("resources.task_manager.random.uniform", return_value=20) as uniform_mock:
+            self.assertEqual(manager.next_sleep_duration(), 20)
+
+        uniform_mock.assert_called_once_with(15, 30)
 
     async def test_fake_detection_uses_watch_only_path(self):
         manager = self.make_task_manager()
