@@ -110,6 +110,13 @@ class DashboardModalScreen(ModalScreen[None]):
         margin-bottom: 1;
     }
 
+    .modal-section-title {
+        color: __COLOR_BRAND__;
+        text-style: bold;
+        margin-top: 1;
+        margin-bottom: 1;
+    }
+
     .modal-info-tile {
         width: 1fr;
         min-width: 12;
@@ -123,6 +130,24 @@ class DashboardModalScreen(ModalScreen[None]):
         border-title-align: center;
     }
 
+    .modal-info-clickable:hover {
+        border: round __COLOR_BRAND__;
+        border-title-color: __COLOR_BRAND__;
+        color: __COLOR_BRAND__;
+    }
+
+    .modal-info-muted {
+        border: round #2b2b2b;
+        border-title-color: #777777;
+        color: #aaaaaa;
+    }
+
+    .preset-selected {
+        border: round __COLOR_BRAND__;
+        border-title-color: __COLOR_BRAND__;
+        color: __COLOR_BRAND__;
+    }
+
     .modal-info-wide {
         width: 2fr;
         min-width: 24;
@@ -131,11 +156,13 @@ class DashboardModalScreen(ModalScreen[None]):
     .modal-row {
         height: auto;
         margin-bottom: 1;
+        align: left middle;
     }
 
     .modal-row > Label {
         width: 18;
         text-style: bold;
+        content-align: left middle;
     }
 
     .modal-actions {
@@ -151,9 +178,9 @@ class DashboardModalScreen(ModalScreen[None]):
     }
 
     .modal-actions Button:hover {
-        border: round #f2efe7;
+        border: round __COLOR_BRAND__;
         background: #171717;
-        color: #f2efe7;
+        color: __COLOR_BRAND__;
     }
 
     .modal-actions Button:focus {
@@ -173,9 +200,9 @@ class DashboardModalScreen(ModalScreen[None]):
     .modal-actions Button.-primary:hover,
     .modal-actions Button.-warning:hover,
     .modal-actions Button.-error:hover {
-        border: round #f2efe7;
+        border: round __COLOR_BRAND__;
         background: #171717;
-        color: #f2efe7;
+        color: __COLOR_BRAND__;
     }
 
     .modal-actions Button.-primary:focus,
@@ -197,8 +224,8 @@ class DashboardModalScreen(ModalScreen[None]):
     }
 
     .modal-action-tile:hover {
-        border: round #f2efe7;
-        color: #f2efe7;
+        border: round __COLOR_BRAND__;
+        color: __COLOR_BRAND__;
         background: #171717;
     }
 
@@ -309,9 +336,9 @@ class MonitorModal(DashboardModalScreen):
         with Vertical(classes="modal-card") as dialog:
             dialog.border_title = "Monitor"
             with Horizontal(id="monitor-summary", classes="modal-summary-row"):
-                yield Static(id="monitor-status-tile", classes="modal-info-tile")
-                yield Static(id="monitor-mode-tile", classes="modal-info-tile")
-                yield Static(id="monitor-session-tile", classes="modal-info-tile")
+                yield Static(id="monitor-status-tile", classes="modal-info-tile modal-info-muted")
+                yield Static(id="monitor-mode-tile", classes="modal-info-tile modal-info-muted")
+                yield Static(id="monitor-session-tile", classes="modal-info-tile modal-info-muted")
             with Horizontal(classes="modal-row"):
                 yield Label("Buy mode")
                 yield Switch(value=app.task_manager.purchase_submission_enabled, id="buy-mode-switch")
@@ -328,8 +355,8 @@ class SpendCapModal(DashboardModalScreen):
             dialog.border_title = "Spent"
             yield Static("Silver Spend Cap", classes="modal-heading")
             with Horizontal(id="spend-summary", classes="modal-summary-row"):
-                yield Static(id="spend-cap-tile", classes="modal-info-tile")
-                yield Static(id="spend-session-tile", classes="modal-info-tile")
+                yield Static(id="spend-cap-tile", classes="modal-info-tile modal-info-muted")
+                yield Static(id="spend-session-tile", classes="modal-info-tile modal-info-muted")
             yield Label("Spend cap in silver")
             yield Input(
                 value=str(app.task_manager.max_spend or 0),
@@ -349,12 +376,13 @@ class PollingModal(DashboardModalScreen):
         with Vertical(classes="modal-card") as dialog:
             dialog.border_title = "Polling"
             with Horizontal(id="polling-summary", classes="modal-summary-row"):
-                yield Static(id="polling-speed-tile", classes="modal-info-tile")
-                yield Static(id="polling-interval-tile", classes="modal-info-tile")
+                yield Static(id="polling-speed-tile", classes="modal-info-tile modal-info-muted")
+                yield Static(id="polling-interval-tile", classes="modal-info-tile modal-info-muted")
+            yield Static("Presets", classes="modal-section-title")
             with Horizontal(id="polling-recommendations", classes="modal-summary-row"):
-                yield Static(id="polling-fast-tile", classes="modal-info-tile")
-                yield Static(id="polling-balanced-tile", classes="modal-info-tile")
-                yield Static(id="polling-slow-tile", classes="modal-info-tile")
+                yield PollingPresetTile("1", "Fast")
+                yield PollingPresetTile("2", "Balanced")
+                yield PollingPresetTile("3", "Slow")
             with Horizontal(classes="modal-row"):
                 yield Label("Custom min")
                 yield Input(value=str(low), type="integer", placeholder="Seconds", id="custom-delay-min-input")
@@ -373,9 +401,9 @@ class CredentialsModal(DashboardModalScreen):
         with Vertical(classes="modal-card") as dialog:
             dialog.border_title = "Credentials"
             with Horizontal(id="credentials-summary", classes="modal-summary-row"):
-                yield Static(id="credentials-email-tile", classes="modal-info-tile modal-info-wide")
-                yield Static(id="credentials-password-tile", classes="modal-info-tile")
-                yield Static(id="credentials-status-tile", classes="modal-info-tile")
+                yield Static(id="credentials-email-tile", classes="modal-info-tile modal-info-muted modal-info-wide")
+                yield Static(id="credentials-password-tile", classes="modal-info-tile modal-info-muted")
+                yield Static(id="credentials-status-tile", classes="modal-info-tile modal-info-muted")
             yield Label("Email")
             yield Input(value=email or "", placeholder="account@example.com", id="email-input")
             yield Label("Password")
@@ -392,8 +420,8 @@ class SessionModal(DashboardModalScreen):
             dialog.border_title = "Session"
             yield Static("Marketplace Session", classes="modal-heading")
             with Horizontal(id="session-summary", classes="modal-summary-row"):
-                yield Static(id="session-status-tile", classes="modal-info-tile")
-                yield Static(id="session-account-tile", classes="modal-info-tile")
+                yield Static(id="session-status-tile", classes="modal-info-tile modal-info-muted")
+                yield Static(id="session-account-tile", classes="modal-info-tile modal-info-muted")
             with Horizontal(classes="modal-actions"):
                 yield Button("Refresh Session", id="refresh-session", variant="primary")
                 yield Button("Close", id="close-modal")
@@ -461,6 +489,21 @@ class ModalAction(Static):
     def __init__(self, label: str, action_id: str) -> None:
         super().__init__(label, id=action_id, classes="modal-action-tile")
         self.action_id = action_id
+
+    def on_click(self) -> None:
+        self.post_message(self.Pressed(self))
+
+
+class PollingPresetTile(Static):
+    class Pressed(Message):
+        def __init__(self, preset: "PollingPresetTile") -> None:
+            super().__init__()
+            self.preset = preset
+
+    def __init__(self, preset_key: str, title: str) -> None:
+        super().__init__("", id=f"polling-preset-{preset_key}", classes="modal-info-tile modal-info-clickable")
+        self.preset_key = preset_key
+        self.border_title = title
 
     def on_click(self) -> None:
         self.post_message(self.Pressed(self))
@@ -914,15 +957,27 @@ class MarketplaceToolsApp(App[None]):
         level: str,
         show_dot: bool,
         muted: bool = False,
+        subdued: bool = False,
     ) -> RenderableType:
         body = Table.grid(expand=False)
         body.add_column(justify="center")
-        if muted and level == "muted":
+        if subdued and level != "info":
+            value_text = self.status_text(value, level, show_dot=show_dot)
+            detail_style = "#5f5f5f"
+        elif subdued:
+            value_text = Text()
+            if show_dot:
+                value_text.append(f"{STATUS_DOT} ", style="#8f8f8f")
+            value_text.append(value, style="#9a9a9a")
+            detail_style = "#5f5f5f"
+        elif muted and level == "muted":
             value_text = Text(value, style="dim #aaaaaa")
+            detail_style = "#777777"
         else:
             value_text = self.status_text(value, level, show_dot=show_dot)
+            detail_style = "dim"
         body.add_row(value_text)
-        body.add_row(Text(detail, style="dim #777777" if muted else "dim"))
+        body.add_row(Text(detail, style=detail_style))
         return Align.center(body, vertical="middle")
 
     def refresh_dashboard_tiles(self, snapshot: tuple[str, ...]) -> None:
@@ -1054,7 +1109,55 @@ class MarketplaceToolsApp(App[None]):
             return
 
         tile.border_title = title
-        tile.update(self.tile_renderable(value, detail, level, show_dot=show_dot))
+        tile.update(
+            self.tile_renderable(
+                value,
+                detail,
+                level,
+                show_dot=show_dot,
+                subdued="modal-info-muted" in tile.classes,
+            )
+        )
+
+    def modal_custom_delay_bounds(self) -> tuple[int, int] | None:
+        try:
+            low = int(self.query_visible_one("#custom-delay-min-input", Input).value.strip())
+            high = int(self.query_visible_one("#custom-delay-max-input", Input).value.strip())
+        except Exception:
+            return None
+        if low <= 0 or high <= 0:
+            return None
+        return low, high
+
+    def matching_delay_choice(self, bounds: tuple[int, int] | None) -> str | None:
+        if bounds is None:
+            return None
+        for key, (_label, preset_bounds) in self.task_manager.delay_choices.items():
+            if tuple(preset_bounds) == bounds:
+                return key
+        return None
+
+    def refresh_polling_preset_tiles(self) -> None:
+        try:
+            self.query_visible_one("#polling-recommendations")
+        except Exception:
+            return
+
+        bounds = self.modal_custom_delay_bounds() or self.task_manager.current_delay_bounds()
+        selected_key = self.matching_delay_choice(bounds)
+        for key, (_label, (low, high)) in self.task_manager.delay_choices.items():
+            try:
+                tile = self.query_visible_one(f"#polling-preset-{key}", PollingPresetTile)
+            except Exception:
+                continue
+
+            selected = key == selected_key
+            if selected:
+                tile.add_class("preset-selected")
+            else:
+                tile.remove_class("preset-selected")
+            detail = "Recommended" if key == "2" else ""
+            tile.update(self.tile_renderable(f"{low}-{high}s", detail, "orange" if selected else "info", False))
 
     def refresh_credentials_summary(self) -> None:
         try:
@@ -1132,13 +1235,10 @@ class MarketplaceToolsApp(App[None]):
 
         self.refresh_modal_tile("polling-speed-tile", "Speed", self.task_manager.current_delay_label(), "Current")
         self.refresh_modal_tile("polling-interval-tile", "Interval", self.task_manager.current_delay_range(), "Between scans")
-        for key, tile_id in (
-            ("1", "polling-fast-tile"),
-            ("2", "polling-balanced-tile"),
-            ("3", "polling-slow-tile"),
-        ):
-            label, (low, high) = self.task_manager.delay_choices[key]
-            self.refresh_modal_tile(tile_id, label, f"{low}-{high}s", "Recommended")
+        self.refresh_polling_preset_tiles()
+
+    def polling_status_detail(self) -> str:
+        return f"{self.task_manager.current_delay_label()} ({self.task_manager.current_delay_range()})"
 
     def refresh_monitor_summary(self) -> None:
         try:
@@ -1279,6 +1379,16 @@ class MarketplaceToolsApp(App[None]):
         if confirmed:
             self.run_worker(self.login_refresh(), name="login-refresh", group="actions", exclusive=True)
 
+    def on_polling_preset_tile_pressed(self, event: PollingPresetTile.Pressed) -> None:
+        event.stop()
+        low, high = self.task_manager.delay_choices[event.preset.preset_key][1]
+        try:
+            self.query_visible_one("#custom-delay-min-input", Input).value = str(low)
+            self.query_visible_one("#custom-delay-max-input", Input).value = str(high)
+        except Exception:
+            return
+        self.refresh_polling_preset_tiles()
+
     async def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id != "delay-select":
             return
@@ -1295,6 +1405,10 @@ class MarketplaceToolsApp(App[None]):
         elif event.input.id in {"custom-delay-min-input", "custom-delay-max-input"}:
             self.apply_custom_delay_from_inputs()
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id in {"custom-delay-min-input", "custom-delay-max-input"}:
+            self.refresh_polling_preset_tiles()
+
     def apply_delay_choice(self, delay: object) -> None:
         delay = str(delay)
         if delay == "custom":
@@ -1302,7 +1416,7 @@ class MarketplaceToolsApp(App[None]):
                 return
 
             self.task_manager.delay = "custom"
-            self.set_status(f"Polling set to custom ({self.task_manager.current_delay_range()}).", "info")
+            self.set_status(f"Polling set to {self.polling_status_detail()}.", "info")
             self.refresh_settings_summary()
             self.refresh_live_widgets()
             return
@@ -1311,15 +1425,12 @@ class MarketplaceToolsApp(App[None]):
             return
 
         self.task_manager.delay = delay
-        self.set_status(
-            f"Polling set to {self.task_manager.current_delay_label()} "
-            f"({self.task_manager.current_delay_range()}).",
-            "info",
-        )
+        self.task_manager.custom_delay_range = tuple(self.task_manager.delay_choices[delay][1])
+        self.set_status(f"Polling set to {self.polling_status_detail()}.", "info")
         self.refresh_settings_summary()
         self.refresh_live_widgets()
 
-    def apply_custom_delay_from_inputs(self) -> bool:
+    def apply_custom_delay_from_inputs(self, log_status: bool = True) -> bool:
         try:
             min_input = self.query_visible_one("#custom-delay-min-input", Input)
             max_input = self.query_visible_one("#custom-delay-max-input", Input)
@@ -1335,16 +1446,17 @@ class MarketplaceToolsApp(App[None]):
             )
             return False
 
-        self.set_status(f"Polling set to custom ({self.task_manager.current_delay_range()}).", "info")
+        if log_status:
+            self.set_status(f"Polling set to {self.polling_status_detail()}.", "info")
         self.refresh_settings_summary()
         self.refresh_live_widgets()
         return True
 
     def save_polling_settings(self) -> bool:
-        if not self.apply_custom_delay_from_inputs():
+        if not self.apply_custom_delay_from_inputs(log_status=False):
             return False
 
-        self.set_status("Polling settings saved.", "success")
+        self.set_status(f"Polling settings saved: {self.polling_status_detail()}.", "success")
         return True
 
     async def apply_purchase_mode(self, enabled: bool, source_switch_id: str | None = None) -> None:
