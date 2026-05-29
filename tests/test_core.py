@@ -203,6 +203,15 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         await manager.stop_login_status_checker()
         self.assertIsNone(manager.login_checker_task)
 
+    async def test_custom_delay_range_feeds_monitor_sleep_bounds(self):
+        manager = self.make_task_manager()
+        manager.set_custom_delay_range(8, 13)
+
+        self.assertEqual(manager.delay, "custom")
+        self.assertEqual(manager.current_delay_label(), "Custom")
+        self.assertEqual(manager.current_delay_range(), "8-13s")
+        self.assertEqual(manager.current_delay_bounds(), (8, 13))
+
     async def test_fake_detection_uses_watch_only_path(self):
         manager = self.make_task_manager()
         manager.purchase_submission_enabled = True
@@ -421,11 +430,19 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.click("#tile-polling")
                 await pilot.pause()
                 self.assertEqual(app.current_view, "dashboard")
-                self.assertEqual(app.query_visible_one("#delay-select").value, app.task_manager.delay)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#delay-select"))), 0)
                 self.assertEqual(len(list(app.screen_stack[-1].query("#polling-summary"))), 1)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#polling-recommendations"))), 1)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#polling-fast-tile"))), 1)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#polling-balanced-tile"))), 1)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#polling-slow-tile"))), 1)
                 self.assertEqual(len(list(app.screen_stack[-1].query("#settings-summary"))), 0)
+                app.query_visible_one("#custom-delay-min-input", Input).value = "8"
+                app.query_visible_one("#custom-delay-max-input", Input).value = "13"
                 await pilot.click("#save-polling")
                 await pilot.pause()
+                self.assertEqual(app.task_manager.delay, "custom")
+                self.assertEqual(app.task_manager.current_delay_bounds(), (8, 13))
                 self.assertEqual([type(screen).__name__ for screen in app.screen_stack], ["Screen"])
                 await pilot.click("#tile-polling")
                 await pilot.pause()

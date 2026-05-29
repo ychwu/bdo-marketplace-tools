@@ -186,10 +186,27 @@ class DashboardModalScreen(ModalScreen[None]):
         color: #d8d3c8;
     }
 
+    .modal-action-tile {
+        width: 16;
+        height: 3;
+        margin-right: 1;
+        content-align: center middle;
+        border: round #d8d3c8;
+        color: #d8d3c8;
+        background: #171717;
+    }
+
+    .modal-action-tile:hover {
+        border: round #f2efe7;
+        color: #f2efe7;
+        background: #171717;
+    }
+
     .modal-card Input {
         border: round #d8d3c8;
         background: #171717;
         color: #d8d3c8;
+        width: 1fr;
     }
 
     .modal-card Input:focus {
@@ -328,13 +345,22 @@ class SpendCapModal(DashboardModalScreen):
 class PollingModal(DashboardModalScreen):
     def compose(self) -> ComposeResult:
         app = self.app
+        low, high = app.task_manager.current_delay_bounds()
         with Vertical(classes="modal-card") as dialog:
             dialog.border_title = "Polling"
             with Horizontal(id="polling-summary", classes="modal-summary-row"):
                 yield Static(id="polling-speed-tile", classes="modal-info-tile")
                 yield Static(id="polling-interval-tile", classes="modal-info-tile")
-            yield Label("Polling interval")
-            yield Select(app.delay_options(), value=app.task_manager.delay, id="delay-select")
+            with Horizontal(id="polling-recommendations", classes="modal-summary-row"):
+                yield Static(id="polling-fast-tile", classes="modal-info-tile")
+                yield Static(id="polling-balanced-tile", classes="modal-info-tile")
+                yield Static(id="polling-slow-tile", classes="modal-info-tile")
+            with Horizontal(classes="modal-row"):
+                yield Label("Custom min")
+                yield Input(value=str(low), type="integer", placeholder="Seconds", id="custom-delay-min-input")
+            with Horizontal(classes="modal-row"):
+                yield Label("Custom max")
+                yield Input(value=str(high), type="integer", placeholder="Seconds", id="custom-delay-max-input")
             with Horizontal(classes="modal-actions"):
                 yield Button("Save", id="save-polling", variant="primary")
                 yield Button("Close", id="close-modal")
@@ -382,12 +408,11 @@ class SessionRefreshConfirmScreen(ModalScreen[bool]):
             dialog.border_title = "Refresh Session"
             yield Static("Refresh the marketplace session now?")
             with Horizontal(classes="modal-actions"):
-                yield Button("Refresh", id="confirm-refresh-session", variant="primary")
-                yield Button("Cancel", id="cancel-refresh-session")
+                yield ModalAction("Refresh", "confirm-refresh-session")
+                yield ModalAction("Cancel", "cancel-refresh-session")
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        event.button.blur()
-        self.dismiss(event.button.id == "confirm-refresh-session")
+    def on_modal_action_pressed(self, event: ModalAction.Pressed) -> None:
+        self.dismiss(event.action.action_id == "confirm-refresh-session")
 
     def action_cancel(self) -> None:
         self.dismiss(False)
@@ -425,6 +450,20 @@ class DashboardTile(Static, can_focus=True):
     def on_click(self) -> None:
         self.action_press()
         self.blur()
+
+
+class ModalAction(Static):
+    class Pressed(Message):
+        def __init__(self, action: "ModalAction") -> None:
+            super().__init__()
+            self.action = action
+
+    def __init__(self, label: str, action_id: str) -> None:
+        super().__init__(label, id=action_id, classes="modal-action-tile")
+        self.action_id = action_id
+
+    def on_click(self) -> None:
+        self.post_message(self.Pressed(self))
 
 
 class MarketplaceToolsApp(App[None]):
@@ -785,10 +824,12 @@ class MarketplaceToolsApp(App[None]):
         return "Not Set", "No account configured", "error", email, password
 
     def delay_options(self) -> list[tuple[str, str]]:
-        return [
+        options = [
             (f"{label} ({low}-{high}s)", key)
             for key, (label, (low, high)) in self.task_manager.delay_choices.items()
         ]
+        options.append((f"Custom ({self.task_manager.current_delay_range()})", "custom"))
+        return options
 
     def dashboard_snapshot(self) -> tuple[str, ...]:
         credential_status, credential_detail, credential_level, _, _ = self.credential_state()
@@ -1091,6 +1132,13 @@ class MarketplaceToolsApp(App[None]):
 
         self.refresh_modal_tile("polling-speed-tile", "Speed", self.task_manager.current_delay_label(), "Current")
         self.refresh_modal_tile("polling-interval-tile", "Interval", self.task_manager.current_delay_range(), "Between scans")
+        for key, tile_id in (
+            ("1", "polling-fast-tile"),
+            ("2", "polling-balanced-tile"),
+            ("3", "polling-slow-tile"),
+        ):
+            label, (low, high) = self.task_manager.delay_choices[key]
+            self.refresh_modal_tile(tile_id, label, f"{low}-{high}s", "Recommended")
 
     def refresh_monitor_summary(self) -> None:
         try:
@@ -1184,10 +1232,9 @@ class MarketplaceToolsApp(App[None]):
                 self.refresh_modal_summaries()
                 self.close_active_dashboard_modal()
         elif button_id == "save-polling":
-            self.apply_delay_choice(self.query_visible_one("#delay-select", Select).value)
-            self.set_status("Polling settings saved.", "info")
-            self.refresh_modal_summaries()
-            self.close_active_dashboard_modal()
+            if self.save_polling_settings():
+                self.refresh_modal_summaries()
+                self.close_active_dashboard_modal()
         elif button_id == "modal-start-monitor":
             await self.start_monitor()
             self.refresh_modal_summaries()
@@ -1245,9 +1292,21 @@ class MarketplaceToolsApp(App[None]):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "spend-cap-input":
             self.apply_spend_cap_from_input(event.input.id)
+        elif event.input.id in {"custom-delay-min-input", "custom-delay-max-input"}:
+            self.apply_custom_delay_from_inputs()
 
     def apply_delay_choice(self, delay: object) -> None:
         delay = str(delay)
+        if delay == "custom":
+            if delay == self.task_manager.delay:
+                return
+
+            self.task_manager.delay = "custom"
+            self.set_status(f"Polling set to custom ({self.task_manager.current_delay_range()}).", "info")
+            self.refresh_settings_summary()
+            self.refresh_live_widgets()
+            return
+
         if delay not in self.task_manager.delay_choices or delay == self.task_manager.delay:
             return
 
@@ -1259,6 +1318,34 @@ class MarketplaceToolsApp(App[None]):
         )
         self.refresh_settings_summary()
         self.refresh_live_widgets()
+
+    def apply_custom_delay_from_inputs(self) -> bool:
+        try:
+            min_input = self.query_visible_one("#custom-delay-min-input", Input)
+            max_input = self.query_visible_one("#custom-delay-max-input", Input)
+        except Exception:
+            return False
+
+        try:
+            self.task_manager.set_custom_delay_range(min_input.value.strip(), max_input.value.strip())
+        except (TypeError, ValueError):
+            self.set_status(
+                "Custom polling range must use positive seconds with min less than or equal to max.",
+                "warning",
+            )
+            return False
+
+        self.set_status(f"Polling set to custom ({self.task_manager.current_delay_range()}).", "info")
+        self.refresh_settings_summary()
+        self.refresh_live_widgets()
+        return True
+
+    def save_polling_settings(self) -> bool:
+        if not self.apply_custom_delay_from_inputs():
+            return False
+
+        self.set_status("Polling settings saved.", "success")
+        return True
 
     async def apply_purchase_mode(self, enabled: bool, source_switch_id: str | None = None) -> None:
         if self._syncing_controls:
