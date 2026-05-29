@@ -203,6 +203,29 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         await manager.stop_login_status_checker()
         self.assertIsNone(manager.login_checker_task)
 
+    async def test_custom_delay_range_feeds_monitor_sleep_bounds(self):
+        manager = self.make_task_manager()
+        manager.set_custom_delay_range(8, 13)
+
+        self.assertEqual(manager.delay, "custom")
+        self.assertEqual(manager.current_delay_label(), "Custom")
+        self.assertEqual(manager.current_delay_range(), "8-13s")
+        self.assertEqual(manager.current_delay_bounds(), (8, 13))
+
+        manager.set_custom_delay_range(5, 10)
+        self.assertEqual(manager.delay, "2")
+        self.assertEqual(manager.current_delay_label(), "Balanced")
+        self.assertEqual(manager.current_delay_bounds(), (5, 10))
+
+        manager.set_custom_delay_range(8, 13)
+        manager.api_handler.check_stock = AsyncMock(return_value=[])
+        with patch("resources.task_manager.random.uniform", return_value=9) as uniform_mock:
+            with patch("resources.task_manager.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
+                with self.assertRaises(asyncio.CancelledError):
+                    await manager.checker()
+
+        uniform_mock.assert_called_once_with(8, 13)
+
     async def test_fake_detection_uses_watch_only_path(self):
         manager = self.make_task_manager()
         manager.purchase_submission_enabled = True
@@ -421,11 +444,36 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.click("#tile-polling")
                 await pilot.pause()
                 self.assertEqual(app.current_view, "dashboard")
-                self.assertEqual(app.query_visible_one("#delay-select").value, app.task_manager.delay)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#delay-select"))), 0)
                 self.assertEqual(len(list(app.screen_stack[-1].query("#polling-summary"))), 1)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#polling-recommendations"))), 1)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#polling-preset-1"))), 1)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#polling-preset-2"))), 1)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#polling-preset-3"))), 1)
+                self.assertIn("modal-info-muted", app.query_visible_one("#polling-speed-tile").classes)
+                self.assertNotIn("modal-info-clickable", app.query_visible_one("#polling-speed-tile").classes)
+                self.assertIn("modal-info-clickable", app.query_visible_one("#polling-preset-2").classes)
+                self.assertIn("preset-selected", app.query_visible_one("#polling-preset-3").classes)
                 self.assertEqual(len(list(app.screen_stack[-1].query("#settings-summary"))), 0)
+                await pilot.click("#polling-preset-2")
+                await pilot.pause()
+                self.assertEqual(app.query_visible_one("#custom-delay-min-input", Input).value, "5")
+                self.assertEqual(app.query_visible_one("#custom-delay-max-input", Input).value, "10")
+                self.assertIn("preset-selected", app.query_visible_one("#polling-preset-2").classes)
+                app.query_visible_one("#custom-delay-min-input", Input).value = "8"
+                app.query_visible_one("#custom-delay-max-input", Input).value = "13"
+                await pilot.pause()
+                self.assertNotIn("preset-selected", app.query_visible_one("#polling-preset-2").classes)
+                app.query_visible_one("#custom-delay-min-input", Input).value = "5"
+                app.query_visible_one("#custom-delay-max-input", Input).value = "10"
+                await pilot.pause()
+                self.assertIn("preset-selected", app.query_visible_one("#polling-preset-2").classes)
+                app.query_visible_one("#custom-delay-min-input", Input).value = "8"
+                app.query_visible_one("#custom-delay-max-input", Input).value = "13"
                 await pilot.click("#save-polling")
                 await pilot.pause()
+                self.assertEqual(app.task_manager.delay, "custom")
+                self.assertEqual(app.task_manager.current_delay_bounds(), (8, 13))
                 self.assertEqual([type(screen).__name__ for screen in app.screen_stack], ["Screen"])
                 await pilot.click("#tile-polling")
                 await pilot.pause()
@@ -507,6 +555,21 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(list(test_app.query("#test-controls"))), 1)
                 self.assertEqual(len(list(test_app.query("#fake-detection"))), 1)
                 self.assertEqual(len(list(test_app.query("#fake-buy-success"))), 1)
+
+    async def test_polling_modal_saves_preset_equivalent_range_as_preset(self):
+        app = self.make_app()
+        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.click("#tile-polling")
+                await pilot.pause()
+                await pilot.click("#polling-preset-2")
+                await pilot.pause()
+                await pilot.click("#save-polling")
+                await pilot.pause()
+
+        self.assertEqual(app.task_manager.delay, "2")
+        self.assertEqual(app.task_manager.current_delay_bounds(), (5, 10))
+        self.assertIn("Balanced (5-10s)", app.status_message)
 
     async def test_buy_mode_start_requires_login_logs_one_combined_warning(self):
         app = self.make_app()

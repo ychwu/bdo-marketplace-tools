@@ -61,6 +61,7 @@ class BackgroundTasks:
             "3": ("Slow", (15, 30)),
         }
         self.delay = "3"
+        self.custom_delay_range = (15, 30)
         self.events = deque(maxlen=9)
         self.purchase_submission_enabled = False
         self.max_spend = None
@@ -90,11 +91,40 @@ class BackgroundTasks:
         self.events.append(f"[dim]{timestamp}[/dim] [{style}]{message}[/{style}]")
 
     def current_delay_label(self):
+        if self.delay == "custom":
+            matching_key = self.matching_delay_choice(self.custom_delay_range)
+            if matching_key:
+                return self.delay_choices[matching_key][0]
+            return "Custom"
         return self.delay_choices[self.delay][0]
 
+    def matching_delay_choice(self, bounds):
+        bounds = tuple(bounds)
+        for key, (_label, preset_bounds) in self.delay_choices.items():
+            if tuple(preset_bounds) == bounds:
+                return key
+        return None
+
+    def current_delay_bounds(self):
+        if self.delay == "custom":
+            return self.custom_delay_range
+        return self.delay_choices[self.delay][1]
+
     def current_delay_range(self):
-        low, high = self.delay_choices[self.delay][1]
+        low, high = self.current_delay_bounds()
         return f"{low}-{high}s"
+
+    def recommended_delay_label(self):
+        label, (low, high) = self.delay_choices["3"]
+        return f"{label} ({low}-{high}s)"
+
+    def set_custom_delay_range(self, low, high):
+        low = int(low)
+        high = int(high)
+        if low <= 0 or high <= 0 or low > high:
+            raise ValueError("Custom delay must use positive seconds with min less than or equal to max.")
+        self.custom_delay_range = (low, high)
+        self.delay = self.matching_delay_choice(self.custom_delay_range) or "custom"
 
     def runtime_label(self):
         if not self.checker_enabled or self.checker_started_at is None:
@@ -162,7 +192,7 @@ class BackgroundTasks:
                 except Exception as exc:
                     self.add_event(f"Monitor cycle failed: {exc}", "error")
 
-                sleep_duration = random.uniform(*self.delay_choices[self.delay][1])
+                sleep_duration = random.uniform(*self.current_delay_bounds())
                 await asyncio.sleep(sleep_duration)
         except asyncio.CancelledError:
             raise
