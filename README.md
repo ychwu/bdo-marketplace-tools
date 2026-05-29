@@ -38,7 +38,7 @@ py -3 main.py --test-mode
 
 You can also set `BDO_MARKET_TEST_MODE=1`. Test mode skips only the automatic startup session check; explicit actions such as session refresh, wallet refresh, or starting the monitor can still call live marketplace endpoints.
 
-In test mode, extra sidebar controls are available for interface and debug work: adding synthetic event-log rows, faking a watch-only outfit detection, and simulating a detection plus successful purchase accounting without calling the live buy API.
+In test mode, extra sidebar controls are available for interface and debug work: adding synthetic event-log rows, toggling a simulated valid session, faking a watch-only outfit detection, and simulating purchase accounting without calling the live buy API.
 
 ## Technical Highlights
 

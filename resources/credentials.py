@@ -27,6 +27,7 @@ def _read_info():
         with INFO_PATH.open("r", encoding="utf-8-sig") as file:
             return json.load(file)
     except FileNotFoundError:
+        _write_info({})
         return {}
     except json.JSONDecodeError as exc:
         raise CredentialStoreError("credentials file is invalid JSON") from exc

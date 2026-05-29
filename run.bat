@@ -24,9 +24,12 @@ goto collect_args
 if not defined INSIDE_WT if not defined WT_SESSION (
     where wt.exe >nul 2>&1
     if not errorlevel 1 (
-        wt.exe -w 0 --size %WT_COLUMNS%,%WT_LINES% -d "%PROJECT_DIR%" cmd.exe /k call "%~f0" --inside-wt %APP_ARGS%
-        exit /b 0
+        wt.exe -w new --size %WT_COLUMNS%,%WT_LINES% -d "%PROJECT_DIR%" cmd.exe /k call "%~f0" --inside-wt %APP_ARGS%
+        if not errorlevel 1 exit /b 0
     )
+
+    start "BDO OutfitBot" cmd.exe /k call "%~f0" --inside-wt %APP_ARGS%
+    exit /b 0
 )
 
 if exist ".venv\Scripts\python.exe" (

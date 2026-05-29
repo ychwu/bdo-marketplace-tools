@@ -1,14 +1,20 @@
 import asyncio
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import main as app_main
+from rich.console import Console
 from textual.color import Color
-from textual.widgets import Input
+from textual.widgets import Button, Input, Static
 from market.api_handler import APIHandler, MarketplaceAPIError, MarketplaceResponseError, purchase_result_message
 from market.pricing import apply_price_rules, purchase_record_count, purchase_record_spend
+from resources import credentials as credentials_module
+from resources import task_manager as task_manager_module
 from resources.task_manager import BackgroundTasks
-from resources.textual_ui import BANNER_ART, DEFAULT_THEME, STATUS_STYLES, DashboardTile, MarketplaceToolsApp
+from resources.textual_ui import BANNER_ART, DEFAULT_THEME, STATUS_STYLES, DashboardTile, MarketplaceToolsApp, ModalAction
 
 
 LOCAL_DATA = {
@@ -124,6 +130,46 @@ class APIResultTests(unittest.TestCase):
         with self.assertRaises(MarketplaceResponseError):
             APIHandler._purchase_result_code(handler, {})
 
+    def test_missing_session_file_is_initialized_with_empty_cookie_store(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_path = Path(temp_dir) / "resources" / "session.json"
+            handler = object.__new__(APIHandler)
+
+            with patch("market.api_handler.SESSION_COOKIE_PATH", session_path), patch(
+                "market.api_handler.LEGACY_SESSION_PATHS",
+                (),
+            ):
+                status = APIHandler.load_session(handler)
+
+            self.assertEqual(status, -1)
+            self.assertTrue(session_path.exists())
+            self.assertEqual(json.loads(session_path.read_text(encoding="utf-8")), {"version": 1, "cookies": []})
+
+
+class LocalRuntimeFileTests(unittest.TestCase):
+    def test_missing_credentials_file_is_initialized_empty(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            info_path = Path(temp_dir) / "resources" / "info.json"
+
+            with patch("resources.credentials.INFO_PATH", info_path):
+                self.assertEqual(credentials_module.load_credentials(), (None, None))
+
+            self.assertTrue(info_path.exists())
+            self.assertEqual(json.loads(info_path.read_text(encoding="utf-8")), {})
+
+    def test_missing_local_data_file_is_initialized_with_default_totals(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_data_path = Path(temp_dir) / "resources" / "local_data.json"
+
+            with patch("resources.task_manager.LOCAL_DATA_PATH", local_data_path):
+                data = task_manager_module._load_local_data()
+
+            self.assertEqual(data, LOCAL_DATA)
+            self.assertTrue(local_data_path.exists())
+            payload = json.loads(local_data_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload, LOCAL_DATA)
+            self.assertNotIn("updated_at", payload)
+
 
 class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_buy_item_validates_session_before_purchase_requests(self):
@@ -203,6 +249,25 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         await manager.stop_login_status_checker()
         self.assertIsNone(manager.login_checker_task)
 
+    async def test_monitor_start_and_stop_are_idempotent(self):
+        manager = self.make_task_manager()
+
+        async def idle_checker():
+            await asyncio.sleep(60)
+
+        manager.checker = idle_checker
+
+        self.assertTrue(await manager.start_checker())
+        first_task = manager.checker_task
+        self.assertFalse(await manager.start_checker())
+        self.assertIs(manager.checker_task, first_task)
+        self.assertTrue(manager.checker_enabled)
+
+        self.assertTrue(await manager.stop_checker())
+        self.assertFalse(manager.checker_enabled)
+        self.assertFalse(await manager.stop_checker())
+        self.assertFalse(manager.checker_enabled)
+
     async def test_custom_delay_range_feeds_monitor_sleep_bounds(self):
         manager = self.make_task_manager()
         manager.set_custom_delay_range(8, 13)
@@ -248,6 +313,35 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.lifetime_successful_purchases, 1)
         self.assertGreater(manager.session_silver_spent, 0)
         save_mock.assert_called_once()
+
+    async def test_simulated_session_buy_mode_does_not_call_purchase_api(self):
+        manager = self.make_task_manager()
+        manager.set_simulated_session(True)
+        manager.purchase_submission_enabled = True
+        manager.api_handler.buy_item = AsyncMock()
+
+        with patch.object(manager, "save_local_data") as save_mock:
+            await manager.process_detected_outfits([["debug-premium-outfit", "1", "2020000000"]])
+
+        manager.api_handler.buy_item.assert_not_called()
+        self.assertTrue(manager.api_handler.login_status)
+        self.assertTrue(manager.simulated_session_enabled)
+        self.assertEqual(manager.session_detected_outfits, 1)
+        self.assertEqual(manager.session_successful_purchases, 1)
+        self.assertGreater(manager.session_silver_spent, 0)
+        self.assertTrue(any("Test-mode purchase simulated" in event for event in manager.events))
+        save_mock.assert_called_once()
+
+    async def test_disabling_simulated_session_returns_to_watch_only(self):
+        manager = self.make_task_manager()
+        manager.set_simulated_session(True)
+        manager.purchase_submission_enabled = True
+
+        manager.set_simulated_session(False)
+
+        self.assertFalse(manager.api_handler.login_status)
+        self.assertFalse(manager.simulated_session_enabled)
+        self.assertFalse(manager.purchase_submission_enabled)
 
     async def test_zero_purchase_summary_does_not_save_local_data(self):
         manager = self.make_task_manager()
@@ -340,6 +434,11 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(100, 36)) as pilot:
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertEqual(app.theme, DEFAULT_THEME)
+                self.assertEqual(len(list(app.query("AppHeader"))), 1)
+                self.assertEqual(len(list(app.query("HeaderIcon"))), 0)
+                self.assertEqual(len(list(app.query("HeaderClock"))), 1)
+                await pilot.click("#app-header")
+                self.assertFalse(app.query_one("#app-header").has_class("-tall"))
                 self.assertEqual(app.query_one("#banner").render(), BANNER_ART)
                 self.assertTrue(app.query_one("#banner").display)
                 self.assertFalse(app.query_one("#screen-title").display)
@@ -349,6 +448,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(app.query_one("#screen-title").display)
                 await pilot.press("3")
                 self.assertEqual(app.current_view, "stats")
+                self.assertEqual(len(list(app.query("#stats-output"))), 0)
+                self.assertEqual(len(list(app.query(".stats-tile"))), 6)
                 await pilot.press("escape")
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertTrue(app.query_one("#banner").display)
@@ -391,6 +492,16 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Credentials saved", app.status_message)
                 self.assertEqual([type(screen).__name__ for screen in app.screen_stack], ["Screen"])
 
+    async def test_saved_credentials_are_labeled_set_not_authenticated_ready(self):
+        app = self.make_app()
+        with patch("resources.textual_ui.load_credentials", return_value=("user@example.com", "secret")):
+            async with app.run_test(size=(100, 36)):
+                credential_status, credential_detail, credential_level, _, _ = app.credential_state()
+
+        self.assertEqual(credential_status, "Set")
+        self.assertEqual(credential_detail, "us**@example.com")
+        self.assertEqual(credential_level, "success")
+
     async def test_dashboard_live_metrics_refresh(self):
         app = self.make_app()
         with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
@@ -424,6 +535,12 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("50%", rendered_tiles)
                 self.assertIn("1.5B silver", rendered_tiles)
 
+                await pilot.click("#tile-monitor")
+                await pilot.pause()
+                monitor_note = str(app.query_visible_one(".modal-note", Static).render())
+                self.assertIn("online marketplace session", monitor_note)
+                self.assertIn("refresh Session from the dashboard", monitor_note)
+                await pilot.press("escape")
                 await pilot.click("#tile-spent")
                 await pilot.pause()
                 self.assertEqual(app.current_view, "dashboard")
@@ -487,6 +604,44 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.current_view, "dashboard")
                 await pilot.click("#tile-runtime")
                 self.assertEqual(app.current_view, "dashboard")
+
+    async def test_stats_page_uses_tiles_without_local_file_path(self):
+        app = self.make_app()
+        app.task_manager.session_detected_outfits = 5
+        app.task_manager.session_successful_purchases = 4
+        app.task_manager.session_silver_spent = 2_000_000_000
+        app.task_manager.lifetime_successful_purchases = 9
+        app.task_manager.lifetime_silver_spent = 12_000_000_000
+        app.task_manager.reload_lifetime_stats = lambda: None
+
+        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.press("3")
+                self.assertIsInstance(app.query_one("#refresh-stats"), ModalAction)
+                self.assertEqual(list(app.query("#stats-actions Button")), [])
+                stat_tiles = [
+                    app.query_one("#stats-session-detected", Static),
+                    app.query_one("#stats-session-purchases", Static),
+                    app.query_one("#stats-session-rate", Static),
+                    app.query_one("#stats-session-spent", Static),
+                    app.query_one("#stats-lifetime-purchases", Static),
+                    app.query_one("#stats-lifetime-spent", Static),
+                ]
+                console = Console(width=100, color_system=None)
+                with console.capture() as capture:
+                    for tile in stat_tiles:
+                        console.print(tile.content)
+                rendered = capture.get()
+                border_titles = "\n".join(str(tile.border_title) for tile in stat_tiles)
+                await pilot.click("#refresh-stats")
+                await pilot.pause()
+
+        self.assertIn("Success Rate", border_titles)
+        self.assertIn("80%", rendered)
+        self.assertIn("2B silver", rendered)
+        self.assertIn("12B silver", rendered)
+        self.assertNotIn("Local Data File", rendered)
+        self.assertEqual(app.status_message, "Stats refreshed.")
 
     async def test_purchase_success_rate_uses_color_spectrum(self):
         app = self.make_app()
@@ -553,6 +708,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
             async with test_app.run_test(size=(100, 36)):
                 self.assertEqual(len(list(test_app.query("#test-controls"))), 1)
+                self.assertEqual(len(list(test_app.query("#toggle-test-session"))), 1)
                 self.assertEqual(len(list(test_app.query("#fake-detection"))), 1)
                 self.assertEqual(len(list(test_app.query("#fake-buy-success"))), 1)
 
@@ -629,6 +785,46 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(app.task_manager.session_silver_spent, 0)
         save_mock.assert_called_once()
 
+    async def test_test_session_toggle_allows_buy_mode_without_live_purchase_api(self):
+        app = self.make_app(launch_mode="test")
+        app.task_manager.purchase_submission_enabled = True
+        app.api_handler.buy_item = AsyncMock()
+
+        async def idle_checker():
+            await asyncio.sleep(60)
+
+        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch.object(
+            app.task_manager,
+            "checker",
+            new=idle_checker,
+        ), patch.object(app.task_manager, "save_local_data"):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.click("#toggle-test-session")
+                await pilot.pause()
+                self.assertTrue(app.task_manager.simulated_session_enabled)
+                self.assertTrue(app.api_handler.login_status)
+                self.assertIn("Test session marked valid", app.status_message)
+
+                await app.start_monitor()
+                await pilot.pause(0.1)
+                self.assertFalse(app.task_manager.checker_enabled)
+                self.assertIsInstance(app.query_visible_one("#confirm-start"), ModalAction)
+
+                await pilot.click("#confirm-start")
+                await pilot.pause(0.1)
+                self.assertTrue(app.task_manager.checker_enabled)
+                self.assertTrue(app.task_manager.purchase_submission_enabled)
+
+                await app.task_manager.buy_item([["debug-premium-outfit", "1", "2020000000"]])
+                app.api_handler.buy_item.assert_not_called()
+                self.assertEqual(app.task_manager.session_successful_purchases, 1)
+
+                await pilot.click("#toggle-test-session")
+                await pilot.pause()
+                self.assertFalse(app.task_manager.simulated_session_enabled)
+                self.assertFalse(app.api_handler.login_status)
+                self.assertFalse(app.task_manager.purchase_submission_enabled)
+
     async def test_watch_only_start_works_logged_out_and_buy_mode_blocks(self):
         app = self.make_app()
 
@@ -651,6 +847,123 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(app.task_manager.checker_enabled)
                 self.assertIn("Login or refresh", app.status_message)
 
+    async def test_repeated_start_and_stop_controls_log_without_duplicate_monitor_tasks(self):
+        app = self.make_app()
+
+        async def idle_checker():
+            await asyncio.sleep(60)
+
+        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch.object(
+            app.task_manager,
+            "checker",
+            new=idle_checker,
+        ):
+            async with app.run_test(size=(100, 36)):
+                await app.stop_monitor()
+                self.assertIn("already stopped", app.status_message)
+
+                await app.start_monitor()
+                first_task = app.task_manager.checker_task
+                self.assertTrue(app.task_manager.checker_enabled)
+
+                await app.start_monitor()
+                self.assertIs(app.task_manager.checker_task, first_task)
+                self.assertIn("already running", app.status_message)
+                self.assertTrue(any("no additional monitor task started" in event for event in app.task_manager.events))
+
+                await app.stop_monitor()
+                self.assertFalse(app.task_manager.checker_enabled)
+
+    async def test_monitor_modal_buttons_follow_running_state_and_watch_start_closes_modal(self):
+        app = self.make_app()
+
+        async def idle_checker():
+            await asyncio.sleep(60)
+
+        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch.object(
+            app.task_manager,
+            "checker",
+            new=idle_checker,
+        ):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.click("#tile-monitor")
+                await pilot.pause()
+                self.assertFalse(app.query_visible_one("#modal-start-monitor", Button).disabled)
+                self.assertTrue(app.query_visible_one("#modal-stop-monitor", Button).disabled)
+
+                await pilot.click("#modal-start-monitor")
+                await pilot.pause(0.1)
+                self.assertTrue(app.task_manager.checker_enabled)
+                self.assertEqual([type(screen).__name__ for screen in app.screen_stack], ["Screen"])
+
+                await pilot.click("#tile-monitor")
+                await pilot.pause()
+                self.assertTrue(app.query_visible_one("#modal-start-monitor", Button).disabled)
+                self.assertFalse(app.query_visible_one("#modal-stop-monitor", Button).disabled)
+
+                await app.stop_monitor()
+
+    async def test_buy_mode_start_confirmation_closes_monitor_modal_stack(self):
+        app = self.make_app()
+        app.api_handler.login_status = True
+        app.api_handler.email = "user@example.com"
+        app.task_manager.purchase_submission_enabled = True
+
+        async def idle_checker():
+            await asyncio.sleep(60)
+
+        with patch("resources.textual_ui.load_credentials", return_value=("user@example.com", "secret")), patch.object(
+            app.task_manager,
+            "checker",
+            new=idle_checker,
+        ):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.click("#tile-monitor")
+                await pilot.pause()
+                await pilot.click("#modal-start-monitor")
+                await pilot.pause(0.1)
+                self.assertEqual(type(app.screen_stack[-1]).__name__, "ConfirmBuyModeScreen")
+
+                await pilot.click("#confirm-start")
+                await pilot.pause(0.1)
+                self.assertTrue(app.task_manager.checker_enabled)
+                self.assertEqual([type(screen).__name__ for screen in app.screen_stack], ["Screen"])
+
+                await app.stop_monitor()
+
+    async def test_running_watch_monitor_requires_confirmation_before_buy_mode(self):
+        app = self.make_app()
+        app.api_handler.login_status = True
+        app.api_handler.email = "user@example.com"
+
+        async def idle_checker():
+            await asyncio.sleep(60)
+
+        with patch("resources.textual_ui.load_credentials", return_value=("user@example.com", "secret")), patch.object(
+            app.task_manager,
+            "checker",
+            new=idle_checker,
+        ):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await app.start_monitor()
+                first_task = app.task_manager.checker_task
+                self.assertTrue(app.task_manager.checker_enabled)
+                self.assertFalse(app.task_manager.purchase_submission_enabled)
+
+                await app.apply_purchase_mode(True)
+                await pilot.pause(0.1)
+                self.assertFalse(app.task_manager.purchase_submission_enabled)
+                self.assertIs(app.task_manager.checker_task, first_task)
+                self.assertIsInstance(app.query_visible_one("#confirm-start"), ModalAction)
+
+                await pilot.click("#confirm-start")
+                await pilot.pause(0.1)
+                self.assertTrue(app.task_manager.purchase_submission_enabled)
+                self.assertIs(app.task_manager.checker_task, first_task)
+                self.assertIn("Buy mode enabled", app.status_message)
+
+                await app.stop_monitor()
+
     async def test_buy_mode_requires_confirmation_before_starting(self):
         app = self.make_app()
         app.api_handler.login_status = True
@@ -669,6 +982,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await app.start_monitor()
                 await pilot.pause(0.1)
                 self.assertFalse(app.task_manager.checker_enabled)
+                self.assertIsInstance(app.query_visible_one("#confirm-start"), ModalAction)
+                self.assertIn("modal-action-tile", app.query_visible_one("#confirm-start", ModalAction).classes)
                 await pilot.click("#confirm-start")
                 await pilot.pause(0.1)
                 self.assertTrue(app.task_manager.checker_enabled)

@@ -1,5 +1,4 @@
 requests
-bitstring
 colorama
 keyring
 rich

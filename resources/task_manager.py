@@ -16,6 +16,7 @@ DEFAULT_LOCAL_DATA = {
     "silver_spent": 0,
 }
 DEBUG_OUTFIT_LISTING = [["debug-premium-outfit", "1", "2020000000"]]
+SIMULATED_SESSION_EMAIL = "test-session@example.local"
 
 
 def _safe_int(value):
@@ -29,13 +30,23 @@ def _load_local_data():
     try:
         with LOCAL_DATA_PATH.open("r", encoding="utf-8") as data_file:
             data = json.load(data_file)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except FileNotFoundError:
+        _create_default_local_data()
+        return DEFAULT_LOCAL_DATA.copy()
+    except (json.JSONDecodeError, OSError):
         return DEFAULT_LOCAL_DATA.copy()
 
     return {
         "successful_purchases": _safe_int(data.get("successful_purchases")),
         "silver_spent": _safe_int(data.get("silver_spent")),
     }
+
+
+def _create_default_local_data():
+    LOCAL_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCAL_DATA_PATH.open("w", encoding="utf-8") as data_file:
+        json.dump(DEFAULT_LOCAL_DATA, data_file, indent=2)
+        data_file.write("\n")
 
 
 def _save_local_data(data):
@@ -69,6 +80,7 @@ class BackgroundTasks:
         self.session_detected_outfits = 0
         self.session_successful_purchases = 0
         self.session_silver_spent = 0
+        self.simulated_session_enabled = False
         self.lifetime_successful_purchases = local_data["successful_purchases"]
         self.lifetime_silver_spent = local_data["silver_spent"]
 
@@ -133,13 +145,17 @@ class BackgroundTasks:
 
     async def start_checker(self):
         if self.purchase_submission_enabled and not self.api_handler.login_status:
-            return
+            return False
 
-        if self.checker_task is None or self.checker_task.done():
-            self.checker_started_at = time.monotonic()
-            self.checker_task = asyncio.create_task(self.checker())
-            self.checker_task.add_done_callback(self._handle_checker_done)
+        if self.checker_task is not None and not self.checker_task.done():
             self.checker_enabled = True
+            return False
+
+        self.checker_started_at = time.monotonic()
+        self.checker_task = asyncio.create_task(self.checker())
+        self.checker_task.add_done_callback(self._handle_checker_done)
+        self.checker_enabled = True
+        return True
 
     def _handle_checker_done(self, task):
         if task.cancelled():
@@ -159,6 +175,7 @@ class BackgroundTasks:
             self.checker_task = None
 
     async def stop_checker(self):
+        was_running = bool(self.checker_task and not self.checker_task.done())
         if self.checker_task and not self.checker_task.done():
             self.checker_task.cancel()
             try:
@@ -169,6 +186,7 @@ class BackgroundTasks:
         self.checker_enabled = False
         self.checker_started_at = None
         self.checker_task = None
+        return was_running
 
     def start_login_status_checker(self):
         if self.login_checker_task is None or self.login_checker_task.done():
@@ -223,26 +241,40 @@ class BackgroundTasks:
         self.add_event(f"Outfit detected: {detected_count} available outfits. Simulating purchase.", "success")
 
         adjusted_buy_list = await self.adjust_prices(DEBUG_OUTFIT_LISTING)
-        purchase_records = [
-            {
-                "item_id": item_id,
-                "price": int(price),
-                "count": int(stock),
-                "result_code": 0,
-            }
-            for item_id, stock, price in adjusted_buy_list
-        ]
-        self.record_purchase_summary(
-            {
-                "purchase_records": purchase_records,
-                "events": [
-                    {
-                        "level": "success",
-                        "message": f"Simulated purchase succeeded for {detected_count} outfit.",
-                    }
-                ],
-            }
-        )
+        self.record_purchase_summary(self._simulated_purchase_summary(adjusted_buy_list, "Simulated purchase succeeded"))
+
+    def set_simulated_session(self, enabled):
+        self.simulated_session_enabled = bool(enabled)
+        self.api_handler.login_status = bool(enabled)
+        if enabled and not getattr(self.api_handler, "email", None):
+            self.api_handler.email = SIMULATED_SESSION_EMAIL
+        if not enabled and getattr(self.api_handler, "email", None) == SIMULATED_SESSION_EMAIL:
+            self.api_handler.email = None
+        if not enabled:
+            self.purchase_submission_enabled = False
+
+    def _simulated_purchase_summary(self, buy_list, label="Test-mode purchase simulated"):
+        purchase_records = []
+        for item_id, stock, price in buy_list:
+            purchase_records.append(
+                {
+                    "item_id": item_id,
+                    "price": int(price),
+                    "count": int(stock),
+                    "result_code": 0,
+                }
+            )
+
+        purchased_count = purchase_record_count(purchase_records)
+        return {
+            "purchase_records": purchase_records,
+            "events": [
+                {
+                    "level": "success",
+                    "message": f"{label} for {purchased_count} outfit.",
+                }
+            ],
+        }
 
     async def buy_item(self, buy_list):
         updated_buy_list = await self.adjust_prices(buy_list)
@@ -250,6 +282,10 @@ class BackgroundTasks:
 
         if not capped_buy_list:
             self.add_event("Purchase skipped: spend cap would be exceeded.", "warning")
+            return
+
+        if self.simulated_session_enabled:
+            self.record_purchase_summary(self._simulated_purchase_summary(capped_buy_list))
             return
 
         try:

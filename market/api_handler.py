@@ -436,8 +436,12 @@ class APIHandler:
                     self.save_session()
                     return 0
             except Exception:
+                if not SESSION_COOKIE_PATH.exists():
+                    self.save_session()
                 return -1
 
+        if not SESSION_COOKIE_PATH.exists():
+            self.save_session()
         return -1
 
     def _load_cookies(self, cookies):
