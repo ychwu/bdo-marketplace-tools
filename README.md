@@ -11,27 +11,28 @@ The app is designed around safety-first defaults: watch-only monitoring is the n
 
 ### Core Capabilities
 
-- Monitors Black Desert Online marketplace outfit listings from a terminal dashboard.
-- Runs in watch-only mode by default so availability can be tracked without submitting purchase requests.
-- Supports an explicitly confirmed buy mode for authenticated purchase attempts.
-- Lets users configure marketplace polling speed and a separate delay between individual buy attempts.
-- Applies a current-session spend cap before purchase requests are sent.
-- Tracks session detections, successful purchases, silver spent, runtime, and lifetime local totals.
-- Displays marketplace session state, saved credential state, monitor status, and recent events in one dashboard.
-- Provides a marketplace wallet view for checking stored silver, Value Pack state, and marketplace weight data.
+- Live interactive dashboard.
+- Monitors BDO marketplace for outfit listings.
+- Automated purchasing of outfits upon detection.
+- Adjustable marketplace polling speed and delay between individual buy attempts.
+- Custom silver spend cap per session, stopping future purchases if cap is met.
+- Tracks current session's outfit detections, successful purchases, and silver spent. 
+- Tracks lifetime silver spent, and successful purchases.
+- Provides logging for actions, purchases, detection, and errors.
+- Provides a marketplace wallet view for checking stored silver, Value Pack state, and marketplace inventory data (WIP).
 
 ### Technical Features
 
-- Reverse-engineered marketplace API integration across public listing endpoints, authenticated session endpoints, wallet data, and buy submission flow.
-- Concurrent public category scanning for male/female outfit sections with isolated unauthenticated request state.
-- Custom decoder for the marketplace's packed Huffman response format, including optimized byte-transition decoding for repeated polling.
-- Cookie-based session persistence with migration away from legacy pickled session storage.
-- Credential handling split between local email storage and OS keyring-backed password storage.
-- Structured error handling around network timeouts, invalid JSON, unexpected API shapes, expired sessions, and known purchase result codes.
-- Purchase accounting that parses `BuyItem` responses to distinguish immediate purchases from pre-order placement and records actual execution price.
-- Long-running async task orchestration for polling, session refresh checks, monitor crash handling, and capped backoff after repeated failures.
-- Textual terminal UI with live dashboard updates, modal-based controls, confirmation flows, and headless UI test coverage.
-- Focused unit coverage for scan parsing, pricing conversion, spend caps, session refresh behavior, buy-result handling, runtime file initialization, and dashboard workflows.
+- Marketplace API integration for listing scans, wallet data, session refresh, authentication, and `BuyItem` purchase requests.
+- Concurrent marketplace polling with isolated unauthenticated `requests.Session` clients for male and female outfit categories, preserving connection reuse without sharing authenticated state.
+- Custom Huffman response decoder for packed marketplace payloads, optimized for repeated high-frequency scans.
+- Async monitor orchestration around blocking HTTP calls using `asyncio.to_thread()`, randomized polling windows, capped retry backoff, task lifecycle guards, and crash-aware monitor state.
+- Secure session and credential persistence with JSON cookie storage, legacy pickle-session migration, local email initialization, and OS keyring-backed password storage.
+- Safety-gated purchase pipeline with explicit buy-mode confirmation, spend-cap enforcement, configurable per-item buy delay, session-expiration recovery, and one-time retry on expired marketplace sessions.
+- Structured purchase result parsing that separates fulfilled purchases from pre-order placements, records actual execution prices, and maps known marketplace result codes into actionable event-log messages.
+- Resilient network and response validation for timeouts, malformed JSON, unexpected API shapes, invalid listing rows, stale pricing, duplicate orders, and unavailable items.
+- Textual-based terminal dashboard with live runtime metrics, modal control flows, wallet/status views, test-mode-only simulation controls, and headless UI workflow tests.
+- Focused unit coverage for listing parsing, pricing conversion, spend caps, session refresh behavior, purchase accounting, runtime file initialization, and dashboard workflows.
 
 ## How It Works
 
@@ -81,9 +82,15 @@ This repository is provided as a proof of concept for authenticated web sessions
 
 If your IP reputation is low, the official login flow may present a CAPTCHA. This project does not handle CAPTCHA challenges. To confirm whether that is the issue, try logging in manually on the [BDO website](https://www.naeu.playblackdesert.com/en-US/Main/Index).
 
-If you encounter `unexpected result code 34` when attempting to make a purchase, it usually means the outfit went out of stock before the request completed, or the request would create a duplicate pre-order.
+Known marketplace purchase result codes:
 
-`unexpected result code -14` means price mismatch. This can happen when Pearl Abyss changes max prices or when an item has not reached its max price yet.
+- `resultCode=0`: request accepted. This can be an immediate purchase or a successfully placed pre-order; the app checks `resultMsg` before counting it as a purchase.
+- `resultCode=30`: identical order already exists. This has been observed with `resultMsg=eErrNoAlreadyReservationDay`.
+- `resultCode=34`: item unavailable, already taken, or the request would create a duplicate pre-order.
+- `resultCode=-14`: price mismatch. This can happen when submitted pricing is stale, the item's max price changed, or the item is not currently valid at the submitted price.
+- `resultCode=2000`: marketplace login session expired. The app attempts to refresh/re-authenticate and retries the same item once.
+
+Unknown purchase codes are reported as `resultCode {code}` in the event log so they can be documented after a new capture.
 
 ## Contact
 
