@@ -3,7 +3,7 @@
 ![Marketplace Tools dashboard](docs/assets/dashboard.png)
 
 
-Python CLI app for monitoring the *Black Desert Online* marketplace. It maintains an authenticated marketplace session, and is able to execute buy orders remotely. It continuously check for outfit availability with a custom delay in the background, and purchase them upon detection, in milliseconds.
+Python CLI app for monitoring the *Black Desert Online* marketplace through authenticated HTTP/API requests. It maintains a persistent marketplace session, continuously checks for outfit listings at a custom polling interval, handles long-running monitoring sessions with custom built re-authentication workflow, and executes buy-order requests as soon as matching items become available, in millieseconds.
 
 
 ## Features
