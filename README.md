@@ -3,9 +3,8 @@
 ![Marketplace Tools dashboard](docs/assets/dashboard.png)
 
 
-Marketplace Tools is a Python CLI app for monitoring the *Black Desert Online* marketplace from an authenticated session. It demonstrates how to maintain a marketplace login session, inspect outfit availability through HTTP requests, decode marketplace responses, and run a configurable long-lived monitor.
+Python CLI app for monitoring the *Black Desert Online* marketplace. It maintains an authenticated marketplace session, and is able to execute buy orders remotely. It continuously check for outfit availability with a custom delay in the background, and purchase them upon detection, in milliseconds.
 
-The app is designed around safety-first defaults: watch-only monitoring is the normal starting point, while buy mode must be explicitly enabled and confirmed before authenticated purchase requests are submitted.
 
 ## Features
 
@@ -82,13 +81,12 @@ This repository is provided as a proof of concept for authenticated web sessions
 
 If your IP reputation is low, the official login flow may present a CAPTCHA. This project does not handle CAPTCHA challenges. To confirm whether that is the issue, try logging in manually on the [BDO website](https://www.naeu.playblackdesert.com/en-US/Main/Index).
 
-Known marketplace purchase result codes:
+Known problematic result codes:
 
-- `resultCode=0`: request accepted. This can be an immediate purchase or a successfully placed pre-order; the app checks `resultMsg` before counting it as a purchase.
 - `resultCode=30`: identical order already exists. This has been observed with `resultMsg=eErrNoAlreadyReservationDay`.
 - `resultCode=34`: item unavailable, already taken, or the request would create a duplicate pre-order.
-- `resultCode=-14`: price mismatch. This can happen when submitted pricing is stale, the item's max price changed, or the item is not currently valid at the submitted price.
-- `resultCode=2000`: marketplace login session expired. The app attempts to refresh/re-authenticate and retries the same item once.
+- `resultCode=-14`: price mismatch. This can happen when PA decide to change max outfit prices. needs updating if that's the case.
+- `resultCode=2000`: marketplace login session expired upon buy attempt. The app attempts to refresh/re-authenticate and re buy the item.
 
 Unknown purchase codes are reported as `resultCode {code}` in the event log so they can be documented after a new capture.
 
