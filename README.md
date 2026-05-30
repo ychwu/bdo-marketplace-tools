@@ -2,9 +2,8 @@
 
 ![Marketplace Tools dashboard](docs/assets/dashboard.png)
 
-## About the Project
 
-Marketplace Tools is a Python terminal app for monitoring the *Black Desert Online* marketplace from an authenticated session. It demonstrates how to maintain a marketplace login session, inspect outfit availability through HTTP requests, decode marketplace responses, and run a configurable long-lived monitor.
+Marketplace Tools is a Python CLI app for monitoring the *Black Desert Online* marketplace from an authenticated session. It demonstrates how to maintain a marketplace login session, inspect outfit availability through HTTP requests, decode marketplace responses, and run a configurable long-lived monitor.
 
 The app is designed around safety-first defaults: watch-only monitoring is the normal starting point, while buy mode must be explicitly enabled and confirmed before authenticated purchase requests are submitted.
 
@@ -35,9 +34,9 @@ This project is currently undergoing a codebase rewrite and Textual UI migration
 
 ## Supported Versions
 
-Last verified against the supported marketplace flow: July 14, 2025.
+Last verified compatibility: July 14, 2025.
 
-Steam accounts and OTP-enabled accounts are not supported. Only launcher accounts without OTP are supported.
+Steam accounts and OTP-enabled accounts are not supported (yet). Only launcher accounts without OTP are supported.
 
 ## Running the App
 
