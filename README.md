@@ -33,14 +33,6 @@ Python CLI app for monitoring the *Black Desert Online* marketplace through auth
 - Textual-based terminal dashboard with live runtime metrics, modal control flows, wallet/status views, test-mode-only simulation controls, and headless UI workflow tests.
 - Focused unit coverage for listing parsing, pricing conversion, spend caps, session refresh behavior, purchase accounting, runtime file initialization, and dashboard workflows.
 
-## How It Works
-
-The monitor checks the public outfit marketplace categories on a configurable polling window. It pulls the male and female outfit subcategories concurrently, decodes the packed marketplace response, and filters rows with available stock.
-
-When running in watch-only mode, detections are written to the dashboard event log without making purchase requests. When buy mode is enabled, detections pass through outfit price rules, the current spend cap, and a configurable delay between individual buy attempts.
-
-Authenticated requests use a saved marketplace cookie session when available. The app can refresh session validity, re-authenticate with saved credentials when needed, and record successful purchases using the actual price returned by the marketplace API.
-
 ## Project Status
 
 This project is currently undergoing a codebase rewrite and Textual UI migration. Features may be incomplete, unstable, or temporarily broken while the modernization work is in progress.
