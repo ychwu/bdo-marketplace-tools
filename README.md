@@ -22,7 +22,7 @@ The project covers browser network analysis, request payload debugging, session 
 
 ## How It Works
 
-When enabled, the app periodically checks outfit marketplace categories using a preset or custom delay window. The default mode is watch-only, which reports availability without submitting purchase requests and can run without logging in. A separate buy mode can be enabled from the dashboard monitor controls and requires an authenticated session plus confirmation before the monitor starts.
+When enabled, the app periodically checks outfit marketplace categories using a preset or custom polling delay window. The default mode is watch-only, which reports availability without submitting purchase requests and can run without logging in. A separate buy mode can be enabled from the dashboard monitor controls and requires an authenticated session plus confirmation before the monitor starts. Buy mode also has a separate configurable buy delay, which spaces out individual purchase requests after detections.
 
 The app uses your login credentials to authenticate with the official [BDO web marketplace](https://na-trade.naeu.playblackdesert.com/Intro/). The email is stored locally, while the password is stored through the operating system keyring. The app can also persist and reuse marketplace sessions, then re-authenticate when a session expires.
 
@@ -38,7 +38,9 @@ py -3 main.py --test-mode
 
 You can also set `BDO_MARKET_TEST_MODE=1`. Test mode skips only the automatic startup session check; explicit actions such as session refresh, wallet refresh, or starting the monitor can still call live marketplace endpoints.
 
-In test mode, extra sidebar controls are available for interface and debug work: adding synthetic event-log rows, toggling a simulated valid session, faking a watch-only outfit detection, and simulating purchase accounting without calling the live buy API.
+In test mode, extra sidebar controls are available for interface and debug work: adding synthetic event-log rows, toggling a simulated valid session, running a public single-item scan, faking a watch-only outfit detection, and simulating purchase accounting without calling the live buy API. These helpers are guarded behind test launch mode, and any live endpoint test requires an authenticated session plus explicit confirmation.
+
+`run.bat` uses Windows Terminal when available so the Textual UI opens at a usable size. Set `BDO_DISABLE_WT=1` before launching to run in the current console instead.
 
 ## Technical Highlights
 
@@ -47,6 +49,7 @@ In test mode, extra sidebar controls are available for interface and debug work:
 - Authenticated HTTP session management with `requests`.
 - Marketplace response decoding using a Huffman decoder.
 - Configurable preset or custom polling delay windows.
+- Configurable buy delay between individual purchase requests.
 - Watch-only mode, buy mode, and spend caps.
 - Local session persistence and automatic re-login flow.
 - Local dashboard statistics for successful purchases and silver spent.

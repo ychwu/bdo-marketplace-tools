@@ -30,7 +30,7 @@ def env_test_mode():
 async def run_app(test_mode=False):
     colorama.init()
     API = APIHandler()
-    task_manager = BackgroundTasks(API)
+    task_manager = BackgroundTasks(API, test_mode_enabled=test_mode)
     launch_mode = "test" if test_mode else "live"
 
     if test_mode:

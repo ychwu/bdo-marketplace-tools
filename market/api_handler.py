@@ -22,6 +22,10 @@ GAME_TRADE_URL = "https://na-game-trade.naeu.playblackdesert.com"
 ACCOUNT_URL = "https://account.pearlabyss.com"
 LOGIN_URL = f"{ACCOUNT_URL}/en-US/Member/Login/LoginProcess"
 FORM_CONTENT_TYPE = "application/x-www-form-urlencoded; charset=UTF-8"
+PUBLIC_MARKET_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": "BlackDesert",
+}
 MARKET_ACCEPT_LANGUAGE = "en-US,en;q=0.9,ko;q=0.8,zh-CN;q=0.7,zh;q=0.6"
 MARKET_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -29,6 +33,7 @@ MARKET_USER_AGENT = (
     "Chrome/148.0.0.0 Safari/537.36"
 )
 MARKET_AJAX_HEADER = "XMLHttpRequest"
+DEFAULT_PURCHASE_DELAY_BOUNDS = (1.0, 2.5)
 
 
 class MarketplaceAPIError(RuntimeError):
@@ -44,6 +49,7 @@ class MarketplaceResponseError(MarketplaceAPIError):
 
 
 PURCHASE_RESULT_REASONS = {
+    30: "an identical order already exists",
     34: "item was unavailable or would create a duplicate pre-order",
     -14: "price mismatch",
     2000: "login session expired",
@@ -58,6 +64,19 @@ def purchase_result_message(result_code, item_id, price):
     if reason:
         return f"Purchase failed for {item_id} at {price} silver: {reason}."
     return f"Purchase failed for {item_id} at {price} silver: resultCode {result_code}."
+
+
+def purchase_success_message(item_id, actual_price, submitted_price=None):
+    if submitted_price is not None and int(submitted_price) != int(actual_price):
+        return (
+            f"Purchase request succeeded for {item_id} at {actual_price} silver "
+            f"(submitted up to {submitted_price})."
+        )
+    return purchase_result_message(0, item_id, actual_price)
+
+
+def purchase_preorder_message(item_id, price):
+    return f"Purchase request placed a pre-order for {item_id} at {price} silver; no stock was bought."
 
 
 def marketplace_silver_balance(wallet_response):
@@ -163,10 +182,7 @@ class APIHandler:
 
     async def check_stock(self):
         url = "https://na-trade.naeu.playblackdesert.com/Trademarket/GetWorldMarketList"
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "BlackDesert",
-        }
+        headers = dict(PUBLIC_MARKET_HEADERS)
         payload_male = {
             "keyType": 0,
             "mainCategory": 55,
@@ -304,13 +320,15 @@ class APIHandler:
         self.login_status = False
         return False
 
-    async def buy_item(self, buy_list):
+    async def buy_item(self, buy_list, purchase_delay_bounds=None):
         url = f"{self._game_trade_url()}/GameTradeMarket/BuyItem"
         headers = self._market_headers(
             f"{self._trade_url()}/",
             origin=self._trade_url(),
             ajax=False,
         )
+        purchase_delay_bounds = self._purchase_delay_bounds(purchase_delay_bounds)
+        purchase_attempts = self._purchase_attempts(buy_list)
 
         summary = {
             "attempted": 0,
@@ -318,6 +336,7 @@ class APIHandler:
             "events": [],
             "purchase_records": [],
             "results": [],
+            "purchase_delay_bounds": purchase_delay_bounds,
         }
 
         try:
@@ -335,89 +354,158 @@ class APIHandler:
             )
             return summary
 
-        for item in buy_list:
-            item_id, stock, price = item[0], item[1], item[2]
-            try:
-                stock_count = int(stock)
-            except ValueError as exc:
-                raise MarketplaceResponseError(f"purchase row had invalid stock: {item}") from exc
+        for attempt_index, (item_id, price) in enumerate(purchase_attempts):
+            payload = {
+                "buyMainKey": item_id,
+                "buySubKey": "0",
+                "buyKeyType": "0",
+                "isWaitItem": "false",
+                "otp": "",
+                "retryBiddingNo": "",
+                "buyPrice": price,
+                "buyCount": "1",
+                "buyChooseKey": "0",
+            }
+            summary["attempted"] += 1
+            response = await self._session_request(
+                "POST",
+                url,
+                "purchase request",
+                headers=headers,
+                data=payload,
+            )
+            response_json = self._json_response(response, "purchase request")
+            result_code = self._purchase_result_code(response_json)
+            result_details = self._purchase_result_details(response_json, item_id, price)
+            if result_code != 0:
+                result_details["outcome"] = "failed"
+                result_details["count"] = 0
 
-            for _ in range(stock_count):
-                payload = {
-                    "buyMainKey": item_id,
-                    "buySubKey": "0",
-                    "buyKeyType": "0",
-                    "isWaitItem": "false",
-                    "otp": "",
-                    "retryBiddingNo": "",
-                    "buyPrice": price,
-                    "buyCount": "1",
-                    "buyChooseKey": "0",
-                }
-                summary["attempted"] += 1
-                response = await self._session_request(
-                    "POST",
-                    url,
-                    "purchase request",
-                    headers=headers,
-                    data=payload,
-                )
-                response_json = self._json_response(response, "purchase request")
-                result_code = self._purchase_result_code(response_json)
+            result_record = {
+                "item_id": result_details["item_id"],
+                "price": result_details["price"],
+                "submitted_price": result_details["submitted_price"],
+                "count": result_details["count"],
+                "result_code": result_code,
+                "outcome": result_details["outcome"],
+                "response": response_json,
+            }
+            if result_details["reservation_id"]:
+                result_record["reservation_id"] = result_details["reservation_id"]
+            summary["results"].append(result_record)
 
-                result_record = {
-                    "item_id": item_id,
-                    "price": int(price),
-                    "count": 1,
-                    "result_code": result_code,
-                    "response": response_json,
-                }
-                summary["results"].append(result_record)
-
-                if result_code == 0:
-                    summary["purchased"] += 1
-                    purchase_record = {
-                        "item_id": item_id,
-                        "price": int(price),
-                        "count": 1,
-                        "result_code": result_code,
-                    }
-                    summary["purchase_records"].append(purchase_record)
+            if result_code == 0:
+                if result_details["outcome"] != "purchase":
                     summary["events"].append(
                         {
-                            "level": "success",
-                            "message": purchase_result_message(result_code, item_id, price),
+                            "level": "warning",
+                            "message": purchase_preorder_message(
+                                result_details["item_id"],
+                                result_details["price"],
+                            ),
                         }
                     )
-                    await asyncio.sleep(random.uniform(1, 2.5))
-                    continue
+                    break
 
-                if result_code == 2000:
-                    summary["events"].append(
-                        {"level": "warning", "message": "Login session expired. Attempting to re-authenticate."}
-                    )
-                    try:
-                        reauthenticated = await self.ensure_session_valid()
-                    except MarketplaceAPIError as exc:
-                        summary["events"].append({"level": "error", "message": f"Re-authentication failed: {exc}"})
-                        return summary
-
-                    if reauthenticated:
-                        summary["events"].append({"level": "success", "message": "Re-authentication succeeded."})
-                        continue
-
-                    summary["events"].append({"level": "error", "message": "Re-authentication failed."})
-                    return summary
-
+                summary["purchased"] += result_details["count"]
+                purchase_record = {
+                    "item_id": result_details["item_id"],
+                    "price": result_details["price"],
+                    "submitted_price": result_details["submitted_price"],
+                    "count": result_details["count"],
+                    "result_code": result_code,
+                }
+                summary["purchase_records"].append(purchase_record)
                 summary["events"].append(
                     {
-                        "level": "warning",
-                        "message": purchase_result_message(result_code, item_id, price),
+                        "level": "success",
+                        "message": purchase_success_message(
+                            result_details["item_id"],
+                            result_details["price"],
+                            result_details["submitted_price"],
+                        )
                     }
                 )
-                break
+                await self._sleep_before_next_purchase_attempt(
+                    attempt_index,
+                    purchase_attempts,
+                    purchase_delay_bounds,
+                )
+                continue
+
+            if result_code == 2000:
+                summary["events"].append(
+                    {"level": "warning", "message": "Login session expired. Attempting to re-authenticate."}
+                )
+                try:
+                    reauthenticated = await self.ensure_session_valid()
+                except MarketplaceAPIError as exc:
+                    summary["events"].append({"level": "error", "message": f"Re-authentication failed: {exc}"})
+                    return summary
+
+                if reauthenticated:
+                    summary["events"].append({"level": "success", "message": "Re-authentication succeeded."})
+                    await self._sleep_before_next_purchase_attempt(
+                        attempt_index,
+                        purchase_attempts,
+                        purchase_delay_bounds,
+                    )
+                    continue
+
+                summary["events"].append({"level": "error", "message": "Re-authentication failed."})
+                return summary
+
+            summary["events"].append(
+                {
+                    "level": "warning",
+                    "message": purchase_result_message(result_code, item_id, price),
+                }
+            )
+            break
 
         return summary
+
+    def _purchase_attempts(self, buy_list):
+        attempts = []
+        for item in buy_list:
+            try:
+                item_id, stock, price = item[0], item[1], item[2]
+            except (IndexError, TypeError) as exc:
+                raise MarketplaceResponseError(f"purchase row had an unexpected shape: {item}") from exc
+
+            try:
+                stock_count = int(stock)
+            except (TypeError, ValueError) as exc:
+                raise MarketplaceResponseError(f"purchase row had invalid stock: {item}") from exc
+
+            for _ in range(max(0, stock_count)):
+                attempts.append((str(item_id), str(price)))
+        return attempts
+
+    def _purchase_delay_bounds(self, purchase_delay_bounds):
+        bounds = DEFAULT_PURCHASE_DELAY_BOUNDS if purchase_delay_bounds is None else purchase_delay_bounds
+        try:
+            low, high = bounds
+            low = float(low)
+            high = float(high)
+        except (TypeError, ValueError) as exc:
+            raise MarketplaceResponseError("purchase delay bounds must be a two-value range") from exc
+
+        if low < 0 or high < 0 or low > high:
+            raise MarketplaceResponseError(
+                "purchase delay bounds must use non-negative seconds with min less than or equal to max"
+            )
+        return (low, high)
+
+    async def _sleep_before_next_purchase_attempt(self, attempt_index, purchase_attempts, purchase_delay_bounds):
+        if attempt_index >= len(purchase_attempts) - 1:
+            return
+
+        low, high = purchase_delay_bounds
+        if high <= 0:
+            return
+
+        await asyncio.sleep(random.uniform(low, high))
 
     def _purchase_result_code(self, response_json):
         if "resultCode" not in response_json:
@@ -426,6 +514,52 @@ class APIHandler:
             return int(response_json["resultCode"])
         except (TypeError, ValueError) as exc:
             raise MarketplaceResponseError("purchase response had an invalid resultCode") from exc
+
+    def _purchase_result_details(self, response_json, item_id, submitted_price):
+        submitted_price = int(submitted_price)
+        details = {
+            "item_id": str(item_id),
+            "submitted_price": submitted_price,
+            "price": submitted_price,
+            "count": 1,
+            "outcome": "purchase",
+            "reservation_id": None,
+        }
+
+        result_msg = response_json.get("resultMsg")
+        if not isinstance(result_msg, str) or not result_msg:
+            return details
+
+        row = result_msg.split("|", 1)[0]
+        parts = row.split("-")
+        if len(parts) < 6:
+            return details
+
+        try:
+            details["item_id"] = parts[0] or details["item_id"]
+            details["count"] = int(parts[4])
+            details["price"] = int(parts[5])
+        except (TypeError, ValueError):
+            return details
+
+        reservation_id = self._optional_positive_int(parts[7] if len(parts) > 7 else None)
+        if reservation_id is not None:
+            details["reservation_id"] = reservation_id
+
+        if details["count"] <= 0:
+            details["outcome"] = "preorder"
+            details["count"] = 0
+
+        return details
+
+    def _optional_positive_int(self, value):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed <= 0:
+            return None
+        return parsed
 
     async def is_session_expired(self):
         if not self.session.cookies:
@@ -442,10 +576,19 @@ class APIHandler:
             data={"_isCalc": "false"},
         )
         response_json = self._json_response(response, "session refresh")
-        if "_resultCode" not in response_json:
-            raise MarketplaceResponseError("session refresh response did not include _resultCode")
+        result_code = self._session_refresh_result_code(response_json)
+        return 0 if result_code == 0 else -1
 
-        return 0 if response_json["_resultCode"] == 0 else -1
+    def _session_refresh_result_code(self, response_json):
+        for key in ("_resultCode", "resultCode"):
+            if key not in response_json:
+                continue
+            try:
+                return int(response_json[key])
+            except (TypeError, ValueError) as exc:
+                raise MarketplaceResponseError(f"session refresh response had an invalid {key}") from exc
+
+        raise MarketplaceResponseError("session refresh response did not include _resultCode or resultCode")
 
     def save_session(self):
         SESSION_COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)

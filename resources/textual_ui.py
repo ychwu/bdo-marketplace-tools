@@ -18,6 +18,7 @@ from textual.widgets import Button, Input, Label, ListItem, ListView, RichLog, S
 from textual.widgets._header import HeaderClock
 
 from market.api_handler import marketplace_silver_balance
+from market.test_mode import SINGLE_ITEM_TEST_TARGET
 from resources.credentials import CredentialStoreError, clear_credentials, load_credentials, save_credentials
 from resources.display import (
     APP_TITLE,
@@ -350,11 +351,12 @@ class ConfirmBuyModeScreen(ModalScreen[bool]):
     BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
     CSS = DashboardModalScreen.CSS
 
-    def __init__(self, account: str, polling: str, spend_cap: str) -> None:
+    def __init__(self, account: str, polling: str, spend_cap: str, buy_delay: str) -> None:
         super().__init__()
         self.account = account
         self.polling = polling
         self.spend_cap = spend_cap
+        self.buy_delay = buy_delay
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog", classes="modal-card") as dialog:
@@ -363,6 +365,7 @@ class ConfirmBuyModeScreen(ModalScreen[bool]):
             yield Static("Mode: Buy mode")
             yield Static(f"Polling interval: {self.polling}")
             yield Static(f"Spend cap: {self.spend_cap}")
+            yield Static(f"Buy delay: {self.buy_delay}")
             with Horizontal(id="confirm-actions", classes="modal-actions"):
                 yield ModalAction("Start Buy Mode", "confirm-start")
                 yield ModalAction("Cancel", "confirm-cancel")
@@ -391,8 +394,8 @@ class MonitorModal(DashboardModalScreen):
                 yield Label("Buy mode")
                 yield Switch(value=app.task_manager.purchase_submission_enabled, id="buy-mode-switch")
             with Horizontal(classes="modal-actions"):
-                yield Button("Start", id="modal-start-monitor", variant="primary", disabled=app.task_manager.checker_enabled)
-                yield Button("Stop", id="modal-stop-monitor", variant="warning", disabled=not app.task_manager.checker_enabled)
+                yield Button("Start", id="modal-start-monitor", variant="primary", disabled=app.task_manager.monitor_running())
+                yield Button("Stop", id="modal-stop-monitor", variant="warning", disabled=not app.task_manager.monitor_running())
                 yield Button("Close", id="close-modal")
 
 
@@ -423,10 +426,11 @@ class PollingModal(DashboardModalScreen):
         low, high = app.task_manager.current_delay_bounds()
         with Vertical(classes="modal-card") as dialog:
             dialog.border_title = "Polling"
-            with Horizontal(id="polling-summary", classes="modal-summary-row"):
-                yield Static(id="polling-speed-tile", classes="modal-info-tile modal-info-muted")
-                yield Static(id="polling-interval-tile", classes="modal-info-tile modal-info-muted")
             yield Static("Presets", classes="modal-section-title")
+            yield Static(
+                "Polling controls how often the app checks the marketplace for new listings. Slower polling is calmer; faster polling checks more often.",
+                classes="modal-note",
+            )
             with Horizontal(id="polling-recommendations", classes="modal-summary-row"):
                 yield PollingPresetTile("1", "Fast")
                 yield PollingPresetTile("2", "Balanced")
@@ -439,6 +443,39 @@ class PollingModal(DashboardModalScreen):
                 yield Input(value=str(high), type="integer", placeholder="Seconds", id="custom-delay-max-input")
             with Horizontal(classes="modal-actions"):
                 yield Button("Save", id="save-polling", variant="primary")
+                yield Button("Close", id="close-modal")
+
+
+class BuyDelayModal(DashboardModalScreen):
+    def compose(self) -> ComposeResult:
+        app = self.app
+        low, high = app.task_manager.purchase_delay_bounds
+        with Vertical(classes="modal-card") as dialog:
+            dialog.border_title = "Buy Delay"
+            with Horizontal(id="buy-delay-summary", classes="modal-summary-row"):
+                yield Static(id="buy-delay-current-tile", classes="modal-info-tile modal-info-muted")
+            yield Static(
+                "When a scan finds multiple buyable items, this waits a random amount of time between each purchase attempt. It does not change how often the app scans.",
+                classes="modal-note",
+            )
+            with Horizontal(classes="modal-row"):
+                yield Label("Delay min")
+                yield Input(
+                    value=app.format_delay_seconds(low),
+                    type="number",
+                    placeholder="Seconds",
+                    id="purchase-delay-min-input",
+                )
+            with Horizontal(classes="modal-row"):
+                yield Label("Delay max")
+                yield Input(
+                    value=app.format_delay_seconds(high),
+                    type="number",
+                    placeholder="Seconds",
+                    id="purchase-delay-max-input",
+                )
+            with Horizontal(classes="modal-actions"):
+                yield Button("Save", id="save-buy-delay", variant="primary")
                 yield Button("Close", id="close-modal")
 
 
@@ -654,6 +691,11 @@ class MarketplaceToolsApp(App[None]):
         height: 4;
     }
 
+    .dashboard-tile-column {
+        width: 1fr;
+        height: 8;
+    }
+
     .dashboard-tile {
         width: 1fr;
         height: 4;
@@ -782,6 +824,7 @@ class MarketplaceToolsApp(App[None]):
         self.task_manager = task_manager
         self.api_handler = api_handler
         self.launch_mode = launch_mode
+        self.task_manager.test_mode_enabled = self.is_test_mode
         self.current_view = "dashboard"
         self.status_message = ""
         self._rendered_events: tuple[str, ...] | None = None
@@ -804,6 +847,9 @@ class MarketplaceToolsApp(App[None]):
                     with Vertical(id="test-controls"):
                         yield Button("Add Test Log", id="add-test-log")
                         yield Button("Toggle Test Session", id="toggle-test-session")
+                        yield Button("Start Test Scan", id="start-test-monitor")
+                        yield Button("Start Test Buy", id="start-test-buy")
+                        yield Button("Stop Test Scan", id="stop-test-monitor")
                         yield Button("Fake Detection", id="fake-detection")
                         yield Button("Fake Buy Success", id="fake-buy-success")
             with Vertical(id="main"):
@@ -829,6 +875,7 @@ class MarketplaceToolsApp(App[None]):
 
     async def on_unmount(self) -> None:
         await self.task_manager.stop_checker()
+        await self.task_manager.stop_single_item_test_checker()
         await self.task_manager.stop_login_status_checker()
         self.api_handler.save_session()
 
@@ -868,6 +915,17 @@ class MarketplaceToolsApp(App[None]):
         await self.start_monitor()
 
     async def stop_monitor(self, close_modal: bool = False) -> None:
+        if self.task_manager.single_item_test_checker_enabled and not self.task_manager.checker_enabled:
+            was_running = await self.task_manager.stop_single_item_test_checker()
+            if was_running:
+                self.set_status("Single-item test monitor stopped.", "info")
+            else:
+                self.set_status("Monitor already stopped.", "info")
+            self.refresh_live_widgets()
+            if close_modal:
+                self.close_active_dashboard_modal()
+            return
+
         was_running = await self.task_manager.stop_checker()
         if was_running:
             self.set_status("Monitor stopped.", "info")
@@ -888,19 +946,24 @@ class MarketplaceToolsApp(App[None]):
 
         if view_name == "dashboard":
             dashboard_tiles = Horizontal(
-                Vertical(
-                    Horizontal(
+                Horizontal(
+                    Vertical(
                         DashboardTile("monitor", "Monitor"),
-                        DashboardTile("spent", "Spent"),
-                        DashboardTile("polling", "Polling"),
-                        id="dashboard-primary-row",
-                        classes="dashboard-tile-row",
-                    ),
-                    Horizontal(
-                        DashboardTile("credentials", "Credentials"),
                         DashboardTile("session", "Session"),
-                        id="dashboard-secondary-row",
-                        classes="dashboard-tile-row",
+                        id="dashboard-monitor-column",
+                        classes="dashboard-tile-column",
+                    ),
+                    Vertical(
+                        DashboardTile("spent", "Spent"),
+                        DashboardTile("credentials", "Credentials"),
+                        id="dashboard-account-column",
+                        classes="dashboard-tile-column",
+                    ),
+                    Vertical(
+                        DashboardTile("polling", "Polling"),
+                        DashboardTile("buy-delay", "Buy Delay"),
+                        id="dashboard-delay-column",
+                        classes="dashboard-tile-column",
                     ),
                     id="dashboard-action-tiles",
                 ),
@@ -999,8 +1062,8 @@ class MarketplaceToolsApp(App[None]):
     def dashboard_snapshot(self) -> tuple[str, ...]:
         credential_status, credential_detail, credential_level, _, _ = self.credential_state()
         login_status, _, _ = self.session_status_state()
-        monitor_status = "Running" if self.task_manager.checker_enabled else "Stopped"
-        mode = "Buy mode" if self.task_manager.purchase_submission_enabled else "Watch only"
+        monitor_status = self.task_manager.monitor_status_label()
+        mode = self.task_manager.monitor_mode_label()
         purchase_rate = format_percent(
             self.task_manager.session_successful_purchases,
             self.task_manager.session_detected_outfits,
@@ -1020,6 +1083,7 @@ class MarketplaceToolsApp(App[None]):
             mode,
             self.task_manager.current_delay_label(),
             self.task_manager.current_delay_range(),
+            self.task_manager.purchase_delay_range(),
             purchase_rate,
             purchase_detail,
             format_compact_silver(self.task_manager.session_silver_spent),
@@ -1044,6 +1108,7 @@ class MarketplaceToolsApp(App[None]):
             mode,
             delay_label,
             delay_range,
+            purchase_delay_range,
             purchase_rate,
             purchase_detail,
             silver_spent,
@@ -1054,13 +1119,14 @@ class MarketplaceToolsApp(App[None]):
         purchase_tile_detail = purchase_detail.replace(" this session", "")
         spend_tile_detail = spend_detail.replace(" per cycle", "")
         credential_tile_detail = "No account" if credential_detail == "No account configured" else credential_detail
-        monitor_level = "success" if self.task_manager.checker_enabled else "error"
+        monitor_level = "success" if self.task_manager.monitor_running() else "error"
         _session_label, session_detail, session_level = self.session_status_state()
 
         return [
             ("monitor", monitor_status, mode, monitor_level, True),
             ("spent", silver_spent, spend_tile_detail, "info", False),
             ("polling", delay_label, delay_range, "info", False),
+            ("buy-delay", purchase_delay_range, "Between buys", "info", False),
             ("credentials", credential_status, credential_tile_detail, credential_level, True),
             (
                 "session",
@@ -1119,6 +1185,7 @@ class MarketplaceToolsApp(App[None]):
             _mode,
             delay_label,
             delay_range,
+            purchase_delay_range,
             _purchase_rate,
             _purchase_detail,
             _silver_spent,
@@ -1139,6 +1206,7 @@ class MarketplaceToolsApp(App[None]):
             self.session_status_state()[1],
         )
         details.add_row("Polling", "->", self.status_text(delay_label, "info", show_dot=False), delay_range)
+        details.add_row("Buy Delay", "->", self.status_text(purchase_delay_range, "info", show_dot=False), "Between buys")
 
         return Group(details)
 
@@ -1352,16 +1420,30 @@ class MarketplaceToolsApp(App[None]):
 
     def refresh_polling_summary(self) -> None:
         try:
-            self.query_visible_one("#polling-summary")
+            self.query_visible_one("#polling-recommendations")
         except Exception:
             return
 
-        self.refresh_modal_tile("polling-speed-tile", "Speed", self.task_manager.current_delay_label(), "Current")
-        self.refresh_modal_tile("polling-interval-tile", "Interval", self.task_manager.current_delay_range(), "Between scans")
         self.refresh_polling_preset_tiles()
 
     def polling_status_detail(self) -> str:
         return f"{self.task_manager.current_delay_label()} ({self.task_manager.current_delay_range()})"
+
+    def format_delay_seconds(self, value: float) -> str:
+        return self.task_manager._format_seconds(value)
+
+    def refresh_buy_delay_summary(self) -> None:
+        try:
+            self.query_visible_one("#buy-delay-summary")
+        except Exception:
+            return
+
+        self.refresh_modal_tile(
+            "buy-delay-current-tile",
+            "Current",
+            self.task_manager.purchase_delay_range(),
+            "Between BuyItem requests",
+        )
 
     def refresh_monitor_summary(self) -> None:
         try:
@@ -1372,15 +1454,15 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_modal_tile(
             "monitor-status-tile",
             "Status",
-            "Running" if self.task_manager.checker_enabled else "Stopped",
+            self.task_manager.monitor_status_label(),
             "Monitor",
-            "success" if self.task_manager.checker_enabled else "error",
+            "success" if self.task_manager.monitor_running() else "error",
             True,
         )
         self.refresh_modal_tile(
             "monitor-mode-tile",
             "Mode",
-            "Buy mode" if self.task_manager.purchase_submission_enabled else "Watch only",
+            self.task_manager.monitor_mode_label(),
             "Purchase behavior",
         )
         self.refresh_modal_tile(
@@ -1392,8 +1474,8 @@ class MarketplaceToolsApp(App[None]):
             True,
         )
         try:
-            self.query_visible_one("#modal-start-monitor", Button).disabled = self.task_manager.checker_enabled
-            self.query_visible_one("#modal-stop-monitor", Button).disabled = not self.task_manager.checker_enabled
+            self.query_visible_one("#modal-start-monitor", Button).disabled = self.task_manager.monitor_running()
+            self.query_visible_one("#modal-stop-monitor", Button).disabled = not self.task_manager.monitor_running()
         except Exception:
             pass
 
@@ -1419,6 +1501,7 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_settings_summary()
         self.refresh_spend_summary()
         self.refresh_polling_summary()
+        self.refresh_buy_delay_summary()
         self.refresh_monitor_summary()
         self.refresh_session_summary()
 
@@ -1541,6 +1624,10 @@ class MarketplaceToolsApp(App[None]):
             if self.save_polling_settings():
                 self.refresh_modal_summaries()
                 self.close_active_dashboard_modal()
+        elif button_id == "save-buy-delay":
+            if self.save_buy_delay_settings():
+                self.refresh_modal_summaries()
+                self.close_active_dashboard_modal()
         elif button_id == "modal-start-monitor":
             await self.start_monitor()
             self.refresh_modal_summaries()
@@ -1557,6 +1644,12 @@ class MarketplaceToolsApp(App[None]):
             await self.add_test_log()
         elif button_id == "toggle-test-session":
             await self.toggle_test_session()
+        elif button_id == "start-test-monitor":
+            await self.start_single_item_test_monitor()
+        elif button_id == "start-test-buy":
+            await self.start_single_item_test_monitor(allow_purchase=True)
+        elif button_id == "stop-test-monitor":
+            await self.stop_single_item_test_monitor()
         elif button_id == "fake-detection":
             await self.fake_outfit_detection()
         elif button_id == "fake-buy-success":
@@ -1578,6 +1671,8 @@ class MarketplaceToolsApp(App[None]):
             self.push_screen(SessionRefreshConfirmScreen(), callback=self._handle_session_refresh_confirmation)
         elif tile_key == "polling":
             self.push_screen(PollingModal())
+        elif tile_key == "buy-delay":
+            self.push_screen(BuyDelayModal())
         self.call_after_refresh(self.refresh_modal_summaries)
 
     def _handle_session_refresh_confirmation(self, confirmed: bool) -> None:
@@ -1664,6 +1759,34 @@ class MarketplaceToolsApp(App[None]):
         self.set_status(f"Polling settings saved: {self.polling_status_detail()}.", "success")
         return True
 
+    def apply_purchase_delay_from_inputs(self, log_status: bool = True) -> bool:
+        try:
+            min_input = self.query_visible_one("#purchase-delay-min-input", Input)
+            max_input = self.query_visible_one("#purchase-delay-max-input", Input)
+        except Exception:
+            return False
+
+        try:
+            self.task_manager.set_purchase_delay_range(min_input.value.strip(), max_input.value.strip())
+        except (TypeError, ValueError):
+            self.set_status(
+                "Buy delay must use non-negative seconds with min less than or equal to max.",
+                "warning",
+            )
+            return False
+
+        if log_status:
+            self.set_status(f"Buy delay set to {self.task_manager.purchase_delay_range()}.", "info")
+        self.refresh_live_widgets()
+        return True
+
+    def save_buy_delay_settings(self) -> bool:
+        if not self.apply_purchase_delay_from_inputs(log_status=False):
+            return False
+
+        self.set_status(f"Buy delay saved: {self.task_manager.purchase_delay_range()}.", "success")
+        return True
+
     async def apply_purchase_mode(self, enabled: bool, source_switch_id: str | None = None) -> None:
         if self._syncing_controls:
             return
@@ -1694,9 +1817,16 @@ class MarketplaceToolsApp(App[None]):
                     account=self.session_account_label(),
                     polling=f"{self.task_manager.current_delay_label()} ({self.task_manager.current_delay_range()})",
                     spend_cap=format_compact_silver(self.task_manager.max_spend),
+                    buy_delay=self.task_manager.purchase_delay_range(),
                 ),
                 callback=self._handle_running_buy_mode_confirmation,
             )
+            return
+
+        if self.task_manager.single_item_test_checker_enabled:
+            self.set_status("Single-item test monitor is running. Stop it before changing buy mode.", "warning")
+            self.sync_mode_switches(False)
+            self.refresh_live_widgets()
             return
 
         self.task_manager.purchase_submission_enabled = True
@@ -1781,6 +1911,11 @@ class MarketplaceToolsApp(App[None]):
         if not self._debug_action_allowed():
             return
 
+        if self.task_manager.single_item_test_checker_enabled:
+            self.set_status("Stop the single-item test monitor before changing simulated session state.", "warning")
+            await self.return_to_dashboard()
+            return
+
         enabled = not self.is_simulated_session
         self.task_manager.set_simulated_session(enabled)
         if enabled:
@@ -1792,6 +1927,93 @@ class MarketplaceToolsApp(App[None]):
             self.sync_mode_switches(False)
             self.set_status("Test session marked invalid. Buy mode returned to watch only.", "warning")
         self.refresh_modal_summaries()
+        await self.return_to_dashboard()
+
+    async def start_single_item_test_monitor(self, allow_purchase: bool = False) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        item_name = SINGLE_ITEM_TEST_TARGET["name"]
+        if self.task_manager.single_item_test_checker_enabled:
+            self.set_status("Single-item test monitor already running; no additional task started.", "info")
+            await self.return_to_dashboard()
+            return
+
+        if self.task_manager.checker_enabled:
+            self.set_status("Stop the normal monitor before starting the single-item test monitor.", "warning")
+            await self.return_to_dashboard()
+            return
+
+        if allow_purchase:
+            if self.is_simulated_session:
+                self.set_status(
+                    "Disable the simulated test session before starting the live single-item buy test.",
+                    "warning",
+                )
+                await self.return_to_dashboard()
+                return
+
+            if not self.api_handler.login_status:
+                self.set_status(
+                    "Login required before starting the single-item buy test. Refresh the marketplace session first.",
+                    "warning",
+                )
+                await self.return_to_dashboard()
+                return
+
+            self.push_screen(
+                ConfirmBuyModeScreen(
+                    account=self.session_account_label(),
+                    polling=f"{self.task_manager.current_delay_label()} ({self.task_manager.current_delay_range()})",
+                    spend_cap=format_compact_silver(self.task_manager.max_spend),
+                    buy_delay=self.task_manager.purchase_delay_range(),
+                ),
+                callback=self._handle_single_item_test_buy_confirmation,
+            )
+            return
+
+        await self._start_single_item_test_monitor_now(allow_purchase=False)
+
+    def _handle_single_item_test_buy_confirmation(self, confirmed: bool) -> None:
+        if not confirmed:
+            self.set_status("Single-item buy test canceled.", "info")
+            return
+        self.run_worker(
+            self._start_single_item_test_monitor_now(allow_purchase=True),
+            name="start-single-item-buy-test",
+            group="actions",
+            exclusive=True,
+        )
+
+    async def _start_single_item_test_monitor_now(self, allow_purchase: bool = False) -> None:
+        item_name = SINGLE_ITEM_TEST_TARGET["name"]
+        started = await self.task_manager.start_single_item_test_checker(allow_purchase=allow_purchase)
+        if started:
+            if allow_purchase:
+                self.set_status(
+                    f"Single-item buy test started for {item_name}. Public detection uses the normal buy pipeline.",
+                    "warning",
+                )
+            else:
+                self.set_status(
+                    f"Single-item test monitor started for {item_name}. Public scan only; live buy calls are disabled.",
+                    "warning",
+                )
+        elif self.task_manager.single_item_test_checker_enabled:
+            self.set_status("Single-item test monitor already running; no additional task started.", "info")
+        else:
+            self.set_status("Single-item test monitor did not start.", "warning")
+        await self.return_to_dashboard()
+
+    async def stop_single_item_test_monitor(self) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        was_running = await self.task_manager.stop_single_item_test_checker()
+        if was_running:
+            self.set_status("Single-item test monitor stopped.", "info")
+        else:
+            self.set_status("Single-item test monitor already stopped.", "info")
         await self.return_to_dashboard()
 
     async def fake_outfit_detection(self) -> None:
@@ -1872,12 +2094,18 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_live_widgets()
 
     async def login_refresh(self) -> None:
-        self.set_status("Checking marketplace session...")
+        self.task_manager.add_event("Fetching session status...", "info")
+        self.set_status("Fetching session status...")
         await self.task_manager.login()
         self.set_status("Login check complete.")
         self.refresh_live_widgets()
 
     async def start_monitor(self) -> None:
+        if self.task_manager.single_item_test_checker_enabled:
+            self.set_status("Single-item test monitor is running. Stop it before starting the normal monitor.", "warning")
+            self.refresh_live_widgets()
+            return
+
         if self.task_manager.checker_enabled:
             mode = "buy mode" if self.task_manager.purchase_submission_enabled else "watch-only mode"
             self.set_status(f"Monitor already running in {mode}; no additional monitor task started.", "info")
@@ -1898,6 +2126,7 @@ class MarketplaceToolsApp(App[None]):
                     account=self.session_account_label(),
                     polling=f"{self.task_manager.current_delay_label()} ({self.task_manager.current_delay_range()})",
                     spend_cap=format_compact_silver(self.task_manager.max_spend),
+                    buy_delay=self.task_manager.purchase_delay_range(),
                 ),
                 callback=self._handle_buy_mode_confirmation,
             )
@@ -1917,6 +2146,8 @@ class MarketplaceToolsApp(App[None]):
         if started:
             self.set_status(f"Monitor started in {mode}.", "success")
             self.close_dashboard_modals()
+        elif self.task_manager.single_item_test_checker_enabled:
+            self.set_status("Single-item test monitor is running. Stop it before starting the normal monitor.", "warning")
         elif self.task_manager.checker_enabled:
             self.set_status(f"Monitor already running in {mode}; no additional monitor task started.", "info")
         else:
@@ -1956,6 +2187,7 @@ class MarketplaceToolsApp(App[None]):
 
     async def action_quit_app(self) -> None:
         await self.task_manager.stop_checker()
+        await self.task_manager.stop_single_item_test_checker()
         await self.task_manager.stop_login_status_checker()
         self.api_handler.save_session()
         self.exit()
