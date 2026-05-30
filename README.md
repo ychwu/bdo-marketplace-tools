@@ -1,12 +1,37 @@
 # Marketplace Tools
 
+![Marketplace Tools dashboard](docs/assets/dashboard.png)
+
+## About the Project
+
+Marketplace Tools is a Python terminal app for monitoring the *Black Desert Online* marketplace from an authenticated session. It demonstrates how to maintain a marketplace login session, inspect outfit availability through HTTP requests, decode marketplace responses, and run a configurable long-lived monitor.
+
+The app is designed around safety-first defaults: watch-only monitoring is the normal starting point, while buy mode must be explicitly enabled and confirmed before authenticated purchase requests are submitted.
+
+## How It Works
+
+The monitor checks the public outfit marketplace categories on a configurable polling window. It pulls the male and female outfit subcategories concurrently, decodes the packed marketplace response, and filters rows with available stock.
+
+When running in watch-only mode, detections are written to the dashboard event log without making purchase requests. When buy mode is enabled, detections pass through outfit price rules, the current spend cap, and a configurable delay between individual buy attempts.
+
+Authenticated requests use a saved marketplace cookie session when available. The app can refresh session validity, re-authenticate with saved credentials when needed, and record successful purchases using the actual price returned by the marketplace API.
+
+## Technical Highlights
+
+- Textual-powered terminal dashboard with live monitor, session, spend, polling, buy-delay, and event-log widgets.
+- Concurrent public marketplace scans for outfit categories.
+- Marketplace response decoding using a Huffman decoder.
+- Authenticated HTTP session management with `requests`.
+- Cookie-based session persistence under ignored local runtime files.
+- OS keyring integration for password storage.
+- Watch-only mode, confirmed buy mode, spend caps, and configurable buy delay.
+- Purchase accounting based on structured API responses instead of guessed success strings.
+- Local dashboard statistics for successful purchases and silver spent.
+- Focused tests for session handling, scan parsing, pricing rules, spend caps, buy results, and UI behavior.
+
 ## Project Status
 
 This project is currently undergoing a codebase rewrite and Textual UI migration. Features may be incomplete, unstable, or temporarily broken while the modernization work is in progress.
-
-## Disclaimer
-
-This repository is provided as a proof of concept for authenticated web sessions, HTTP requests, and marketplace-style API integration. Use it only in environments where automation is permitted by the relevant terms of service. The project does not handle CAPTCHA challenges or other access-control interruptions.
 
 ## Supported Versions
 
@@ -14,47 +39,25 @@ Last verified against the supported marketplace flow: July 14, 2025.
 
 Steam accounts and OTP-enabled accounts are not supported. Only launcher accounts without OTP are supported.
 
-## About the Project
+## Running the App
 
-Marketplace Tools is a Python terminal app for monitoring the *Black Desert Online* marketplace from an authenticated session. It demonstrates how to maintain a login session, inspect marketplace availability through HTTP requests, decode marketplace responses, and run a configurable long-lived monitor.
-
-The project covers browser network analysis, request payload debugging, session persistence, and resilient terminal-app design.
-
-## How It Works
-
-When enabled, the app periodically checks outfit marketplace categories using a preset or custom polling delay window. The default mode is watch-only, which reports availability without submitting purchase requests and can run without logging in. A separate buy mode can be enabled from the dashboard monitor controls and requires an authenticated session plus confirmation before the monitor starts. Buy mode also has a separate configurable buy delay, which spaces out individual purchase requests after detections.
-
-The app uses your login credentials to authenticate with the official [BDO web marketplace](https://na-trade.naeu.playblackdesert.com/Intro/). The email is stored locally, while the password is stored through the operating system keyring. The app can also persist and reuse marketplace sessions, then re-authenticate when a session expires.
-
-## Launch Modes
-
-Default launch mode checks the saved marketplace session on startup. For interface work or local testing where that startup API call should be skipped, launch with test mode:
+On Windows, run:
 
 ```powershell
-run-test.bat
-run.bat --test-mode
-py -3 main.py --test-mode
+run.bat
 ```
 
-You can also set `BDO_MARKET_TEST_MODE=1`. Test mode skips only the automatic startup session check; explicit actions such as session refresh, wallet refresh, or starting the monitor can still call live marketplace endpoints.
+Or run directly from the repository root:
 
-In test mode, extra sidebar controls are available for interface and debug work: adding synthetic event-log rows, toggling a simulated valid session, running a public single-item scan, faking a watch-only outfit detection, and simulating purchase accounting without calling the live buy API. These helpers are guarded behind test launch mode, and any live endpoint test requires an authenticated session plus explicit confirmation.
+```powershell
+py -3 main.py
+```
 
 `run.bat` uses Windows Terminal when available so the Textual UI opens at a usable size. Set `BDO_DISABLE_WT=1` before launching to run in the current console instead.
 
-## Technical Highlights
+## Disclaimer
 
-- Python async terminal app with long-running background tasks.
-- Textual-powered terminal UI with live status widgets, sidebar navigation, and event logging.
-- Authenticated HTTP session management with `requests`.
-- Marketplace response decoding using a Huffman decoder.
-- Configurable preset or custom polling delay windows.
-- Configurable buy delay between individual purchase requests.
-- Watch-only mode, buy mode, and spend caps.
-- Local session persistence and automatic re-login flow.
-- Local dashboard statistics for successful purchases and silver spent.
-- Test-mode simulation tools for event-log sizing and purchase-success-rate checks.
-- OS keyring integration for safer password storage.
+This repository is provided as a proof of concept for authenticated web sessions, HTTP requests, and marketplace-style API integration. Use it only in environments where automation is permitted by the relevant terms of service. The project does not handle CAPTCHA challenges or other access-control interruptions.
 
 ## Known Issues
 
