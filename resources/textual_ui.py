@@ -1072,7 +1072,7 @@ class MarketplaceToolsApp(App[None]):
             f"{self.task_manager.session_successful_purchases}/"
             f"{self.task_manager.session_detected_outfits} bought this session"
         )
-        spend_detail = f"Cap: {format_compact_silver(self.task_manager.max_spend)} per cycle"
+        spend_detail = f"Cap: {format_compact_silver(self.task_manager.max_spend)} this session"
 
         return (
             credential_status,
@@ -1117,7 +1117,7 @@ class MarketplaceToolsApp(App[None]):
         ) = snapshot
 
         purchase_tile_detail = purchase_detail.replace(" this session", "")
-        spend_tile_detail = spend_detail.replace(" per cycle", "")
+        spend_tile_detail = spend_detail.replace(" this session", "")
         credential_tile_detail = "No account" if credential_detail == "No account configured" else credential_detail
         monitor_level = "success" if self.task_manager.monitor_running() else "error"
         _session_label, session_detail, session_level = self.session_status_state()
@@ -1410,7 +1410,7 @@ class MarketplaceToolsApp(App[None]):
         except Exception:
             return
 
-        self.refresh_modal_tile("spend-cap-tile", "Cap", format_compact_silver(self.task_manager.max_spend), "Per cycle")
+        self.refresh_modal_tile("spend-cap-tile", "Cap", format_compact_silver(self.task_manager.max_spend), "This session")
         self.refresh_modal_tile(
             "spend-session-tile",
             "Session",

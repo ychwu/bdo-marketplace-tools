@@ -495,7 +495,9 @@ class BackgroundTasks:
             return buy_list
 
         capped = []
-        remaining = self.max_spend
+        remaining = self.max_spend - self.session_silver_spent
+        if remaining <= 0:
+            return capped
 
         for item_id, stock, price in buy_list:
             item_price = int(price)

@@ -19,7 +19,14 @@ from market.api_handler import (
     marketplace_silver_balance,
     purchase_result_message,
 )
-from market.pricing import apply_price_rules, purchase_record_count, purchase_record_spend
+from market.pricing import (
+    CLASSIC_OUTFIT_MAX_PRICE,
+    OUTFIT_SET_MAX_PRICE,
+    PREMIUM_OUTFIT_MAX_PRICE,
+    apply_price_rules,
+    purchase_record_count,
+    purchase_record_spend,
+)
 from market.test_mode import SINGLE_ITEM_TEST_TARGET, check_single_item_stock, parse_single_item_stock_response
 from resources import credentials as credentials_module
 from resources import task_manager as task_manager_module
@@ -107,14 +114,24 @@ class PricingTests(unittest.TestCase):
         adjusted, fallbacks = apply_price_rules(
             [
                 ["premium", "1", "2020000000"],
+                ["classic", "1", "1630000000"],
+                ["set", "1", "1100000000"],
                 ["unknown", "2", "12345"],
             ]
         )
 
-        self.assertEqual(adjusted, [["premium", "1", "2170000000"], ["unknown", "2", "1180000000"]])
+        self.assertEqual(
+            adjusted,
+            [
+                ["premium", "1", PREMIUM_OUTFIT_MAX_PRICE],
+                ["classic", "1", CLASSIC_OUTFIT_MAX_PRICE],
+                ["set", "1", OUTFIT_SET_MAX_PRICE],
+                ["unknown", "2", OUTFIT_SET_MAX_PRICE],
+            ],
+        )
         self.assertEqual(
             fallbacks,
-            [{"item_id": "unknown", "detected_price": "12345", "adjusted_price": "1180000000"}],
+            [{"item_id": "unknown", "detected_price": "12345", "adjusted_price": OUTFIT_SET_MAX_PRICE}],
         )
 
     def test_purchase_record_helpers_sum_actual_successes(self):
@@ -368,6 +385,34 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["purchased"], 0)
         self.assertEqual(summary["events"][0]["level"], "error")
 
+    async def test_check_stock_uses_persistent_public_category_clients(self):
+        handler = object.__new__(APIHandler)
+        male_client = object()
+        female_client = object()
+        handler.public_market_sessions = {
+            "male": male_client,
+            "female": female_client,
+        }
+        captured_clients = []
+
+        class FakeResponse:
+            content = b"compressed"
+
+        async def fake_request(client, *args, **kwargs):
+            captured_clients.append(client)
+            return FakeResponse()
+
+        handler._request = fake_request
+        handler._parse_world_market_response = lambda _content, context: [[context, "1", "100"]]
+
+        result = await APIHandler.check_stock(handler)
+
+        self.assertEqual(captured_clients, [male_client, female_client])
+        self.assertEqual(
+            result,
+            [["male outfit stock", "1", "100"], ["female outfit stock", "1", "100"]],
+        )
+
     async def test_buy_item_returns_structured_purchase_records(self):
         handler = object.__new__(APIHandler)
         session_requests = []
@@ -446,6 +491,54 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
         uniform_mock.assert_called_with(4.0, 7.0)
         self.assertEqual(sleep_mock.await_count, 2)
         sleep_mock.assert_awaited_with(4.5)
+
+    async def test_buy_item_retries_same_item_once_after_session_expiry_result(self):
+        handler = object.__new__(APIHandler)
+        handler.login_status = True
+        handler.session = type("Session", (), {"cookies": {"session": "present"}})()
+        ensure_calls = 0
+        session_payloads = []
+        response_payloads = [
+            {"resultCode": 2000},
+            {"resultCode": 0, "resultMsg": "item-0-1-100-1-100-0-0-0-False"},
+        ]
+
+        async def valid_session():
+            nonlocal ensure_calls
+            ensure_calls += 1
+            handler.login_status = True
+            return True
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def json(self):
+                return self.payload
+
+        async def fake_session_request(*args, **kwargs):
+            session_payloads.append(kwargs["data"])
+            return FakeResponse(response_payloads.pop(0))
+
+        handler.ensure_session_valid = valid_session
+        handler._session_request = fake_session_request
+        handler._json_response = APIHandler._json_response.__get__(handler, APIHandler)
+        handler._purchase_result_code = APIHandler._purchase_result_code.__get__(handler, APIHandler)
+        handler._purchase_result_details = APIHandler._purchase_result_details.__get__(handler, APIHandler)
+        handler._optional_positive_int = APIHandler._optional_positive_int.__get__(handler, APIHandler)
+
+        summary = await APIHandler.buy_item(
+            handler,
+            [["item", "1", "100"]],
+            purchase_delay_bounds=(0, 0),
+        )
+
+        self.assertEqual(ensure_calls, 1)
+        self.assertEqual([payload["buyMainKey"] for payload in session_payloads], ["item", "item"])
+        self.assertEqual(summary["attempted"], 2)
+        self.assertEqual([record["result_code"] for record in summary["results"]], [2000, 0])
+        self.assertEqual(summary["purchased"], 1)
+        self.assertEqual(summary["purchase_records"][0]["item_id"], "item")
 
     async def test_buy_item_rejects_invalid_purchase_delay_bounds(self):
         handler = object.__new__(APIHandler)
@@ -561,6 +654,18 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         capped = manager._apply_spend_cap([["a", "3", "100"], ["b", "2", "80"]])
 
         self.assertEqual(capped, [["a", "2", "100"]])
+
+    async def test_spend_cap_applies_to_current_session_spend(self):
+        manager = self.make_task_manager()
+        manager.max_spend = 250
+        manager.session_silver_spent = 100
+
+        capped = manager._apply_spend_cap([["a", "3", "100"], ["b", "2", "80"]])
+
+        self.assertEqual(capped, [["a", "1", "100"]])
+
+        manager.session_silver_spent = 250
+        self.assertEqual(manager._apply_spend_cap([["a", "1", "100"]]), [])
 
     async def test_login_status_checker_does_not_start_duplicates(self):
         manager = self.make_task_manager()

@@ -107,6 +107,10 @@ class APIHandler:
         self.game_trade_url = GAME_TRADE_URL
         self.login_url = LOGIN_URL
         self.session = requests.Session()
+        self.public_market_sessions = {
+            "male": requests.Session(),
+            "female": requests.Session(),
+        }
         self.login_status = False
         self.email = None
         self.password = None
@@ -119,6 +123,16 @@ class APIHandler:
 
     def _game_trade_url(self):
         return getattr(self, "game_trade_url", GAME_TRADE_URL).rstrip("/")
+
+    def _public_market_client(self, category_key):
+        sessions = getattr(self, "public_market_sessions", None)
+        if not sessions:
+            return requests
+        return sessions[category_key]
+
+    def _has_session_cookies(self):
+        session = getattr(self, "session", None)
+        return bool(getattr(session, "cookies", None))
 
     def _market_headers(self, referer=None, *, origin=None, content_type=FORM_CONTENT_TYPE, ajax=False):
         headers = {
@@ -181,7 +195,7 @@ class APIHandler:
         return cookies
 
     async def check_stock(self):
-        url = "https://na-trade.naeu.playblackdesert.com/Trademarket/GetWorldMarketList"
+        url = f"{self._trade_url()}/Trademarket/GetWorldMarketList"
         headers = dict(PUBLIC_MARKET_HEADERS)
         payload_male = {
             "keyType": 0,
@@ -196,7 +210,7 @@ class APIHandler:
 
         response_male, response_female = await asyncio.gather(
             self._request(
-                requests,
+                self._public_market_client("male"),
                 "POST",
                 url,
                 "male outfit stock check",
@@ -204,7 +218,7 @@ class APIHandler:
                 headers=headers,
             ),
             self._request(
-                requests,
+                self._public_market_client("female"),
                 "POST",
                 url,
                 "female outfit stock check",
@@ -229,8 +243,8 @@ class APIHandler:
             if not row:
                 continue
 
-            parts = row.split("-")
-            if len(parts) <= 3:
+            parts = row.split("-", 4)
+            if len(parts) < 4:
                 raise MarketplaceResponseError(f"{context} row had an unexpected shape: {row}")
 
             item_id, stock, price = parts[0], parts[1], parts[3]
@@ -339,22 +353,26 @@ class APIHandler:
             "purchase_delay_bounds": purchase_delay_bounds,
         }
 
-        try:
-            session_valid = await self.ensure_session_valid()
-        except MarketplaceAPIError as exc:
-            summary["events"].append({"level": "error", "message": f"Purchase aborted: {exc}"})
-            return summary
+        if not getattr(self, "login_status", False) or not self._has_session_cookies():
+            try:
+                session_valid = await self.ensure_session_valid()
+            except MarketplaceAPIError as exc:
+                summary["events"].append({"level": "error", "message": f"Purchase aborted: {exc}"})
+                return summary
 
-        if not session_valid:
-            summary["events"].append(
-                {
-                    "level": "error",
-                    "message": "Purchase aborted: login session is invalid and re-authentication failed.",
-                }
-            )
-            return summary
+            if not session_valid:
+                summary["events"].append(
+                    {
+                        "level": "error",
+                        "message": "Purchase aborted: login session is invalid and re-authentication failed.",
+                    }
+                )
+                return summary
 
-        for attempt_index, (item_id, price) in enumerate(purchase_attempts):
+        attempt_index = 0
+        retried_after_session_refresh = False
+        while attempt_index < len(purchase_attempts):
+            item_id, price = purchase_attempts[attempt_index]
             payload = {
                 "buyMainKey": item_id,
                 "buySubKey": "0",
@@ -431,12 +449,20 @@ class APIHandler:
                     purchase_attempts,
                     purchase_delay_bounds,
                 )
+                attempt_index += 1
+                retried_after_session_refresh = False
                 continue
 
             if result_code == 2000:
                 summary["events"].append(
                     {"level": "warning", "message": "Login session expired. Attempting to re-authenticate."}
                 )
+                if retried_after_session_refresh:
+                    summary["events"].append(
+                        {"level": "error", "message": "Purchase aborted: session still expired after re-authentication."}
+                    )
+                    return summary
+
                 try:
                     reauthenticated = await self.ensure_session_valid()
                 except MarketplaceAPIError as exc:
@@ -445,11 +471,7 @@ class APIHandler:
 
                 if reauthenticated:
                     summary["events"].append({"level": "success", "message": "Re-authentication succeeded."})
-                    await self._sleep_before_next_purchase_attempt(
-                        attempt_index,
-                        purchase_attempts,
-                        purchase_delay_bounds,
-                    )
+                    retried_after_session_refresh = True
                     continue
 
                 summary["events"].append({"level": "error", "message": "Re-authentication failed."})
