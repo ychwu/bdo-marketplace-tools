@@ -1,5 +1,11 @@
 # Marketplace Tools
 
+![Python](https://img.shields.io/badge/Python-3.x-blue)
+![Platform](https://img.shields.io/badge/Platform-Windows-0078D6)
+![UI](https://img.shields.io/badge/UI-Textual-orange)
+![Default Mode](https://img.shields.io/badge/Default-Watch--Only-green)
+![Status](https://img.shields.io/badge/Status-Rewrite%20In%20Progress-yellow)
+
 ![Marketplace Tools dashboard](docs/assets/dashboard.png)
 
 
