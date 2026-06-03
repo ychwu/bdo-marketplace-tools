@@ -347,6 +347,20 @@ class DashboardModalScreen(ModalScreen[None]):
             self.close_modal()
 
 
+class ModalAction(Static):
+    class Pressed(Message):
+        def __init__(self, action: "ModalAction") -> None:
+            super().__init__()
+            self.action = action
+
+    def __init__(self, label: str, action_id: str) -> None:
+        super().__init__(label, id=action_id, classes="modal-action-tile")
+        self.action_id = action_id
+
+    def on_click(self) -> None:
+        self.post_message(self.Pressed(self))
+
+
 class ConfirmBuyModeScreen(ModalScreen[bool]):
     BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
     CSS = DashboardModalScreen.CSS
@@ -563,20 +577,6 @@ class DashboardTile(Static, can_focus=True):
     def on_click(self) -> None:
         self.action_press()
         self.blur()
-
-
-class ModalAction(Static):
-    class Pressed(Message):
-        def __init__(self, action: "ModalAction") -> None:
-            super().__init__()
-            self.action = action
-
-    def __init__(self, label: str, action_id: str) -> None:
-        super().__init__(label, id=action_id, classes="modal-action-tile")
-        self.action_id = action_id
-
-    def on_click(self) -> None:
-        self.post_message(self.Pressed(self))
 
 
 class PollingPresetTile(Static):
