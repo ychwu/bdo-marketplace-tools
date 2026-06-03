@@ -158,6 +158,8 @@ resources/session_test.pkl
 resources/session.json
 resources/local_data.json
 resources/info.json
+resources/app_settings.json
+resources/browser_profiles/
 agent/
 agents.md
 AGENTS.md

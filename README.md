@@ -24,15 +24,18 @@ Python CLI app for monitoring the *Black Desert Online* marketplace through auth
 - Tracks current session's outfit detections, successful purchases, and silver spent. 
 - Tracks lifetime silver spent, and successful purchases.
 - Provides logging for actions, purchases, detection, and errors.
+- Allows saved marketplace session cookies to be cleared from App Settings for a fresh login/session.
 - Provides a marketplace wallet view for checking stored silver, Value Pack state, and marketplace inventory data (WIP).
 
 ### Technical Features
 
 - Marketplace API integration for listing scans, wallet data, session refresh, authentication, and `BuyItem` purchase requests.
+- Tier 1 Steam browser-session support through a visible user-driven Patchright Chrome login and cookie import into the existing marketplace session.
 - Concurrent marketplace polling with isolated unauthenticated `requests.Session` clients for male and female outfit categories, preserving connection reuse without sharing authenticated state.
 - Custom Huffman response decoder for packed marketplace payloads, optimized for repeated high-frequency scans.
 - Async monitor orchestration around blocking HTTP calls using `asyncio.to_thread()`, randomized polling windows, capped retry backoff, task lifecycle guards, and crash-aware monitor state.
 - Secure session and credential persistence with JSON cookie storage, legacy pickle-session migration, local email initialization, and OS keyring-backed password storage.
+- Manual session-reset workflow that clears only marketplace cookies while preserving saved credentials.
 - Safety-gated purchase pipeline with explicit buy-mode confirmation, spend-cap enforcement, configurable per-item buy delay, session-expiration recovery, and one-time retry on expired marketplace sessions.
 - Structured purchase result parsing that separates fulfilled purchases from pre-order placements, records actual execution prices, and maps known marketplace result codes into actionable event-log messages.
 - Resilient network and response validation for timeouts, malformed JSON, unexpected API shapes, invalid listing rows, stale pricing, duplicate orders, and unavailable items.
@@ -47,7 +50,8 @@ This project is currently undergoing a codebase rewrite and Textual UI migration
 
 Last verified compatibility: July 14, 2025.
 
-Steam accounts and OTP-enabled accounts are not supported (yet). Only launcher accounts without OTP are supported.
+Pearl Abyss launcher accounts are supported through saved email/password credentials.
+Steam accounts have experimental Tier 1 support through a visible browser session: choose `Steam Account` in the Credentials dashboard modal, then use `Refresh Session` and complete Steam/PA auth manually in the browser. Steam mode does not use saved email/password credentials. OTP pages may be completed manually in that browser; the app does not store OTP values or submit OTP silently.
 
 ## Running the App
 
@@ -56,6 +60,8 @@ Install dependencies from the repository root:
 ```powershell
 py -3 -m pip install -r requirements.txt
 ```
+
+Steam browser-session mode uses Patchright with an installed Google Chrome browser.
 
 On Windows, start the app with:
 
@@ -73,11 +79,11 @@ py -3 main.py
 
 ## Disclaimer
 
-This repository is provided as a proof of concept for authenticated web sessions, HTTP requests, and marketplace-style API integration. Use it only in environments where automation is permitted by the relevant terms of service. The project does not handle CAPTCHA challenges or other access-control interruptions.
+This repository is provided as a proof of concept for authenticated web sessions, HTTP requests, and marketplace-style API integration. Use it only in environments where automation is permitted by the relevant terms of service. The project does not automate CAPTCHA challenges or other access-control interruptions.
 
 ## Known Issues
 
-If your IP reputation is low, the official login flow may present a CAPTCHA. This project does not handle CAPTCHA challenges. To confirm whether that is the issue, try logging in manually on the [BDO website](https://www.naeu.playblackdesert.com/en-US/Main/Index).
+If your IP reputation is low, the official login flow may present a CAPTCHA. This project does not automate CAPTCHA challenges. Steam browser-session mode leaves the official browser visible so you can complete supported manual prompts yourself.
 
 Known problematic result codes:
 
@@ -94,5 +100,5 @@ For questions or bug reports, use the project issue tracker or the listed Discor
 
 ## Planned Work
 
-- Steam account compatibility.
+- Manual QA for fresh and existing Steam browser profiles.
 - More configurable marketplace categories.

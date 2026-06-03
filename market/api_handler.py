@@ -8,6 +8,7 @@ from pathlib import Path
 import requests
 
 from market.decoder import unpack
+from resources.account_mode import PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE, load_account_mode
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +22,11 @@ TRADE_URL = "https://na-trade.naeu.playblackdesert.com"
 GAME_TRADE_URL = "https://na-game-trade.naeu.playblackdesert.com"
 ACCOUNT_URL = "https://account.pearlabyss.com"
 LOGIN_URL = f"{ACCOUNT_URL}/en-US/Member/Login/LoginProcess"
+MARKET_COOKIE_HOSTS = (
+    "na-trade.naeu.playblackdesert.com",
+    "na-game-trade.naeu.playblackdesert.com",
+)
+MARKET_COOKIE_PARENT_DOMAINS = ("naeu.playblackdesert.com",)
 FORM_CONTENT_TYPE = "application/x-www-form-urlencoded; charset=UTF-8"
 PUBLIC_MARKET_HEADERS = {
     "Content-Type": "application/json",
@@ -112,6 +118,7 @@ class APIHandler:
             "female": requests.Session(),
         }
         self.login_status = False
+        self.account_mode = load_account_mode()
         self.email = None
         self.password = None
         self._session_lock = asyncio.Lock()
@@ -133,6 +140,9 @@ class APIHandler:
     def _has_session_cookies(self):
         session = getattr(self, "session", None)
         return bool(getattr(session, "cookies", None))
+
+    def uses_browser_session(self):
+        return getattr(self, "account_mode", PA_CREDENTIALS_MODE) == STEAM_BROWSER_MODE
 
     def _market_headers(self, referer=None, *, origin=None, content_type=FORM_CONTENT_TYPE, ajax=False):
         headers = {
@@ -323,6 +333,9 @@ class APIHandler:
             return True
 
         self.login_status = False
+        if self.uses_browser_session():
+            return False
+
         if not self.email or not self.password:
             return False
 
@@ -361,10 +374,13 @@ class APIHandler:
                 return summary
 
             if not session_valid:
+                message = "Purchase aborted: login session is invalid and re-authentication failed."
+                if self.uses_browser_session():
+                    message = "Purchase aborted: Steam Account session is invalid. Refresh Session before buying."
                 summary["events"].append(
                     {
                         "level": "error",
-                        "message": "Purchase aborted: login session is invalid and re-authentication failed.",
+                        "message": message,
                     }
                 )
                 return summary
@@ -454,6 +470,16 @@ class APIHandler:
                 continue
 
             if result_code == 2000:
+                if self.uses_browser_session():
+                    self.login_status = False
+                    summary["events"].append(
+                        {
+                            "level": "error",
+                            "message": "Login session expired. Refresh the Steam Account session before buying.",
+                        }
+                    )
+                    return summary
+
                 summary["events"].append(
                     {"level": "warning", "message": "Login session expired. Attempting to re-authenticate."}
                 )
@@ -623,6 +649,12 @@ class APIHandler:
             file.write("\n")
         self._restrict_session_file_permissions()
 
+    def clear_session(self, save=True):
+        self.session = requests.Session()
+        self.login_status = False
+        if save:
+            self.save_session()
+
     def _restrict_session_file_permissions(self):
         try:
             SESSION_COOKIE_PATH.chmod(stat.S_IRUSR | stat.S_IWUSR)
@@ -696,6 +728,100 @@ class APIHandler:
             jar.set_cookie(requests.cookies.create_cookie(**kwargs))
 
         self.session.cookies.update(jar)
+
+    def import_browser_cookies(self, cookies):
+        new_session = self._session_from_browser_cookies(cookies)
+        if not new_session.cookies:
+            return 0
+
+        self.session = new_session
+        return len(new_session.cookies)
+
+    async def validate_and_save_imported_session(self, cookies):
+        previous_session = self.session
+        previous_login_status = self.login_status
+        new_session = self._session_from_browser_cookies(cookies)
+        if not new_session.cookies:
+            return False
+
+        self.session = new_session
+        try:
+            status = await self.is_session_expired()
+        except MarketplaceAPIError:
+            self.session = previous_session
+            self.login_status = previous_login_status
+            raise
+
+        if status == 0:
+            self.login_status = True
+            self.save_session()
+            return True
+
+        self.session = previous_session
+        self.login_status = previous_login_status
+        return False
+
+    def _session_from_browser_cookies(self, cookies):
+        new_session = requests.Session()
+        new_session.cookies.update(self._browser_cookie_jar(cookies))
+        return new_session
+
+    def _browser_cookie_jar(self, cookies):
+        jar = requests.cookies.RequestsCookieJar()
+        for cookie in cookies or []:
+            normalized = self._normalize_browser_cookie(cookie)
+            if normalized is None:
+                continue
+            jar.set_cookie(requests.cookies.create_cookie(**normalized))
+        return jar
+
+    def _normalize_browser_cookie(self, cookie):
+        if isinstance(cookie, dict):
+            data = cookie
+        elif hasattr(cookie, "name") and hasattr(cookie, "value"):
+            data = {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain,
+                "path": cookie.path,
+                "secure": cookie.secure,
+                "expires": cookie.expires,
+            }
+        else:
+            return None
+
+        name = data.get("name")
+        value = data.get("value")
+        domain = data.get("domain")
+        if not name or value is None or not domain or not self._is_market_cookie_domain(domain):
+            return None
+
+        normalized = {
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": data.get("path") or "/",
+            "secure": bool(data.get("secure")),
+        }
+        expires = self._normalize_browser_cookie_expires(data.get("expires"))
+        if expires is not None:
+            normalized["expires"] = expires
+        return normalized
+
+    def _normalize_browser_cookie_expires(self, expires):
+        if expires in (None, "", -1):
+            return None
+        try:
+            expires = int(float(expires))
+        except (TypeError, ValueError):
+            return None
+        return expires if expires > 0 else None
+
+    def _is_market_cookie_domain(self, domain):
+        normalized = str(domain or "").lstrip(".").lower()
+        if normalized in MARKET_COOKIE_HOSTS or normalized in MARKET_COOKIE_PARENT_DOMAINS:
+            return True
+        return False
 
     async def get_mp_inventory(self):
         headers = self._market_headers(f"{self._trade_url()}/Home/list/hot", ajax=True)

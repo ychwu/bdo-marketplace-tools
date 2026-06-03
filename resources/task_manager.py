@@ -7,8 +7,24 @@ from datetime import datetime
 from pathlib import Path
 
 from market.api_handler import DEFAULT_PURCHASE_DELAY_BOUNDS, MarketplaceAPIError
+from market.browser_auth import (
+    BrowserAuthError,
+    acquire_steam_market_cookies,
+    open_blank_steam_browser_diagnostic,
+    prepare_steam_browser_profile,
+)
 from market.pricing import apply_price_rules, purchase_record_count, purchase_record_spend
 from market.test_mode import SINGLE_ITEM_TEST_TARGET, check_single_item_stock
+from resources.account_mode import (
+    STEAM_BROWSER_MODE,
+    account_mode_detail,
+    account_mode_label,
+    load_account_mode,
+    load_steam_browser_profile_prepared,
+    normalize_account_mode,
+    save_account_mode,
+    save_steam_browser_profile_prepared,
+)
 from resources.display import EVENT_LEVEL_COLORS, format_duration
 
 LOCAL_DATA_PATH = Path(__file__).with_name("local_data.json")
@@ -66,10 +82,14 @@ class BackgroundTasks:
         local_data = _load_local_data()
         self.api_handler = api_handler
         self.test_mode_enabled = bool(test_mode_enabled)
+        self.account_mode = load_account_mode()
+        self.api_handler.account_mode = self.account_mode
+        self.steam_browser_profile_prepared = load_steam_browser_profile_prepared()
         self.checker_task = None
         self.single_item_test_checker_task = None
         self.login_checker_task = None
         self.checker_enabled = False
+        self.checker_stop_requested = False
         self.single_item_test_checker_enabled = False
         self.single_item_test_purchase_enabled = False
         self.delay_choices = {
@@ -89,6 +109,9 @@ class BackgroundTasks:
         self.session_successful_purchases = 0
         self.session_silver_spent = 0
         self.simulated_session_enabled = False
+        self.debug_force_purchase_session_expired = False
+        self.purchase_in_progress = False
+        self.pending_auth_reset_reason = None
         self.consecutive_cycle_errors = 0
         self.single_item_test_cycle_errors = 0
         self.lifetime_successful_purchases = local_data["successful_purchases"]
@@ -179,6 +202,69 @@ class BackgroundTasks:
     def monitor_running(self):
         return self.checker_enabled or self.single_item_test_checker_enabled
 
+    def uses_steam_browser_session(self):
+        return self.account_mode == STEAM_BROWSER_MODE
+
+    def account_mode_label(self):
+        return account_mode_label(self.account_mode)
+
+    def account_mode_detail(self):
+        return account_mode_detail(self.account_mode)
+
+    def steam_browser_profile_needs_setup(self):
+        return self.uses_steam_browser_session() and not self.steam_browser_profile_prepared
+
+    def set_account_mode(self, mode):
+        normalized = normalize_account_mode(mode)
+        self.account_mode = save_account_mode(normalized)
+        self.api_handler.account_mode = self.account_mode
+        return self.account_mode
+
+    async def change_account_mode(self, mode):
+        normalized = normalize_account_mode(mode)
+        previous_mode = self.account_mode
+        self.account_mode = save_account_mode(normalized)
+        self.api_handler.account_mode = self.account_mode
+        if normalized != previous_mode:
+            await self.reset_authentication_context("Login method changed")
+            return True
+        return False
+
+    async def reset_authentication_context(self, reason):
+        await self.stop_login_status_checker()
+        self.purchase_submission_enabled = False
+
+        if self.purchase_in_progress:
+            self.pending_auth_reset_reason = reason
+            self.checker_stop_requested = True
+            self.add_event(
+                f"{reason}. Current purchase chain will finish, then the monitor will stop and the marketplace session will be cleared.",
+                "warning",
+            )
+            return False
+
+        await self.stop_checker()
+        await self.stop_single_item_test_checker()
+        self._clear_marketplace_session(reason)
+        return True
+
+    def _complete_pending_auth_reset_if_ready(self):
+        if self.pending_auth_reset_reason and not self.purchase_in_progress:
+            self.checker_stop_requested = True
+            self._clear_marketplace_session(self.pending_auth_reset_reason)
+            return True
+        return False
+
+    def _clear_marketplace_session(self, reason):
+        self.pending_auth_reset_reason = None
+        self.purchase_submission_enabled = False
+        self.simulated_session_enabled = False
+        if hasattr(self.api_handler, "clear_session"):
+            self.api_handler.clear_session()
+        else:
+            self.api_handler.login_status = False
+        self.add_event(f"{reason}. Marketplace session cleared. Refresh Session before buying.", "warning")
+
     def monitor_status_label(self):
         if self.single_item_test_checker_enabled:
             return "Test Scan"
@@ -202,6 +288,7 @@ class BackgroundTasks:
             self.checker_enabled = True
             return False
 
+        self.checker_stop_requested = False
         self.checker_started_at = time.monotonic()
         self.checker_task = asyncio.create_task(self.checker())
         self.checker_task.add_done_callback(self._handle_checker_done)
@@ -239,6 +326,7 @@ class BackgroundTasks:
             self.add_event(f"Monitor stopped after an unexpected error: {exc}", "error")
 
         self.checker_enabled = False
+        self.checker_stop_requested = False
         self.checker_started_at = None
         if self.checker_task is task:
             self.checker_task = None
@@ -263,6 +351,7 @@ class BackgroundTasks:
 
     async def stop_checker(self):
         was_running = bool(self.checker_task and not self.checker_task.done())
+        self.checker_stop_requested = True
         if self.checker_task and not self.checker_task.done():
             self.checker_task.cancel()
             try:
@@ -271,6 +360,7 @@ class BackgroundTasks:
                 pass
 
         self.checker_enabled = False
+        self.checker_stop_requested = False
         self.checker_started_at = None
         self.checker_task = None
         return was_running
@@ -305,7 +395,7 @@ class BackgroundTasks:
 
     async def checker(self):
         try:
-            while True:
+            while not self.checker_stop_requested:
                 try:
                     buy_list = await self.api_handler.check_stock()
                     await self.process_detected_outfits(buy_list)
@@ -313,6 +403,9 @@ class BackgroundTasks:
                 except Exception as exc:
                     self.consecutive_cycle_errors += 1
                     self.add_event(f"Monitor cycle failed: {exc}", "error")
+
+                if self._complete_pending_auth_reset_if_ready() or self.checker_stop_requested:
+                    break
 
                 sleep_duration = self.next_sleep_duration()
                 await asyncio.sleep(sleep_duration)
@@ -402,6 +495,88 @@ class BackgroundTasks:
         self.record_purchase_summary(self._simulated_purchase_summary(adjusted_buy_list, "Simulated purchase succeeded"))
         return True
 
+    def debug_invalidate_marketplace_session(self):
+        if not self.test_mode_enabled:
+            return False
+
+        self.simulated_session_enabled = False
+        self.debug_force_purchase_session_expired = True
+        return True
+
+    async def debug_run_reauthentication_check(self):
+        if not self.test_mode_enabled:
+            return False
+
+        self.add_event("Simulated purchase response: login session expired.", "warning")
+        recovered = await self._recover_purchase_session_for_retry(force_pa_relogin=True)
+        if recovered:
+            self.debug_force_purchase_session_expired = False
+        return recovered
+
+    async def debug_open_blank_browser_diagnostic(self):
+        if not self.test_mode_enabled:
+            return False
+
+        try:
+            await open_blank_steam_browser_diagnostic(status_callback=self._browser_auth_status)
+        except BrowserAuthError as exc:
+            self.add_event(f"Blank browser diagnostic failed: {exc}", "error")
+            return False
+
+        self.add_event("Blank browser diagnostic closed.", "info")
+        return True
+
+    async def prepare_steam_browser_profile(self):
+        if not self.uses_steam_browser_session():
+            self.add_event("Switch to Steam Account before running initial Steam setup.", "warning")
+            return False
+
+        if self.steam_browser_profile_prepared:
+            self.add_event("Initial Steam browser setup is already complete.", "info")
+            return True
+
+        try:
+            await prepare_steam_browser_profile(status_callback=self._browser_auth_status)
+        except BrowserAuthError as exc:
+            self.add_event(f"Initial Steam browser setup failed: {exc}", "error")
+            return False
+
+        self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(True)
+        self.add_event("Initial Steam browser setup saved. Refresh Session can now open the market login.", "success")
+        return True
+
+    async def _recover_purchase_session_for_retry(self, *, force_pa_relogin=False):
+        self.add_event("Login session expired. Attempting to re-authenticate.", "warning")
+
+        if self.uses_steam_browser_session():
+            refreshed = await self.refresh_browser_session()
+            if refreshed:
+                self.add_event("Re-authentication succeeded. Retrying purchase request.", "success")
+                return True
+
+            self.add_event("Re-authentication failed. Purchase retry skipped.", "error")
+            return False
+
+        try:
+            if force_pa_relogin:
+                login_status = await self.api_handler.login()
+                reauthenticated = login_status == 1
+                if reauthenticated:
+                    self.api_handler.login_status = True
+                    self.api_handler.save_session()
+            else:
+                reauthenticated = await self.api_handler.ensure_session_valid()
+        except MarketplaceAPIError as exc:
+            self.add_event(f"Re-authentication failed: {exc}", "error")
+            return False
+
+        if reauthenticated:
+            self.add_event("Re-authentication succeeded. Retrying purchase request.", "success")
+            return True
+
+        self.add_event("Re-authentication failed.", "error")
+        return False
+
     def set_simulated_session(self, enabled):
         if not self.test_mode_enabled:
             return False
@@ -440,30 +615,52 @@ class BackgroundTasks:
         }
 
     async def buy_item(self, buy_list, adjust_pricing=True):
+        self.purchase_in_progress = True
         if adjust_pricing:
             updated_buy_list = await self.adjust_prices(buy_list)
         else:
             updated_buy_list = self._normalize_buy_list(buy_list)
-        capped_buy_list = self._apply_spend_cap(updated_buy_list)
-
-        if not capped_buy_list:
-            self.add_event("Purchase skipped: spend cap would be exceeded.", "warning")
-            return
-
-        if self.simulated_session_enabled:
-            self.record_purchase_summary(self._simulated_purchase_summary(capped_buy_list))
-            return
-
         try:
-            summary = await self.api_handler.buy_item(
-                capped_buy_list,
-                purchase_delay_bounds=self.purchase_delay_bounds,
-            )
-        except MarketplaceAPIError as exc:
-            self.add_event(f"Purchase request failed: {exc}", "error")
-            return
+            capped_buy_list = self._apply_spend_cap(updated_buy_list)
 
-        self.record_purchase_summary(summary)
+            if not capped_buy_list:
+                self.add_event("Purchase skipped: spend cap would be exceeded.", "warning")
+                return
+
+            if self.simulated_session_enabled:
+                self.record_purchase_summary(self._simulated_purchase_summary(capped_buy_list))
+                return
+
+            try:
+                summary = await self.api_handler.buy_item(
+                    capped_buy_list,
+                    purchase_delay_bounds=self.purchase_delay_bounds,
+                )
+            except MarketplaceAPIError as exc:
+                self.add_event(f"Purchase request failed: {exc}", "error")
+                return
+
+            if self.uses_steam_browser_session() and self._purchase_summary_has_expired_session(summary):
+                if await self._recover_purchase_session_for_retry():
+                    try:
+                        summary = await self.api_handler.buy_item(
+                            capped_buy_list,
+                            purchase_delay_bounds=self.purchase_delay_bounds,
+                        )
+                    except MarketplaceAPIError as exc:
+                        self.add_event(f"Purchase retry failed: {exc}", "error")
+                        return
+
+            self.record_purchase_summary(summary)
+        finally:
+            self.purchase_in_progress = False
+            self._complete_pending_auth_reset_if_ready()
+
+    def _purchase_summary_has_expired_session(self, summary):
+        for result in summary.get("results", []):
+            if isinstance(result, dict) and result.get("result_code") == 2000:
+                return True
+        return False
 
     def _normalize_buy_list(self, buy_list):
         return [[str(item_id), str(stock), str(price)] for item_id, stock, price in buy_list]
@@ -533,6 +730,10 @@ class BackgroundTasks:
             self.start_login_status_checker()
             return
 
+        if self.uses_steam_browser_session():
+            await self.refresh_browser_session(session_check_error=session_check_error)
+            return
+
         if not self.api_handler.email or not self.api_handler.password:
             if session_check_error:
                 self.add_event(
@@ -570,6 +771,49 @@ class BackgroundTasks:
             else:
                 self.add_event("Login failed.", "error")
 
+    async def refresh_browser_session(self, session_check_error=None):
+        if self.steam_browser_profile_needs_setup():
+            self.add_event("Initial Steam browser setup is required before the market login refresh.", "warning")
+            prepared = await self.prepare_steam_browser_profile()
+            if not prepared:
+                self.api_handler.login_status = False
+                return False
+
+        if session_check_error:
+            self.add_event(
+                f"Session check failed: {session_check_error}. Opening Steam Account browser session.",
+                "warning",
+            )
+        else:
+            self.add_event("Opening Steam Account browser session for manual login.", "info")
+
+        try:
+            cookies = await acquire_steam_market_cookies(status_callback=self._browser_auth_status)
+        except BrowserAuthError as exc:
+            self.api_handler.login_status = False
+            self.add_event(f"Steam Account refresh failed: {exc}", "error")
+            return False
+
+        try:
+            session_valid = await self.api_handler.validate_and_save_imported_session(cookies)
+        except MarketplaceAPIError as exc:
+            self.api_handler.login_status = False
+            self.add_event(f"Steam Account session validation failed: {exc}", "error")
+            return False
+
+        if session_valid:
+            self.api_handler.login_status = True
+            self.add_event("Steam Account session validated and saved.", "success")
+            self.start_login_status_checker()
+            return True
+
+        self.api_handler.login_status = False
+        self.add_event("Steam Account session validation failed. Complete login in the browser and retry.", "error")
+        return False
+
+    def _browser_auth_status(self, message, level="info"):
+        self.add_event(message, level)
+
     async def initial_login_check(self):
         try:
             status = await self.api_handler.is_session_expired()
@@ -584,7 +828,13 @@ class BackgroundTasks:
             self.add_event("Saved marketplace session is valid.", "success")
         else:
             self.api_handler.login_status = False
-            self.add_event("Saved marketplace session is invalid or expired.", "warning")
+            if self.uses_steam_browser_session():
+                self.add_event(
+                    "Saved Steam Account session is invalid or expired. Refresh Session to open the login browser.",
+                    "warning",
+                )
+            else:
+                self.add_event("Saved marketplace session is invalid or expired.", "warning")
 
     async def login_status_checker(self):
         try:
@@ -597,22 +847,43 @@ class BackgroundTasks:
                     continue
 
                 if status == -1:
-                    self.api_handler.login_status = False
-                    try:
-                        login_status = await self.api_handler.login()
-                    except MarketplaceAPIError as exc:
-                        self.add_event(f"Session expired. Re-authentication failed: {exc}", "error")
+                    recovered = await self.handle_expired_session()
+                    if not recovered:
                         break
 
-                    if login_status == 1:
-                        self.api_handler.login_status = True
-                        self.api_handler.save_session()
-                        self.add_event("Session expired. Re-authentication successful.", "success")
-                    else:
-                        self.add_event("Session expired. Re-authentication failed.", "error")
-                        break
                 else:
                     self.api_handler.login_status = True
                     self.add_event("Session still valid.")
         except asyncio.CancelledError:
             raise
+
+    async def handle_expired_session(self):
+        self.api_handler.login_status = False
+        if self.uses_steam_browser_session():
+            if self.purchase_submission_enabled:
+                self.purchase_submission_enabled = False
+                self.add_event(
+                    "Session expired. Steam Account refresh required; buy mode paused.",
+                    "warning",
+                )
+            else:
+                self.add_event(
+                    "Session expired. Refresh the Steam Account session from Session before buying.",
+                    "warning",
+                )
+            return False
+
+        try:
+            login_status = await self.api_handler.login()
+        except MarketplaceAPIError as exc:
+            self.add_event(f"Session expired. Re-authentication failed: {exc}", "error")
+            return False
+
+        if login_status == 1:
+            self.api_handler.login_status = True
+            self.api_handler.save_session()
+            self.add_event("Session expired. Re-authentication successful.", "success")
+            return True
+
+        self.add_event("Session expired. Re-authentication failed.", "error")
+        return False

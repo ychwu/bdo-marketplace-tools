@@ -3,3 +3,4 @@ colorama
 keyring
 rich
 textual
+patchright

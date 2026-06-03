@@ -9,7 +9,7 @@ from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.events import Click
 from textual.message import Message
 from textual.screen import ModalScreen
@@ -19,6 +19,7 @@ from textual.widgets._header import HeaderClock
 
 from market.api_handler import marketplace_silver_balance
 from market.test_mode import SINGLE_ITEM_TEST_TARGET
+from resources.account_mode import ACCOUNT_MODE_LABELS, PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE
 from resources.credentials import CredentialStoreError, clear_credentials, load_credentials, save_credentials
 from resources.display import (
     APP_TITLE,
@@ -497,17 +498,24 @@ class CredentialsModal(DashboardModalScreen):
     def compose(self) -> ComposeResult:
         app = self.app
         _, _, _, email, _ = app.credential_state()
+        mode_options = [(label, value) for value, label in ACCOUNT_MODE_LABELS.items()]
         with Vertical(classes="modal-card") as dialog:
             dialog.border_title = "Credentials"
+            yield Label("Login method")
+            yield Select(
+                mode_options,
+                value=app.task_manager.account_mode,
+                id="account-mode-select",
+            )
+            yield Static(id="credentials-mode-note", classes="modal-note")
             with Horizontal(id="credentials-summary", classes="modal-summary-row"):
-                yield Static(id="credentials-email-tile", classes="modal-info-tile modal-info-muted modal-info-wide")
-                yield Static(id="credentials-password-tile", classes="modal-info-tile modal-info-muted")
-                yield Static(id="credentials-status-tile", classes="modal-info-tile modal-info-muted")
-            yield Label("Email")
+                yield Static(id="steam-setup-status-tile", classes="modal-info-tile modal-info-muted modal-info-wide")
+            yield Label("Email", id="credentials-email-label")
             yield Input(value=email or "", placeholder="account@example.com", id="email-input")
-            yield Label("Password")
+            yield Label("Password", id="credentials-password-label")
             yield Input(password=True, placeholder="Stored in OS keyring", id="password-input")
             with Horizontal(classes="modal-actions"):
+                yield Button("Steam Setup", id="prepare-steam-profile", variant="primary")
                 yield Button("Save", id="save-credentials", variant="primary")
                 yield Button("Clear", id="clear-credentials", variant="error")
                 yield Button("Close", id="close-modal")
@@ -628,17 +636,23 @@ class MarketplaceToolsApp(App[None]):
     }
 
     #nav {
-        height: 1fr;
+        height: auto;
+        margin-bottom: 1;
     }
 
     #test-controls {
-        height: auto;
+        height: 1fr;
+        min-height: 6;
         margin-top: 1;
+        overflow-y: auto;
     }
 
     #test-controls Button {
         width: 100%;
-        margin: 0 0 1 0;
+        min-width: 0;
+        margin: 0;
+        text-align: left;
+        content-align: left middle;
     }
 
     #main {
@@ -844,14 +858,17 @@ class MarketplaceToolsApp(App[None]):
                     id="nav",
                 )
                 if self.is_test_mode:
-                    with Vertical(id="test-controls"):
-                        yield Button("Add Test Log", id="add-test-log")
-                        yield Button("Toggle Test Session", id="toggle-test-session")
-                        yield Button("Start Test Scan", id="start-test-monitor")
-                        yield Button("Start Test Buy", id="start-test-buy")
-                        yield Button("Stop Test Scan", id="stop-test-monitor")
-                        yield Button("Fake Detection", id="fake-detection")
-                        yield Button("Fake Buy Success", id="fake-buy-success")
+                    with VerticalScroll(id="test-controls"):
+                        yield Button("Add Test Log", id="add-test-log", compact=True)
+                        yield Button("Toggle Test Session", id="toggle-test-session", compact=True)
+                        yield Button("Expire Session", id="expire-test-session", compact=True)
+                        yield Button("Reauth Check", id="run-reauth-check", compact=True)
+                        yield Button("Blank Browser", id="open-blank-browser", compact=True)
+                        yield Button("Start Test Scan", id="start-test-monitor", compact=True)
+                        yield Button("Start Test Buy", id="start-test-buy", compact=True)
+                        yield Button("Stop Test Scan", id="stop-test-monitor", compact=True)
+                        yield Button("Fake Detection", id="fake-detection", compact=True)
+                        yield Button("Fake Buy Success", id="fake-buy-success", compact=True)
             with Vertical(id="main"):
                 yield Static(BANNER_ART, id="banner")
                 yield Static("", id="screen-title", classes="screen-heading")
@@ -1022,6 +1039,13 @@ class MarketplaceToolsApp(App[None]):
             self.screen_stack[-1].dismiss(None)
 
     def credential_state(self) -> tuple[str, str, str, Optional[str], Optional[str]]:
+        if self.task_manager.uses_steam_browser_session():
+            self.api_handler.email = None
+            self.api_handler.password = None
+            if self.task_manager.steam_browser_profile_needs_setup():
+                return "Steam Setup", "Initial setup needed", "warning", None, None
+            return "Steam Account", "Browser login", "info", None, None
+
         try:
             email, password = load_credentials()
         except CredentialStoreError as exc:
@@ -1048,6 +1072,10 @@ class MarketplaceToolsApp(App[None]):
     def session_status_state(self) -> tuple[str, str, str]:
         if self.is_simulated_session:
             return "TEST", "Simulated auth", "warning"
+        if self.task_manager.uses_steam_browser_session():
+            if self.api_handler.login_status:
+                return "ONLINE", "Steam Account", "success"
+            return "OFFLINE", "Refresh required", "warning"
         if self.api_handler.login_status:
             return "ONLINE", "Marketplace auth", "success"
         return "OFFLINE", "Marketplace auth", "error"
@@ -1055,6 +1083,8 @@ class MarketplaceToolsApp(App[None]):
     def session_account_label(self) -> str:
         if self.is_simulated_session:
             return "Test session"
+        if self.task_manager.uses_steam_browser_session():
+            return "Steam Account"
         if self.api_handler.email:
             return mask_email(self.api_handler.email)
         return "No account configured"
@@ -1358,26 +1388,72 @@ class MarketplaceToolsApp(App[None]):
 
         state, detail, _, _, password = self.credential_state()
         password_detail = "Stored in OS keyring" if password else "Not set"
+        setup_complete = self.task_manager.steam_browser_profile_prepared
+        setup_state = "Complete" if setup_complete else "Incomplete"
+        setup_detail = "Ready for market login" if setup_complete else "Run Steam Setup once"
+        setup_level = "success" if setup_complete else "warning"
         if isinstance(summary, Static):
             table = Table.grid(padding=(0, 2))
             table.add_column(style="bold")
             table.add_column()
+            table.add_row("Login method", self.task_manager.account_mode_label())
             table.add_row("Email", detail)
             table.add_row("Password", password_detail)
             table.add_row("Status", state)
+            table.add_row("Steam initial setup", setup_state)
             summary.update(table)
             return
 
-        self.refresh_modal_tile("credentials-email-tile", "Email", detail, "Account")
-        self.refresh_modal_tile("credentials-password-tile", "Password", password_detail, "Secure store")
         self.refresh_modal_tile(
-            "credentials-status-tile",
-            "Status",
-            state,
-            "Credential state",
-            "success" if password else "error",
+            "steam-setup-status-tile",
+            "Steam Initial Setup",
+            setup_state,
+            setup_detail,
+            setup_level,
             True,
         )
+        self.refresh_credentials_mode_controls()
+
+    def selected_account_mode(self) -> str:
+        try:
+            return str(self.query_visible_one("#account-mode-select", Select).value)
+        except Exception:
+            return self.task_manager.account_mode
+
+    def refresh_credentials_mode_controls(self) -> None:
+        try:
+            selected_mode = self.selected_account_mode()
+            steam_mode = selected_mode == STEAM_BROWSER_MODE
+            note = self.query_visible_one("#credentials-mode-note", Static)
+        except Exception:
+            return
+
+        if steam_mode:
+            if self.task_manager.steam_browser_profile_prepared:
+                note.update(
+                    "Steam Account does not use saved email or password. Refresh Session opens a visible browser so you can complete Steam and Pearl Abyss login there."
+                )
+            else:
+                note.update(
+                    "Run Steam Setup once to build the app-owned browser profile from the Black Desert site. Refresh Session will use the market login after setup is saved."
+                )
+        else:
+            note.update(
+                "Pearl Abyss Account uses the saved email and OS keyring password when the app needs to refresh the marketplace session."
+            )
+
+        try:
+            setup_button = self.query_visible_one("#prepare-steam-profile", Button)
+            setup_button.display = steam_mode and not self.task_manager.steam_browser_profile_prepared
+            setup_button.disabled = not steam_mode
+        except Exception:
+            pass
+
+        for widget_id in ("email-input", "password-input", "clear-credentials"):
+            try:
+                self.query_visible_one(f"#{widget_id}").disabled = steam_mode
+            except Exception:
+                pass
 
     async def mount_settings(self, content: Container) -> None:
         table = Table.grid(padding=(0, 2))
@@ -1388,6 +1464,17 @@ class MarketplaceToolsApp(App[None]):
         table.add_row("Launch mode", self.launch_mode)
         table.add_row("Theme", self.theme)
         await content.mount(Static(table, classes="panel"))
+        await content.mount(Static(id="settings-summary", classes="panel"))
+        await content.mount(Static("Session Debug", classes="stats-section-title"))
+        await content.mount(
+            Static(
+                "Clear the saved marketplace session cookies when login state looks stale or corrupted. "
+                "This does not clear saved credentials.",
+                classes="panel",
+            )
+        )
+        await content.mount(Button("Clear Saved Session", id="clear-saved-session", variant="warning"))
+        self.refresh_settings_summary()
 
     def refresh_settings_summary(self) -> None:
         try:
@@ -1398,6 +1485,8 @@ class MarketplaceToolsApp(App[None]):
         table.add_column(style="bold")
         table.add_column()
         mode = "Buy mode" if self.task_manager.purchase_submission_enabled else "Watch only"
+        table.add_row("Session mode", self.task_manager.account_mode_label())
+        table.add_row("Session refresh", self.task_manager.account_mode_detail())
         table.add_row("Mode", mode)
         table.add_row("Polling interval", f"{self.task_manager.current_delay_label()} ({self.task_manager.current_delay_range()})")
         table.add_row("Spend cap", format_compact_silver(self.task_manager.max_spend))
@@ -1494,7 +1583,7 @@ class MarketplaceToolsApp(App[None]):
             self.session_status_state()[2],
             True,
         )
-        self.refresh_modal_tile("session-account-tile", "Account", account, "Credentials")
+        self.refresh_modal_tile("session-account-tile", "Account", account, self.task_manager.account_mode_label())
 
     def refresh_modal_summaries(self) -> None:
         self.refresh_credentials_summary()
@@ -1614,6 +1703,8 @@ class MarketplaceToolsApp(App[None]):
                 self.close_active_dashboard_modal()
         elif button_id == "clear-credentials":
             await self.clear_saved_credentials()
+        elif button_id == "clear-saved-session":
+            await self.clear_saved_session()
         elif button_id == "save-settings":
             await self.save_settings()
         elif button_id == "save-spend-cap":
@@ -1644,6 +1735,25 @@ class MarketplaceToolsApp(App[None]):
             await self.add_test_log()
         elif button_id == "toggle-test-session":
             await self.toggle_test_session()
+        elif button_id == "expire-test-session":
+            await self.expire_test_session()
+        elif button_id == "run-reauth-check":
+            await self.run_test_reauthentication_check()
+        elif button_id == "prepare-steam-profile":
+            self.run_worker(
+                self.prepare_steam_browser_profile(),
+                name="prepare-steam-profile",
+                group="actions",
+                exclusive=True,
+            )
+        elif button_id == "open-blank-browser":
+            if self._debug_action_allowed():
+                self.run_worker(
+                    self.open_blank_browser_diagnostic(),
+                    name="blank-browser-diagnostic",
+                    group="actions",
+                    exclusive=True,
+                )
         elif button_id == "start-test-monitor":
             await self.start_single_item_test_monitor()
         elif button_id == "start-test-buy":
@@ -1690,6 +1800,10 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_polling_preset_tiles()
 
     async def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "account-mode-select":
+            self.refresh_credentials_mode_controls()
+            return
+
         if event.select.id != "delay-select":
             return
         self.apply_delay_choice(event.value)
@@ -1929,6 +2043,37 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_modal_summaries()
         await self.return_to_dashboard()
 
+    async def expire_test_session(self) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        if self.task_manager.debug_invalidate_marketplace_session():
+            self.refresh_modal_summaries()
+        await self.return_to_dashboard()
+
+    async def run_test_reauthentication_check(self) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        recovered = await self.task_manager.debug_run_reauthentication_check()
+        if recovered:
+            self.set_status("Test re-authentication check succeeded.")
+        elif self.task_manager.uses_steam_browser_session():
+            self.set_status("Steam Account refresh required after test re-authentication check.")
+        else:
+            self.set_status("Test re-authentication check failed.")
+        self.refresh_modal_summaries()
+        await self.return_to_dashboard()
+
+    async def open_blank_browser_diagnostic(self) -> None:
+        self.set_status("Opening blank Chrome diagnostic browser.")
+        opened = await self.task_manager.debug_open_blank_browser_diagnostic()
+        if opened:
+            self.set_status("Blank Chrome diagnostic browser closed.")
+        else:
+            self.set_status("Blank Chrome diagnostic browser failed.")
+        self.refresh_live_widgets()
+
     async def start_single_item_test_monitor(self, allow_purchase: bool = False) -> None:
         if not self._debug_action_allowed():
             return
@@ -2032,6 +2177,29 @@ class MarketplaceToolsApp(App[None]):
         self.set_status("Fake detection and purchase recorded.")
         await self.return_to_dashboard()
 
+    async def prepare_steam_browser_profile(self) -> None:
+        try:
+            account_mode = self.selected_account_mode()
+        except ValueError:
+            self.set_status("Select Steam Account before running setup.", "warning")
+            return
+
+        if account_mode != STEAM_BROWSER_MODE:
+            self.set_status("Select Steam Account before running setup.", "warning")
+            return
+
+        await self.task_manager.change_account_mode(STEAM_BROWSER_MODE)
+        self.sync_mode_switches(False)
+        self.set_status("Opening initial Steam browser setup.")
+        prepared = await self.task_manager.prepare_steam_browser_profile()
+        if prepared:
+            self.set_status("Initial Steam setup saved. Refresh Session can now use the market login.")
+        else:
+            self.set_status("Initial Steam setup did not complete.")
+        self.refresh_credentials_summary()
+        self.refresh_settings_summary()
+        self.refresh_live_widgets()
+
     async def return_to_dashboard(self) -> None:
         if self.current_view != "dashboard":
             await self.show_view("dashboard")
@@ -2039,6 +2207,24 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_live_widgets()
 
     async def save_credential_inputs(self) -> bool:
+        try:
+            account_mode = self.selected_account_mode()
+        except ValueError:
+            self.set_status("Select a valid login method.", "warning")
+            return False
+
+        if account_mode == STEAM_BROWSER_MODE:
+            await self.task_manager.change_account_mode(account_mode)
+            self.sync_mode_switches(False)
+            self.set_status(
+                "Login method saved: Steam Account. Refresh Session opens the browser login.",
+                "success",
+            )
+            self.refresh_credentials_summary()
+            self.refresh_settings_summary()
+            self.refresh_live_widgets()
+            return True
+
         email = self.query_visible_one("#email-input", Input).value.strip()
         password = self.query_visible_one("#password-input", Input).value
         if not email:
@@ -2051,6 +2237,11 @@ class MarketplaceToolsApp(App[None]):
             self.set_status("Password field cannot be empty.", "warning")
             return False
 
+        previous_email = self.api_handler.email
+        session_identity_changed = bool(
+            self.api_handler.login_status
+            and (not previous_email or previous_email.strip().lower() != email.strip().lower())
+        )
         self.api_handler.email = email
         self.api_handler.password = password
         try:
@@ -2060,9 +2251,15 @@ class MarketplaceToolsApp(App[None]):
             self.set_status("Unable to save credentials.")
             return False
 
+        mode_changed = await self.task_manager.change_account_mode(PA_CREDENTIALS_MODE)
+        if session_identity_changed and not mode_changed:
+            await self.task_manager.reset_authentication_context("Credentials changed")
+        self.sync_mode_switches(False)
         self.query_visible_one("#password-input", Input).value = ""
-        self.set_status("Credentials saved.", "success")
+        self.set_status(f"Credentials saved: {self.task_manager.account_mode_label()}.", "success")
         self.refresh_credentials_summary()
+        self.refresh_settings_summary()
+        self.refresh_live_widgets()
         return True
 
     async def clear_saved_credentials(self) -> None:
@@ -2080,16 +2277,34 @@ class MarketplaceToolsApp(App[None]):
         self.set_status("Saved credentials cleared.", "info")
         self.refresh_credentials_summary()
 
-    async def save_settings(self) -> None:
-        delay = self.query_visible_one("#delay-select", Select).value
-        buy_mode = self.query_visible_one("#buy-mode-switch", Switch).value
+    async def clear_saved_session(self) -> None:
+        cleared_now = await self.task_manager.reset_authentication_context("Manual session reset")
+        self.sync_mode_switches(False)
+        if cleared_now:
+            self.set_status("Saved marketplace session cleared. Refresh Session to log in again.", "warning")
+        else:
+            self.set_status("Session reset queued until the current purchase chain finishes.", "warning")
+        self.refresh_settings_summary()
+        self.refresh_live_widgets()
 
-        self.apply_delay_choice(delay)
-        if not self.apply_spend_cap_from_input("spend-cap-input"):
+    async def save_settings(self) -> None:
+        try:
+            account_mode = self.query_visible_one("#account-mode-select", Select).value
+        except Exception:
+            self.set_status("Settings are not available.", "warning")
             return
 
-        await self.apply_purchase_mode(bool(buy_mode), source_switch_id="buy-mode-switch")
-        self.set_status("Settings saved.", "info")
+        try:
+            normalized_mode = self.task_manager.set_account_mode(str(account_mode))
+        except ValueError:
+            self.set_status("Select a valid session mode.", "warning")
+            return
+
+        if normalized_mode == STEAM_BROWSER_MODE and self.task_manager.purchase_submission_enabled:
+            self.task_manager.purchase_submission_enabled = False
+            self.sync_mode_switches(False)
+
+        self.set_status(f"Settings saved: {self.task_manager.account_mode_label()}.", "success")
         self.refresh_settings_summary()
         self.refresh_live_widgets()
 
@@ -2113,6 +2328,14 @@ class MarketplaceToolsApp(App[None]):
             return
 
         if self.task_manager.purchase_submission_enabled and not self.api_handler.login_status:
+            if self.task_manager.uses_steam_browser_session():
+                self.set_status(
+                    "Steam Account refresh required before starting buy mode. Refresh Session first.",
+                    "warning",
+                )
+                self.refresh_live_widgets()
+                return
+
             self.set_status(
                 "Login required before starting buy mode. Login or refresh the marketplace session before starting the monitor.",
                 "warning",
