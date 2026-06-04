@@ -1,5 +1,7 @@
+from bdo_marketplace_tools.version import APP_CHANNEL, APP_VERSION
+
+
 APP_TITLE = "Marketplace Tools"
-APP_VERSION = "BETA"
 
 COLOR_BRAND = "rgb(255,145,60)"
 COLOR_SUCCESS = "rgb(126,184,138)"
@@ -8,6 +10,8 @@ COLOR_CAUTION = "rgb(201,138,80)"
 COLOR_ERROR = "rgb(209,106,106)"
 COLOR_INFO = "rgb(232,229,220)"
 COLOR_TEXT_MUTED = "rgb(170,170,170)"
+COLOR_STEAM = "rgb(19,100,151)"
+COLOR_GOLD = "rgb(218,177,86)"
 
 EVENT_LEVEL_COLORS = {
     "info": COLOR_INFO,

@@ -4,13 +4,13 @@ import requests
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import main as app_main
 from rich.console import Console
 from textual.color import Color
-from textual.widgets import Button, Input, Static
-from market.api_handler import (
+from textual.widgets import Button, Input, Select, Static
+from bdo_marketplace_tools.market.api_handler import (
     APIHandler,
     DEFAULT_PURCHASE_DELAY_BOUNDS,
     MARKET_AJAX_HEADER,
@@ -19,7 +19,38 @@ from market.api_handler import (
     marketplace_silver_balance,
     purchase_result_message,
 )
-from market.pricing import (
+from bdo_marketplace_tools.market.browser_auth import (
+    BrowserAuthError,
+    COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS,
+    COOKIEBOT_DIALOG_DETECTION_TIMEOUT_MS,
+    COOKIE_CONSENT_MANUAL,
+    COOKIE_CONSENT_NOT_FOUND,
+    COOKIE_CONSENT_SAVED,
+    STEAM_AUTO_LOGIN_CLICKED,
+    STEAM_AUTO_LOGIN_DISABLED,
+    STEAM_AUTO_LOGIN_MANUAL_NEEDED,
+    STEAM_AUTO_LOGIN_SKIPPED,
+    STEAM_BROWSER_CHANNEL,
+    STEAM_COMMUNITY_URL,
+    STEAM_LOGIN_COOKIE_NAMES,
+    STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH,
+    STEAM_MARKET_PROFILE_PATH,
+    STEAM_PROFILE_COOKIE_URLS,
+    STEAM_STORE_URL,
+    _accept_required_cookie_consent_if_available,
+    _browser_launch_error_message,
+    _classify_url,
+    clear_steam_browser_profile_cookies,
+    _has_steam_login_cookie,
+    _market_cookie_capture_ready,
+    _maybe_run_steam_auto_login,
+    _new_steam_auto_login_state,
+    _should_attempt_steam_auto_login,
+    _status_for_state,
+    _steam_store_logged_in_dom_ready,
+    _wait_for_steam_profile_login,
+)
+from bdo_marketplace_tools.market.pricing import (
     CLASSIC_OUTFIT_MAX_PRICE,
     OUTFIT_SET_MAX_PRICE,
     PREMIUM_OUTFIT_MAX_PRICE,
@@ -27,11 +58,14 @@ from market.pricing import (
     purchase_record_count,
     purchase_record_spend,
 )
-from market.test_mode import SINGLE_ITEM_TEST_TARGET, check_single_item_stock, parse_single_item_stock_response
-from resources import credentials as credentials_module
-from resources import task_manager as task_manager_module
-from resources.task_manager import BackgroundTasks
-from resources.textual_ui import BANNER_ART, DEFAULT_THEME, STATUS_STYLES, DashboardTile, MarketplaceToolsApp, ModalAction
+from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET, check_single_item_stock, parse_single_item_stock_response
+from bdo_marketplace_tools.storage import app_settings as account_mode_module
+from bdo_marketplace_tools.storage import credentials as credentials_module
+from bdo_marketplace_tools.services import task_manager as task_manager_module
+from bdo_marketplace_tools.storage.app_settings import PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE
+from bdo_marketplace_tools.services.task_manager import BackgroundTasks
+from bdo_marketplace_tools.ui.app import BANNER_ART, DEFAULT_THEME, STATUS_STYLES, DashboardTile, MarketplaceToolsApp, ModalAction
+from bdo_marketplace_tools.version import APP_CHANNEL, APP_VERSION, PROJECT_NAME, SETTINGS_SCHEMA_VERSION
 
 
 LOCAL_DATA = {
@@ -39,20 +73,50 @@ LOCAL_DATA = {
     "silver_spent": 0,
 }
 
+EXPECTED_APP_SETTINGS_VERSION = {
+    "schema": SETTINGS_SCHEMA_VERSION,
+    "app": APP_VERSION,
+    "channel": APP_CHANNEL,
+    "project": PROJECT_NAME,
+}
+
 
 class FakeAPI:
     login_status = False
     email = None
     password = None
+    account_mode = PA_CREDENTIALS_MODE
+    session_cleared = False
 
     async def get_mp_inventory(self):
-        return {"wallet": [{"currency": "silver", "amount": 123}]}
+        return {
+            "myWalletList": [
+                {"mainKey": 1, "subKey": 0, "name": "Silver", "count": "123456789"},
+            ],
+            "useValuePackage": True,
+            "totalWeight": 12,
+            "maxWeight": 100,
+        }
 
     async def check_stock(self):
         return []
 
+    async def is_session_expired(self):
+        return 0 if self.login_status else -1
+
+    async def login(self):
+        self.login_status = True
+        return 1
+
     def save_session(self):
         pass
+
+    def has_session_cookies(self):
+        return bool(getattr(self, "session_has_cookies", self.login_status))
+
+    def clear_session(self, save=True):
+        self.login_status = False
+        self.session_cleared = True
 
 
 class FakeApp:
@@ -69,8 +133,8 @@ class FakeApp:
 class LaunchModeTests(unittest.IsolatedAsyncioTestCase):
     async def test_test_mode_skips_startup_session_check(self):
         fake_api = FakeAPI()
-        with patch("resources.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
-            fake_manager = BackgroundTasks(fake_api)
+        with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
+            fake_manager = BackgroundTasks(fake_api, persist_ui_settings=False)
         fake_manager.initial_login_check = AsyncMock()
         FakeApp.instances = []
 
@@ -87,8 +151,8 @@ class LaunchModeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_mode_runs_startup_session_check(self):
         fake_api = FakeAPI()
-        with patch("resources.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
-            fake_manager = BackgroundTasks(fake_api)
+        with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
+            fake_manager = BackgroundTasks(fake_api, persist_ui_settings=False)
         fake_manager.initial_login_check = AsyncMock()
         FakeApp.instances = []
 
@@ -145,6 +209,572 @@ class PricingTests(unittest.TestCase):
 
 
 class APIResultTests(unittest.TestCase):
+    def test_browser_auth_launch_error_names_missing_patchright_browser_install(self):
+        message = _browser_launch_error_message(
+            RuntimeError("Executable doesn't exist at C:/ms-playwright/chromium/chrome.exe")
+        )
+
+        self.assertIn("Patchright Chromium is not installed", message)
+        self.assertIn("py -m patchright install chromium", message)
+
+    def test_browser_auth_uses_installed_chrome_channel(self):
+        self.assertEqual(STEAM_BROWSER_CHANNEL, "chrome")
+
+    def test_cookiebot_required_consent_click_is_best_effort(self):
+        clicked_selectors = []
+        statuses = []
+        wait_calls = []
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                if self.selector != "#CybotCookiebotDialogBodyButtonDecline":
+                    raise RuntimeError("not found")
+                clicked_selectors.append((self.selector, timeout))
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+                self.selector = selector
+
+            async def wait_for(self, state=None, timeout=None):
+                wait_calls.append((self.selector, state, timeout))
+
+        class FakePage:
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        self.assertEqual(
+            asyncio.run(_accept_required_cookie_consent_if_available(FakePage(), status_callback=status_callback)),
+            COOKIE_CONSENT_SAVED,
+        )
+        self.assertEqual(
+            clicked_selectors,
+            [("#CybotCookiebotDialogBodyButtonDecline", COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS)],
+        )
+        self.assertEqual(
+            wait_calls,
+            [
+                ("#CybotCookiebotDialog", "visible", COOKIEBOT_DIALOG_DETECTION_TIMEOUT_MS),
+                ("#CybotCookiebotDialog", "hidden", 3000),
+            ],
+        )
+        self.assertEqual(statuses, [("Required cookie consent saved in the Steam browser profile.", "info")])
+
+    def test_cookiebot_required_consent_reports_click_when_dialog_remains(self):
+        statuses = []
+
+        class FakeFirstLocator:
+            async def click(self, timeout=None):
+                return None
+
+        class FakeLocator:
+            first = FakeFirstLocator()
+
+            async def wait_for(self, state=None, timeout=None):
+                if state == "visible":
+                    return None
+                raise RuntimeError("dialog still visible")
+
+        class FakePage:
+            def locator(self, selector):
+                return FakeLocator()
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        self.assertEqual(
+            asyncio.run(_accept_required_cookie_consent_if_available(FakePage(), status_callback=status_callback)),
+            COOKIE_CONSENT_MANUAL,
+        )
+        self.assertEqual(
+            statuses,
+            [("Required cookie consent click sent; continue manually if the banner remains.", "info")],
+        )
+
+    def test_cookiebot_required_consent_returns_not_found_silently(self):
+        clicked_selectors = []
+        statuses = []
+
+        class FakeFirstLocator:
+            async def click(self, timeout=None):
+                clicked_selectors.append(timeout)
+                raise RuntimeError("not found")
+
+        class FakeLocator:
+            first = FakeFirstLocator()
+
+            async def wait_for(self, state=None, timeout=None):
+                raise RuntimeError("dialog not visible")
+
+        class FakePage:
+            def locator(self, selector):
+                return FakeLocator()
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        self.assertEqual(
+            asyncio.run(_accept_required_cookie_consent_if_available(FakePage(), status_callback=status_callback)),
+            COOKIE_CONSENT_NOT_FOUND,
+        )
+        self.assertEqual(clicked_selectors, [])
+        self.assertEqual(statuses, [])
+
+    def test_steam_profile_login_detection_uses_auth_cookie_names_only(self):
+        self.assertEqual(STEAM_LOGIN_COOKIE_NAMES, {"steamLoginSecure"})
+        self.assertTrue(
+            _has_steam_login_cookie(
+                [
+                    {"name": "sessionid", "domain": ".steampowered.com"},
+                    {"name": "steamLoginSecure", "domain": ".steampowered.com"},
+                ]
+            )
+        )
+        self.assertFalse(
+            _has_steam_login_cookie(
+                [
+                    {"name": "sessionid", "domain": ".steampowered.com"},
+                    {"name": "browserid", "domain": ".steampowered.com"},
+                ]
+            )
+        )
+
+    def test_steam_profile_login_detection_observes_local_cookie_store(self):
+        statuses = []
+        cookie_url_calls = []
+
+        class FakePage:
+            url = STEAM_STORE_URL
+
+            def is_closed(self):
+                return False
+
+        class FakeContext:
+            pages = [FakePage()]
+
+            async def cookies(self, urls):
+                cookie_url_calls.append(tuple(urls))
+                return [{"name": "steamLoginSecure", "domain": ".steampowered.com"}]
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        asyncio.run(_wait_for_steam_profile_login(FakeContext(), status_callback, timeout_seconds=1))
+
+        self.assertEqual(cookie_url_calls, [STEAM_PROFILE_COOKIE_URLS])
+        self.assertEqual(
+            statuses,
+            [("Steam login detected in the browser profile.", "info")],
+        )
+        self.assertNotIn("api.steampowered.com", "".join(cookie_url_calls[0]))
+        self.assertIn(STEAM_STORE_URL, cookie_url_calls[0])
+        self.assertIn(STEAM_COMMUNITY_URL, cookie_url_calls[0])
+
+    def test_steam_profile_login_detection_observes_loaded_store_dom(self):
+        statuses = []
+        checked_selectors = []
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def is_visible(self, timeout=None):
+                checked_selectors.append((self.selector, timeout))
+                return self.selector == "#account_pulldown"
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = STEAM_STORE_URL
+
+            def is_closed(self):
+                return False
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        class FakeContext:
+            pages = [FakePage()]
+
+            async def cookies(self, urls):
+                return []
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        asyncio.run(_wait_for_steam_profile_login(FakeContext(), status_callback, timeout_seconds=1))
+
+        self.assertEqual(checked_selectors, [("#account_pulldown", 500)])
+        self.assertEqual(statuses, [("Steam login detected in the browser profile.", "info")])
+
+    def test_steam_profile_logged_in_dom_ignores_non_store_hosts(self):
+        class FakePage:
+            url = "https://steamcommunity.com/"
+
+            def locator(self, selector):
+                raise AssertionError("Non-store pages should not be queried for Store DOM markers.")
+
+        self.assertFalse(asyncio.run(_steam_store_logged_in_dom_ready(FakePage())))
+
+    def test_clear_steam_browser_profile_cookies_clears_persistent_context(self):
+        class FakePlaywrightManager:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeContext:
+            pages = []
+
+            def __init__(self):
+                self.cleared = False
+                self.closed = False
+                self.new_page_called = False
+
+            async def new_page(self):
+                self.new_page_called = True
+                return object()
+
+            async def cookies(self):
+                return [
+                    {"name": "steamLoginSecure", "value": "secret"},
+                    {"name": "sessionid", "value": "also-secret"},
+                ]
+
+            async def clear_cookies(self):
+                self.cleared = True
+
+            async def close(self):
+                self.closed = True
+
+        fake_context = FakeContext()
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "patchright.async_api.async_playwright",
+            return_value=FakePlaywrightManager(),
+        ), patch(
+            "bdo_marketplace_tools.market.browser_auth._launch_persistent_chrome_context",
+            new=AsyncMock(return_value=fake_context),
+        ):
+            cleared_count = asyncio.run(clear_steam_browser_profile_cookies(profile_path=Path(temp_dir)))
+
+        self.assertEqual(cleared_count, 2)
+        self.assertTrue(fake_context.new_page_called)
+        self.assertTrue(fake_context.cleared)
+        self.assertTrue(fake_context.closed)
+
+    def test_steam_auto_login_disabled_does_not_click_buttons(self):
+        clicked_selectors = []
+        statuses = []
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                clicked_selectors.append((self.selector, timeout))
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        result = asyncio.run(
+            _maybe_run_steam_auto_login(
+                FakePage(),
+                "pa",
+                enabled=False,
+                tracking=_new_steam_auto_login_state(),
+                status_callback=status_callback,
+            )
+        )
+
+        self.assertEqual(result, STEAM_AUTO_LOGIN_DISABLED)
+        self.assertEqual(clicked_selectors, [])
+        self.assertEqual(statuses, [])
+
+    def test_steam_auto_login_clicks_pa_steam_button(self):
+        clicked_selectors = []
+        statuses = []
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                if self.selector != "#btnSteam":
+                    raise RuntimeError("not found")
+                clicked_selectors.append((self.selector, timeout))
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        result = asyncio.run(
+            _maybe_run_steam_auto_login(
+                FakePage(),
+                "pa",
+                enabled=True,
+                tracking=_new_steam_auto_login_state(),
+                status_callback=status_callback,
+            )
+        )
+
+        self.assertEqual(result, STEAM_AUTO_LOGIN_CLICKED)
+        self.assertEqual(clicked_selectors, [("#btnSteam", 1000)])
+        self.assertEqual(statuses, [("Automatic Steam re-auth clicked Log in with Steam.", "info")])
+
+    def test_steam_auto_login_clicks_pa_steam_button_inside_frame(self):
+        clicked_selectors = []
+        statuses = []
+
+        class MissingFirstLocator:
+            async def click(self, timeout=None):
+                raise RuntimeError("not found")
+
+        class MissingLocator:
+            first = MissingFirstLocator()
+
+        class FrameFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                if self.selector != "#btnSteam":
+                    raise RuntimeError("not found")
+                clicked_selectors.append((self.selector, timeout))
+
+        class FrameLocator:
+            def __init__(self, selector):
+                self.first = FrameFirstLocator(selector)
+
+        class FakeFrame:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+
+            def locator(self, selector):
+                return FrameLocator(selector)
+
+        class FakePage:
+            url = "https://na-trade.naeu.playblackdesert.com/"
+            frames = [FakeFrame()]
+
+            def locator(self, selector):
+                return MissingLocator()
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        result = asyncio.run(
+            _maybe_run_steam_auto_login(
+                FakePage(),
+                "market",
+                enabled=True,
+                tracking=_new_steam_auto_login_state(),
+                status_callback=status_callback,
+            )
+        )
+
+        self.assertEqual(result, STEAM_AUTO_LOGIN_CLICKED)
+        self.assertEqual(clicked_selectors, [("#btnSteam", 1000)])
+        self.assertEqual(statuses, [("Automatic Steam re-auth clicked Log in with Steam.", "info")])
+
+    def test_steam_auto_login_does_not_probe_top_level_market_page_for_pa_button(self):
+        clicked_selectors = []
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                clicked_selectors.append((self.selector, timeout))
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://na-trade.naeu.playblackdesert.com/"
+            frames = []
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        result = asyncio.run(
+            _maybe_run_steam_auto_login(
+                FakePage(),
+                "market",
+                enabled=True,
+                tracking=_new_steam_auto_login_state(),
+            )
+        )
+
+        self.assertEqual(result, STEAM_AUTO_LOGIN_SKIPPED)
+        self.assertEqual(clicked_selectors, [])
+
+    def test_steam_auto_login_clicks_steam_sign_in_button(self):
+        clicked_selectors = []
+        statuses = []
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                if self.selector != "#imageLogin":
+                    raise RuntimeError("not found")
+                clicked_selectors.append((self.selector, timeout))
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://steamcommunity.com/openid/login"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        result = asyncio.run(
+            _maybe_run_steam_auto_login(
+                FakePage(),
+                "steam",
+                enabled=True,
+                tracking=_new_steam_auto_login_state(),
+                status_callback=status_callback,
+            )
+        )
+
+        self.assertEqual(result, STEAM_AUTO_LOGIN_CLICKED)
+        self.assertEqual(clicked_selectors, [("#imageLogin", 1000)])
+        self.assertEqual(statuses, [("Automatic Steam re-auth clicked Steam Sign In.", "info")])
+
+    def test_steam_auto_login_leaves_otp_status_only(self):
+        clicked_selectors = []
+        statuses = []
+        state, _is_callback = _classify_url("https://account.pearlabyss.com/en-us/Member/Login/CheckOtp")
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                clicked_selectors.append((self.selector, timeout))
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login/CheckOtp"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        result = asyncio.run(
+            _maybe_run_steam_auto_login(
+                FakePage(),
+                state,
+                enabled=True,
+                tracking=_new_steam_auto_login_state(),
+                status_callback=status_callback,
+            )
+        )
+
+        self.assertEqual(state, "otp")
+        self.assertEqual(_status_for_state(state), ("OTP required. Complete verification in the browser.", "warning"))
+        self.assertEqual(result, STEAM_AUTO_LOGIN_SKIPPED)
+        self.assertEqual(clicked_selectors, [])
+        self.assertEqual(statuses, [])
+
+    def test_steam_auto_login_missing_button_reports_manual_input_without_failing(self):
+        statuses = []
+
+        class FakeFirstLocator:
+            async def click(self, timeout=None):
+                raise RuntimeError("not found")
+
+        class FakeLocator:
+            first = FakeFirstLocator()
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+
+            def locator(self, selector):
+                return FakeLocator()
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        result = asyncio.run(
+            _maybe_run_steam_auto_login(
+                FakePage(),
+                "pa",
+                enabled=True,
+                tracking=_new_steam_auto_login_state(),
+                status_callback=status_callback,
+                now=10,
+                missing_notice_seconds=0,
+            )
+        )
+
+        self.assertEqual(result, STEAM_AUTO_LOGIN_MANUAL_NEEDED)
+        self.assertEqual(
+            statuses,
+            [("Automatic Steam re-auth is waiting for manual input on the Pearl Abyss page.", "warning")],
+        )
+
+    def test_steam_auto_login_skips_market_page_after_auth_flow_seen(self):
+        self.assertTrue(_should_attempt_steam_auto_login("market", False, False))
+        self.assertFalse(_should_attempt_steam_auto_login("market", True, False))
+        self.assertFalse(_should_attempt_steam_auto_login("market", False, True))
+        self.assertTrue(_should_attempt_steam_auto_login("pa", True, False))
+
+    def test_market_cookie_capture_allows_fast_auto_redirect_after_auth_flow(self):
+        cookies = [{"name": "anonymous-looking-cookie", "value": "ok"}]
+
+        self.assertFalse(_market_cookie_capture_ready(cookies, False, True, False))
+        self.assertTrue(_market_cookie_capture_ready(cookies, False, True, True))
+        self.assertTrue(_market_cookie_capture_ready(cookies, True, False, False))
+        self.assertFalse(_market_cookie_capture_ready(cookies, False, False, True))
+
+    def test_browser_auth_launch_error_names_missing_google_chrome(self):
+        message = _browser_launch_error_message(
+            RuntimeError("Executable doesn't exist at C:/Program Files/Google/Chrome/Application/chrome.exe")
+        )
+
+        self.assertIn("Google Chrome is not available", message)
+
     def test_purchase_result_messages_name_known_codes(self):
         self.assertIn("identical order already exists", purchase_result_message(30, "item", "100"))
         self.assertIn("price mismatch", purchase_result_message(-14, "item", "100"))
@@ -160,13 +790,10 @@ class APIResultTests(unittest.TestCase):
 
     def test_missing_session_file_is_initialized_with_empty_cookie_store(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            session_path = Path(temp_dir) / "resources" / "session.json"
+            session_path = Path(temp_dir) / "data" / "session.json"
             handler = object.__new__(APIHandler)
 
-            with patch("market.api_handler.SESSION_COOKIE_PATH", session_path), patch(
-                "market.api_handler.LEGACY_SESSION_PATHS",
-                (),
-            ):
+            with patch("bdo_marketplace_tools.market.api_handler.SESSION_COOKIE_PATH", session_path):
                 status = APIHandler.load_session(handler)
 
             self.assertEqual(status, -1)
@@ -204,21 +831,210 @@ class APIResultTests(unittest.TestCase):
 
 
 class LocalRuntimeFileTests(unittest.TestCase):
-    def test_missing_credentials_file_is_initialized_empty(self):
+    def test_missing_account_mode_settings_defaults_to_pa_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            info_path = Path(temp_dir) / "resources" / "info.json"
+            temp_path = Path(temp_dir)
+            settings_path = temp_path / "data" / "app_settings.json"
 
-            with patch("resources.credentials.INFO_PATH", info_path):
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
+                self.assertEqual(account_mode_module.load_account_mode(), PA_CREDENTIALS_MODE)
+                self.assertFalse(account_mode_module.load_steam_browser_profile_prepared())
+                self.assertEqual(account_mode_module.save_account_mode(STEAM_BROWSER_MODE), STEAM_BROWSER_MODE)
+                self.assertTrue(account_mode_module.save_steam_browser_profile_prepared(True))
+                self.assertEqual(account_mode_module.load_account_mode(), STEAM_BROWSER_MODE)
+                self.assertTrue(account_mode_module.load_steam_browser_profile_prepared())
+                self.assertEqual(account_mode_module.account_mode_label(STEAM_BROWSER_MODE), "Steam Account")
+                self.assertEqual(account_mode_module.account_mode_label(PA_CREDENTIALS_MODE), "Pearl Abyss Account")
+                self.assertEqual(account_mode_module.normalize_account_mode("Steam Account"), STEAM_BROWSER_MODE)
+                self.assertEqual(
+                    account_mode_module.normalize_account_mode("Pearl Abyss Account"),
+                    PA_CREDENTIALS_MODE,
+                )
+
+            self.assertTrue(settings_path.exists())
+            saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved_settings["version"], EXPECTED_APP_SETTINGS_VERSION)
+            self.assertEqual(saved_settings["account"]["mode"], STEAM_BROWSER_MODE)
+            self.assertIsNone(saved_settings["account"]["email"])
+            self.assertTrue(saved_settings["steam_browser"]["profile_prepared"])
+            self.assertFalse(saved_settings["session"]["saved_session_last_known_valid"])
+            self.assertEqual(saved_settings["ui"]["polling"]["selected"], "3")
+            self.assertEqual(saved_settings["ui"]["polling"]["custom_range"], [15, 30])
+            self.assertEqual(saved_settings["ui"]["buy_delay"]["range"], [1.0, 2.5])
+            self.assertIsNone(saved_settings["ui"]["spend_cap"])
+            self.assertFalse(saved_settings["ui"]["buy_mode"])
+            self.assertEqual(saved_settings["ui"]["event_log_view"], "core")
+
+    def test_app_settings_persist_ui_preferences(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            settings_path = temp_path / "data" / "app_settings.json"
+
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
+                account_mode_module.save_polling_settings("custom", (8, 13))
+                account_mode_module.save_purchase_delay_bounds((4.5, 8))
+                account_mode_module.save_spend_cap(123456789)
+                account_mode_module.save_buy_mode(True)
+                account_mode_module.save_event_log_view("ui")
+                account_mode_module.save_saved_session_last_known_valid(True)
+                settings = account_mode_module.read_app_settings()
+
+            self.assertEqual(settings["ui"]["polling"]["selected"], "custom")
+            self.assertEqual(settings["ui"]["polling"]["custom_range"], [8, 13])
+            self.assertEqual(settings["ui"]["buy_delay"]["range"], [4.5, 8.0])
+            self.assertEqual(settings["ui"]["spend_cap"], 123456789)
+            self.assertTrue(settings["ui"]["buy_mode"])
+            self.assertEqual(settings["ui"]["event_log_view"], "ui")
+            self.assertTrue(settings["session"]["saved_session_last_known_valid"])
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
+                self.assertFalse(account_mode_module.save_saved_session_last_known_valid(False))
+                self.assertFalse(account_mode_module.load_saved_session_last_known_valid())
+                self.assertEqual(account_mode_module.save_event_log_view("bad-view"), "core")
+
+    def test_background_tasks_load_and_save_persisted_ui_preferences(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            settings_path = temp_path / "data" / "app_settings.json"
+
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
+                account_mode_module.save_polling_settings("custom", (8, 13))
+                account_mode_module.save_purchase_delay_bounds((4.5, 8))
+                account_mode_module.save_spend_cap(250)
+                account_mode_module.save_buy_mode(True)
+                account_mode_module.save_event_log_view("ui")
+
+                with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
+                    manager = BackgroundTasks(FakeAPI())
+
+                self.assertEqual(manager.delay, "custom")
+                self.assertEqual(manager.current_delay_bounds(), (8, 13))
+                self.assertEqual(manager.purchase_delay_bounds, (4.5, 8.0))
+                self.assertEqual(manager.max_spend, 250)
+                self.assertTrue(manager.purchase_submission_enabled)
+                self.assertEqual(manager.event_log_view, "ui")
+
+                manager.set_delay_choice("2")
+                manager.set_purchase_delay_range("1.25", "3.5")
+                manager.set_spend_cap(0)
+                manager.set_purchase_submission_enabled(False)
+                manager.set_event_log_view("core")
+
+                with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
+                    restored = BackgroundTasks(FakeAPI())
+
+            self.assertEqual(restored.delay, "2")
+            self.assertEqual(restored.current_delay_bounds(), (5, 10))
+            self.assertEqual(restored.purchase_delay_bounds, (1.25, 3.5))
+            self.assertIsNone(restored.max_spend)
+            self.assertFalse(restored.purchase_submission_enabled)
+            self.assertEqual(restored.event_log_view, "core")
+
+    def test_old_resource_settings_are_ignored_for_fresh_start(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            settings_path = temp_path / "data" / "app_settings.json"
+            old_settings_path = temp_path / "resources" / "app_settings.json"
+            old_info_path = temp_path / "resources" / "info.json"
+            old_settings_path.parent.mkdir(parents=True)
+            old_settings_path.write_text(
+                json.dumps(
+                    {
+                        "account_mode": STEAM_BROWSER_MODE,
+                        "steam_browser_profile_prepared": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            old_info_path.write_text(
+                json.dumps({"email": "user@example.com", "password": "old-secret"}),
+                encoding="utf-8",
+            )
+
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
+                settings = account_mode_module.read_app_settings()
+
+            self.assertEqual(settings["account"]["mode"], PA_CREDENTIALS_MODE)
+            self.assertIsNone(settings["account"]["email"])
+            self.assertFalse(settings["steam_browser"]["profile_prepared"])
+            saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved_settings, settings)
+
+    def test_app_settings_refresh_version_metadata_when_read(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            settings_path = temp_path / "data" / "app_settings.json"
+            settings_path.parent.mkdir(parents=True)
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "account": {"mode": STEAM_BROWSER_MODE, "email": "user@example.com"},
+                        "steam_browser": {"profile_prepared": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
+                settings = account_mode_module.read_app_settings()
+
+            self.assertEqual(settings["version"], EXPECTED_APP_SETTINGS_VERSION)
+            self.assertEqual(settings["account"]["mode"], STEAM_BROWSER_MODE)
+            self.assertEqual(settings["account"]["email"], "user@example.com")
+            saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved_settings["version"], EXPECTED_APP_SETTINGS_VERSION)
+
+    def test_api_handler_initializes_account_mode_from_saved_settings(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            settings_path = temp_path / "data" / "app_settings.json"
+            session_path = temp_path / "data" / "session.json"
+
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
+                account_mode_module.save_account_mode(STEAM_BROWSER_MODE)
+                with patch("bdo_marketplace_tools.market.api_handler.SESSION_COOKIE_PATH", session_path):
+                    handler = APIHandler()
+
+            self.assertEqual(handler.account_mode, STEAM_BROWSER_MODE)
+
+    def test_missing_app_settings_credentials_are_initialized_empty(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            settings_path = temp_path / "data" / "app_settings.json"
+
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
                 self.assertEqual(credentials_module.load_credentials(), (None, None))
 
-            self.assertTrue(info_path.exists())
-            self.assertEqual(json.loads(info_path.read_text(encoding="utf-8")), {})
+            self.assertTrue(settings_path.exists())
+            saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertIsNone(saved_settings["account"]["email"])
 
-    def test_missing_local_data_file_is_initialized_with_default_totals(self):
+    def test_credentials_use_project_keyring_namespace(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            local_data_path = Path(temp_dir) / "resources" / "local_data.json"
+            temp_path = Path(temp_dir)
+            settings_path = temp_path / "data" / "app_settings.json"
+            keyring_mock = Mock()
+            keyring_mock.get_password.return_value = "saved-secret"
 
-            with patch("resources.task_manager.LOCAL_DATA_PATH", local_data_path):
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path), patch.object(
+                credentials_module, "keyring", keyring_mock
+            ):
+                credentials_module.save_credentials("user@example.com", "new-secret")
+                self.assertEqual(credentials_module.load_credentials(), ("user@example.com", "saved-secret"))
+
+            keyring_mock.set_password.assert_called_once_with(
+                "bdo-marketplace-tools", "user@example.com", "new-secret"
+            )
+            keyring_mock.get_password.assert_called_once_with("bdo-marketplace-tools", "user@example.com")
+            saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved_settings["account"]["email"], "user@example.com")
+            self.assertNotIn("new-secret", json.dumps(saved_settings))
+
+    def test_missing_local_stats_file_is_initialized_with_default_totals(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_data_path = Path(temp_dir) / "data" / "local_stats.json"
+
+            with patch("bdo_marketplace_tools.services.task_manager.LOCAL_DATA_PATH", local_data_path):
                 data = task_manager_module._load_local_data()
 
             self.assertEqual(data, LOCAL_DATA)
@@ -226,6 +1042,62 @@ class LocalRuntimeFileTests(unittest.TestCase):
             payload = json.loads(local_data_path.read_text(encoding="utf-8"))
             self.assertEqual(payload, LOCAL_DATA)
             self.assertNotIn("updated_at", payload)
+
+    def test_old_local_data_file_is_ignored_for_fresh_start(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            local_stats_path = temp_path / "data" / "local_stats.json"
+            old_local_data_path = temp_path / "resources" / "local_data.json"
+            old_local_data_path.parent.mkdir(parents=True)
+            old_local_data_path.write_text(
+                json.dumps({"successful_purchases": 7, "silver_spent": 12345}),
+                encoding="utf-8",
+            )
+
+            data = task_manager_module.load_local_stats(path=local_stats_path)
+
+            self.assertEqual(data, LOCAL_DATA)
+            self.assertTrue(local_stats_path.exists())
+            self.assertEqual(json.loads(local_stats_path.read_text(encoding="utf-8")), LOCAL_DATA)
+
+    def test_old_session_file_is_ignored_for_fresh_start(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            session_path = temp_path / "data" / "session.json"
+            old_session_path = temp_path / "resources" / "session.json"
+            old_session_path.parent.mkdir(parents=True)
+            old_session_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "cookies": [
+                            {
+                                "name": "TradeAuth_Session",
+                                "value": "abc123",
+                                "domain": "na-trade.naeu.playblackdesert.com",
+                                "path": "/",
+                                "secure": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            handler = object.__new__(APIHandler)
+
+            with patch("bdo_marketplace_tools.market.api_handler.SESSION_COOKIE_PATH", session_path):
+                status = APIHandler.load_session(handler)
+
+            self.assertEqual(status, -1)
+            self.assertIsNone(handler.session.cookies.get("TradeAuth_Session"))
+            self.assertTrue(session_path.exists())
+            self.assertEqual(json.loads(session_path.read_text(encoding="utf-8")), {"version": 1, "cookies": []})
+
+    def test_browser_profile_paths_use_data_directory(self):
+        self.assertIn("data", STEAM_MARKET_PROFILE_PATH.parts)
+        self.assertEqual(STEAM_MARKET_PROFILE_PATH.name, "steam-market")
+        self.assertIn("data", STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH.parts)
+        self.assertEqual(STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH.name, "steam-market-diagnostic")
 
 
 class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -434,7 +1306,7 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
         handler._purchase_result_code = APIHandler._purchase_result_code.__get__(handler, APIHandler)
 
         sleep_mock = AsyncMock()
-        with patch("market.api_handler.asyncio.sleep", new=sleep_mock):
+        with patch("bdo_marketplace_tools.market.api_handler.asyncio.sleep", new=sleep_mock):
             summary = await APIHandler.buy_item(handler, [["item", "2", "100"]])
 
         self.assertEqual(summary["attempted"], 2)
@@ -477,8 +1349,8 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
         handler._json_response = APIHandler._json_response.__get__(handler, APIHandler)
         handler._purchase_result_code = APIHandler._purchase_result_code.__get__(handler, APIHandler)
 
-        with patch("market.api_handler.random.uniform", return_value=4.5) as uniform_mock:
-            with patch("market.api_handler.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+        with patch("bdo_marketplace_tools.market.api_handler.random.uniform", return_value=4.5) as uniform_mock:
+            with patch("bdo_marketplace_tools.market.api_handler.asyncio.sleep", new=AsyncMock()) as sleep_mock:
                 summary = await APIHandler.buy_item(
                     handler,
                     [["item", "3", "100"]],
@@ -566,7 +1438,7 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
         handler._purchase_result_details = APIHandler._purchase_result_details.__get__(handler, APIHandler)
         handler._optional_positive_int = APIHandler._optional_positive_int.__get__(handler, APIHandler)
 
-        with patch("market.api_handler.asyncio.sleep", new=AsyncMock()):
+        with patch("bdo_marketplace_tools.market.api_handler.asyncio.sleep", new=AsyncMock()):
             summary = await APIHandler.buy_item(handler, [["10007", "1", "82500"]])
 
         self.assertEqual(summary["purchased"], 1)
@@ -641,11 +1513,96 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await APIHandler.is_session_expired(handler), 0)
 
+    async def test_browser_cookie_import_filters_market_domains_and_saves_after_validation(self):
+        handler = object.__new__(APIHandler)
+        handler.session = requests.Session()
+        handler.login_status = False
+        handler.is_session_expired = AsyncMock(return_value=0)
+        handler.save_session = Mock()
+        cookies = [
+            {
+                "name": "TradeAuth_Session",
+                "value": "market-session",
+                "domain": "na-trade.naeu.playblackdesert.com",
+                "path": "/",
+                "secure": True,
+            },
+            {
+                "name": "steamLoginSecure",
+                "value": "do-not-import",
+                "domain": "steamcommunity.com",
+                "path": "/",
+                "secure": True,
+            },
+        ]
+
+        self.assertTrue(await APIHandler.validate_and_save_imported_session(handler, cookies))
+
+        saved_cookies = handler.session.cookies.get_dict(domain="na-trade.naeu.playblackdesert.com")
+        self.assertEqual(saved_cookies, {"TradeAuth_Session": "market-session"})
+        self.assertTrue(handler.login_status)
+        handler.save_session.assert_called_once()
+
+    async def test_failed_browser_cookie_validation_preserves_existing_session(self):
+        handler = object.__new__(APIHandler)
+        previous_session = requests.Session()
+        previous_session.cookies.set("TradeAuth_Session", "old", domain="na-trade.naeu.playblackdesert.com", path="/")
+        handler.session = previous_session
+        handler.login_status = True
+        handler.is_session_expired = AsyncMock(return_value=-1)
+        handler.save_session = Mock()
+
+        result = await APIHandler.validate_and_save_imported_session(
+            handler,
+            [
+                {
+                    "name": "TradeAuth_Session",
+                    "value": "new",
+                    "domain": "na-trade.naeu.playblackdesert.com",
+                    "path": "/",
+                }
+            ],
+        )
+
+        self.assertFalse(result)
+        self.assertIs(handler.session, previous_session)
+        self.assertTrue(handler.login_status)
+        handler.save_session.assert_not_called()
+
+    async def test_steam_mode_session_validation_does_not_attempt_password_login(self):
+        handler = object.__new__(APIHandler)
+        handler.account_mode = STEAM_BROWSER_MODE
+        handler.login_status = True
+        handler.email = "user@example.com"
+        handler.password = "secret"
+        handler.is_session_expired = AsyncMock(return_value=-1)
+        handler.login = AsyncMock(return_value=1)
+
+        self.assertFalse(await APIHandler.ensure_session_valid(handler))
+        handler.login.assert_not_called()
+        self.assertFalse(handler.login_status)
+
 
 class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
     def make_task_manager(self, test_mode_enabled=False):
-        with patch("resources.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
-            return BackgroundTasks(FakeAPI(), test_mode_enabled=test_mode_enabled)
+        with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()), patch(
+            "bdo_marketplace_tools.services.task_manager.load_account_mode",
+            return_value=PA_CREDENTIALS_MODE,
+        ), patch("bdo_marketplace_tools.services.task_manager.load_steam_browser_profile_prepared", return_value=True):
+            return BackgroundTasks(FakeAPI(), test_mode_enabled=test_mode_enabled, persist_ui_settings=False)
+
+    async def test_event_logs_split_core_and_ui_streams_while_preserving_combined_events(self):
+        manager = self.make_task_manager()
+
+        manager.add_event("Core monitor detail.", "success")
+        manager.add_event("UI setting saved.", "info", channel="ui")
+
+        self.assertTrue(any("Core monitor detail." in event for event in manager.events))
+        self.assertTrue(any("UI setting saved." in event for event in manager.events))
+        self.assertTrue(any("Core monitor detail." in event for event in manager.events_for_channel("core")))
+        self.assertFalse(any("UI setting saved." in event for event in manager.events_for_channel("core")))
+        self.assertTrue(any("UI setting saved." in event for event in manager.events_for_channel("ui")))
+        self.assertFalse(any("Core monitor detail." in event for event in manager.events_for_channel("ui")))
 
     async def test_spend_cap_limits_items_by_price_order(self):
         manager = self.make_task_manager()
@@ -741,11 +1698,11 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         stock_check = AsyncMock(return_value=[["10007", "2", "82500"]])
         manager.api_handler.buy_item = AsyncMock()
 
-        with patch("resources.task_manager.check_single_item_stock", stock_check), patch(
-            "resources.task_manager.random.uniform",
+        with patch("bdo_marketplace_tools.services.task_manager.check_single_item_stock", stock_check), patch(
+            "bdo_marketplace_tools.services.task_manager.random.uniform",
             return_value=3,
         ), patch(
-            "resources.task_manager.asyncio.sleep",
+            "bdo_marketplace_tools.services.task_manager.asyncio.sleep",
             new=AsyncMock(side_effect=asyncio.CancelledError),
         ):
             with self.assertRaises(asyncio.CancelledError):
@@ -775,14 +1732,14 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         )
         manager.single_item_test_purchase_enabled = True
 
-        with patch("resources.task_manager.check_single_item_stock", stock_check), patch.object(
+        with patch("bdo_marketplace_tools.services.task_manager.check_single_item_stock", stock_check), patch.object(
             manager,
             "save_local_data",
         ) as save_mock, patch(
-            "resources.task_manager.random.uniform",
+            "bdo_marketplace_tools.services.task_manager.random.uniform",
             return_value=3,
         ), patch(
-            "resources.task_manager.asyncio.sleep",
+            "bdo_marketplace_tools.services.task_manager.asyncio.sleep",
             new=AsyncMock(side_effect=asyncio.CancelledError),
         ):
             with self.assertRaises(asyncio.CancelledError):
@@ -844,8 +1801,8 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
 
         manager.set_custom_delay_range(8, 13)
         manager.api_handler.check_stock = AsyncMock(return_value=[])
-        with patch("resources.task_manager.random.uniform", return_value=9) as uniform_mock:
-            with patch("resources.task_manager.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
+        with patch("bdo_marketplace_tools.services.task_manager.random.uniform", return_value=9) as uniform_mock:
+            with patch("bdo_marketplace_tools.services.task_manager.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
                 with self.assertRaises(asyncio.CancelledError):
                     await manager.checker()
 
@@ -856,7 +1813,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.set_custom_delay_range(5, 10)
         manager.consecutive_cycle_errors = 2
 
-        with patch("resources.task_manager.random.uniform", return_value=20) as uniform_mock:
+        with patch("bdo_marketplace_tools.services.task_manager.random.uniform", return_value=20) as uniform_mock:
             self.assertEqual(manager.next_sleep_duration(), 20)
 
         uniform_mock.assert_called_once_with(15, 30)
@@ -945,7 +1902,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager = self.make_task_manager()
         manager.api_handler.check_stock = AsyncMock(return_value=[["bad-item", "not-a-number", "100"]])
 
-        with patch("resources.task_manager.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
+        with patch("bdo_marketplace_tools.services.task_manager.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
             with self.assertRaises(asyncio.CancelledError):
                 await manager.checker()
 
@@ -980,33 +1937,493 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Session check failed: network down", event_text)
         self.assertIn("Login failed.", event_text)
 
+    async def test_steam_mode_login_uses_browser_refresh_instead_of_credentials(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.email = "user@example.com"
+        manager.api_handler.password = "secret"
+        manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
+        manager.api_handler.login = AsyncMock(return_value=1)
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_steam_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ) as browser_auth:
+            await manager.login()
+
+        browser_auth.assert_awaited_once()
+        self.assertFalse(browser_auth.await_args.kwargs["auto_steam_login"])
+        manager.api_handler.login.assert_not_called()
+        manager.api_handler.validate_and_save_imported_session.assert_awaited_once()
+        self.assertTrue(manager.api_handler.login_status)
+        self.assertTrue(manager.saved_session_last_known_valid)
+        self.assertTrue(manager.steam_auto_reauth_enabled)
+        self.assertTrue(any("Steam Account session validated and saved" in event for event in manager.events))
+        await manager.stop_login_status_checker()
+
+    async def test_initial_steam_expired_session_prompts_without_enabling_auto_reauth(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.saved_session_last_known_valid = True
+        manager.api_handler.session_has_cookies = True
+        manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
+
+        with patch("bdo_marketplace_tools.services.task_manager.acquire_steam_market_cookies", new=AsyncMock()) as browser_auth:
+            await manager.initial_login_check()
+
+        browser_auth.assert_not_called()
+        self.assertFalse(manager.api_handler.login_status)
+        self.assertFalse(manager.steam_auto_reauth_enabled)
+        self.assertFalse(manager.saved_session_last_known_valid)
+        self.assertTrue(any("Refresh Session to open the login browser" in event for event in manager.events))
+
+    async def test_initial_login_check_skips_api_without_last_known_valid_saved_session(self):
+        manager = self.make_task_manager()
+        manager.saved_session_last_known_valid = False
+        manager.api_handler.session_has_cookies = True
+        manager.api_handler.is_session_expired = AsyncMock(return_value=0)
+
+        await manager.initial_login_check()
+
+        manager.api_handler.is_session_expired.assert_not_called()
+        self.assertFalse(manager.api_handler.login_status)
+        self.assertTrue(any("No previously validated marketplace session" in event for event in manager.events))
+
+    async def test_initial_login_check_clears_last_known_valid_when_cookies_are_missing(self):
+        manager = self.make_task_manager()
+        manager.saved_session_last_known_valid = True
+        manager.api_handler.session_has_cookies = False
+        manager.api_handler.is_session_expired = AsyncMock(return_value=0)
+
+        await manager.initial_login_check()
+
+        manager.api_handler.is_session_expired.assert_not_called()
+        self.assertFalse(manager.saved_session_last_known_valid)
+        self.assertFalse(manager.api_handler.login_status)
+        self.assertTrue(any("No saved marketplace session cookies found" in event for event in manager.events))
+
+    async def test_initial_valid_steam_session_enables_auto_reauth_for_current_run(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.saved_session_last_known_valid = True
+        manager.api_handler.session_has_cookies = True
+        manager.api_handler.is_session_expired = AsyncMock(return_value=0)
+
+        await manager.initial_login_check()
+
+        self.assertTrue(manager.api_handler.login_status)
+        self.assertTrue(manager.saved_session_last_known_valid)
+        self.assertTrue(manager.steam_auto_reauth_enabled)
+        self.assertTrue(any("Saved marketplace session is valid" in event for event in manager.events))
+        await manager.stop_login_status_checker()
+
+    async def test_first_time_steam_refresh_prepares_profile_before_market_cookie_import(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_browser_profile_prepared = False
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
+
+        with patch("bdo_marketplace_tools.services.task_manager.prepare_steam_browser_profile", new=AsyncMock()) as profile_setup, patch(
+            "bdo_marketplace_tools.services.task_manager.save_steam_browser_profile_prepared",
+            return_value=True,
+        ) as save_prepared, patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_steam_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ) as browser_auth:
+            refreshed = await manager.refresh_browser_session()
+
+        self.assertTrue(refreshed)
+        profile_setup.assert_awaited_once()
+        save_prepared.assert_called_once_with(True)
+        browser_auth.assert_awaited_once()
+        self.assertFalse(browser_auth.await_args.kwargs["auto_steam_login"])
+        manager.api_handler.validate_and_save_imported_session.assert_awaited_once()
+        self.assertTrue(manager.steam_browser_profile_prepared)
+        self.assertTrue(manager.saved_session_last_known_valid)
+        self.assertTrue(manager.steam_auto_reauth_enabled)
+        self.assertTrue(any("Initial Steam browser setup is required" in event for event in manager.events))
+        self.assertTrue(any("Initial Steam browser setup saved" in event for event in manager.events))
+        await manager.stop_login_status_checker()
+
+    async def test_failed_steam_refresh_clears_last_known_valid_session_flag(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.saved_session_last_known_valid = True
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_steam_market_cookies",
+            new=AsyncMock(side_effect=BrowserAuthError("browser closed")),
+        ):
+            refreshed = await manager.refresh_browser_session()
+
+        self.assertFalse(refreshed)
+        self.assertFalse(manager.saved_session_last_known_valid)
+        self.assertFalse(manager.api_handler.login_status)
+
+    async def test_account_mode_change_stops_monitor_and_clears_session(self):
+        manager = self.make_task_manager()
+        manager.api_handler.login_status = True
+        manager.purchase_submission_enabled = True
+        manager.steam_auto_reauth_enabled = True
+        manager.saved_session_last_known_valid = True
+
+        async def idle_checker():
+            await asyncio.sleep(60)
+
+        manager.checker = idle_checker
+        await manager.start_checker()
+        self.assertTrue(manager.checker_enabled)
+
+        changed = await manager.change_account_mode(STEAM_BROWSER_MODE)
+
+        self.assertTrue(changed)
+        self.assertFalse(manager.checker_enabled)
+        self.assertFalse(manager.purchase_submission_enabled)
+        self.assertFalse(manager.api_handler.login_status)
+        self.assertTrue(manager.api_handler.session_cleared)
+        self.assertFalse(manager.steam_auto_reauth_enabled)
+        self.assertFalse(manager.saved_session_last_known_valid)
+        self.assertTrue(any("Marketplace session cleared" in event for event in manager.events))
+
+    async def test_account_mode_change_during_purchase_defers_session_clear_until_chain_finishes(self):
+        manager = self.make_task_manager()
+        manager.api_handler.login_status = True
+        manager.purchase_submission_enabled = True
+        manager.steam_auto_reauth_enabled = True
+        manager.saved_session_last_known_valid = True
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_buy(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return {"purchase_records": [], "events": [{"level": "success", "message": "buy chain done"}]}
+
+        manager.api_handler.buy_item = slow_buy
+        buy_task = asyncio.create_task(manager.buy_item([["10007", "1", "82500"]], adjust_pricing=False))
+        await started.wait()
+
+        changed = await manager.change_account_mode(STEAM_BROWSER_MODE)
+
+        self.assertTrue(changed)
+        self.assertTrue(manager.purchase_in_progress)
+        self.assertFalse(manager.api_handler.session_cleared)
+        self.assertIsNotNone(manager.pending_auth_reset_reason)
+
+        release.set()
+        await buy_task
+
+        self.assertFalse(manager.purchase_in_progress)
+        self.assertIsNone(manager.pending_auth_reset_reason)
+        self.assertFalse(manager.api_handler.login_status)
+        self.assertTrue(manager.api_handler.session_cleared)
+        self.assertFalse(manager.steam_auto_reauth_enabled)
+        self.assertFalse(manager.saved_session_last_known_valid)
+        self.assertTrue(any("buy chain done" in event for event in manager.events))
+        self.assertTrue(any("Marketplace session cleared" in event for event in manager.events))
+
+    async def test_debug_session_invalidation_keeps_running_monitor_and_buy_mode(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+        manager.api_handler.login_status = True
+        manager.purchase_submission_enabled = True
+        manager.saved_session_last_known_valid = True
+
+        async def idle_checker():
+            await asyncio.sleep(60)
+
+        manager.checker = idle_checker
+        await manager.start_checker()
+        self.assertTrue(manager.checker_enabled)
+
+        invalidated = manager.debug_invalidate_marketplace_session()
+
+        self.assertTrue(invalidated)
+        self.assertTrue(manager.checker_enabled)
+        self.assertTrue(manager.purchase_submission_enabled)
+        self.assertTrue(manager.api_handler.login_status)
+        self.assertFalse(manager.api_handler.session_cleared)
+        self.assertTrue(manager.debug_force_purchase_session_expired)
+        self.assertFalse(manager.saved_session_last_known_valid)
+        self.assertEqual(len(manager.events), 0)
+
+        await manager.stop_checker()
+
+    async def test_debug_session_invalidation_enables_auto_reauth_for_online_steam_session(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.login_status = True
+        manager.saved_session_last_known_valid = True
+
+        invalidated = manager.debug_invalidate_marketplace_session()
+
+        self.assertTrue(invalidated)
+        self.assertTrue(manager.debug_force_purchase_session_expired)
+        self.assertTrue(manager.steam_auto_reauth_enabled)
+        self.assertTrue(manager.api_handler.login_status)
+        self.assertFalse(manager.saved_session_last_known_valid)
+
+    async def test_debug_toggle_steam_auto_reauth_requires_test_mode_and_steam_mode(self):
+        manager = self.make_task_manager(test_mode_enabled=False)
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+
+        self.assertIsNone(manager.debug_toggle_steam_auto_reauth())
+        self.assertFalse(manager.steam_auto_reauth_enabled)
+
+        manager = self.make_task_manager(test_mode_enabled=True)
+        self.assertIsNone(manager.debug_toggle_steam_auto_reauth())
+        self.assertFalse(manager.steam_auto_reauth_enabled)
+
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        self.assertTrue(manager.debug_toggle_steam_auto_reauth())
+        self.assertTrue(manager.steam_auto_reauth_enabled)
+        self.assertFalse(manager.debug_toggle_steam_auto_reauth())
+        self.assertFalse(manager.steam_auto_reauth_enabled)
+
+    async def test_debug_reauthentication_check_simulates_purchase_expiry_and_pa_relogin(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+        manager.api_handler.login_status = True
+        manager.purchase_submission_enabled = True
+        manager.debug_invalidate_marketplace_session()
+        manager.api_handler.login = AsyncMock(return_value=1)
+        manager.api_handler.save_session = Mock()
+
+        recovered = await manager.debug_run_reauthentication_check()
+
+        self.assertTrue(recovered)
+        manager.api_handler.login.assert_awaited_once()
+        manager.api_handler.save_session.assert_called_once()
+        self.assertTrue(manager.api_handler.login_status)
+        self.assertTrue(manager.purchase_submission_enabled)
+        self.assertFalse(manager.debug_force_purchase_session_expired)
+        self.assertTrue(any("Simulated purchase response: login session expired" in event for event in manager.events))
+        self.assertTrue(any("Re-authentication succeeded. Retrying purchase request" in event for event in manager.events))
+
+    async def test_debug_reauthentication_check_uses_browser_refresh_in_steam_mode(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.purchase_submission_enabled = True
+        manager.api_handler.login = AsyncMock(return_value=1)
+        manager.refresh_browser_session = AsyncMock(return_value=True)
+
+        recovered = await manager.debug_run_reauthentication_check()
+
+        self.assertTrue(recovered)
+        manager.api_handler.login.assert_not_called()
+        manager.refresh_browser_session.assert_awaited_once()
+        self.assertTrue(manager.purchase_submission_enabled)
+        self.assertTrue(any("Re-authentication succeeded. Retrying purchase request" in event for event in manager.events))
+
+    async def test_debug_blank_browser_diagnostic_opens_without_session_import(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+
+        with patch("bdo_marketplace_tools.services.task_manager.open_blank_steam_browser_diagnostic", new=AsyncMock()) as browser_diag:
+            opened = await manager.debug_open_blank_browser_diagnostic()
+
+        self.assertTrue(opened)
+        browser_diag.assert_awaited_once()
+        self.assertFalse(manager.api_handler.session_cleared)
+        self.assertFalse(manager.api_handler.login_status)
+        self.assertTrue(any("Blank browser diagnostic closed" in event for event in manager.events))
+
+    async def test_debug_clear_steam_initial_setup_status_is_test_mode_only(self):
+        manager = self.make_task_manager(test_mode_enabled=False)
+        manager.steam_browser_profile_prepared = True
+        manager.steam_auto_reauth_enabled = True
+
+        with patch("bdo_marketplace_tools.services.task_manager.save_steam_browser_profile_prepared") as save_setup:
+            self.assertFalse(manager.debug_clear_steam_initial_setup_status())
+
+        save_setup.assert_not_called()
+        self.assertTrue(manager.steam_browser_profile_prepared)
+        self.assertTrue(manager.steam_auto_reauth_enabled)
+
+        manager = self.make_task_manager(test_mode_enabled=True)
+        manager.steam_browser_profile_prepared = True
+        manager.steam_auto_reauth_enabled = True
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.save_steam_browser_profile_prepared",
+            return_value=False,
+        ) as save_setup:
+            self.assertTrue(manager.debug_clear_steam_initial_setup_status())
+
+        save_setup.assert_called_once_with(False)
+        self.assertFalse(manager.steam_browser_profile_prepared)
+        self.assertFalse(manager.steam_auto_reauth_enabled)
+        self.assertTrue(any("Initial Steam setup status reset" in event for event in manager.events))
+
+    async def test_debug_clear_steam_browser_cookies_clears_profile_without_logging_values(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.clear_steam_browser_profile_cookies",
+            new=AsyncMock(return_value=3),
+        ) as cookie_clear:
+            result = await manager.debug_clear_steam_browser_cookies()
+
+        self.assertTrue(result)
+        cookie_clear.assert_awaited_once()
+        self.assertTrue(any("Steam browser cookies cleared" in event for event in manager.events))
+        self.assertTrue(any("3 cookies" in event for event in manager.events))
+        self.assertFalse(any("steamLoginSecure" in event for event in manager.events))
+
+    async def test_debug_clear_steam_browser_cookies_is_test_mode_only(self):
+        manager = self.make_task_manager(test_mode_enabled=False)
+
+        with patch("bdo_marketplace_tools.services.task_manager.clear_steam_browser_profile_cookies") as cookie_clear:
+            result = await manager.debug_clear_steam_browser_cookies()
+
+        self.assertFalse(result)
+        cookie_clear.assert_not_called()
+
+    async def test_steam_buy_expired_response_refreshes_browser_and_retries_once(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.purchase_submission_enabled = True
+        expired_summary = {
+            "purchase_records": [],
+            "results": [{"item_id": "10007", "result_code": 2000}],
+            "events": [{"level": "error", "message": "Login session expired."}],
+        }
+        success_summary = {
+            "purchase_records": [{"item_id": "10007", "price": 82500, "count": 1, "result_code": 0}],
+            "results": [{"item_id": "10007", "result_code": 0}],
+            "events": [{"level": "success", "message": "Purchase succeeded after retry."}],
+        }
+        manager.api_handler.buy_item = AsyncMock(side_effect=[expired_summary, success_summary])
+        manager.refresh_browser_session = AsyncMock(return_value=True)
+
+        with patch.object(manager, "save_local_data") as save_mock:
+            await manager.buy_item([["10007", "1", "82500"]], adjust_pricing=False)
+
+        self.assertEqual(manager.api_handler.buy_item.await_count, 2)
+        manager.refresh_browser_session.assert_awaited_once()
+        self.assertTrue(manager.purchase_submission_enabled)
+        self.assertEqual(manager.session_successful_purchases, 1)
+        self.assertTrue(any("Purchase succeeded after retry" in event for event in manager.events))
+        save_mock.assert_called_once()
+
+    async def test_steam_buy_expired_response_uses_enabled_auto_reauth_flow(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_auto_reauth_enabled = True
+        manager.purchase_submission_enabled = True
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
+        expired_summary = {
+            "purchase_records": [],
+            "results": [{"item_id": "10007", "result_code": 2000}],
+            "events": [{"level": "error", "message": "Login session expired."}],
+        }
+        success_summary = {
+            "purchase_records": [{"item_id": "10007", "price": 82500, "count": 1, "result_code": 0}],
+            "results": [{"item_id": "10007", "result_code": 0}],
+            "events": [{"level": "success", "message": "Purchase succeeded after auto re-auth."}],
+        }
+        manager.api_handler.buy_item = AsyncMock(side_effect=[expired_summary, success_summary])
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_steam_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ) as browser_auth:
+            with patch.object(manager, "save_local_data"):
+                await manager.buy_item([["10007", "1", "82500"]], adjust_pricing=False)
+
+        self.assertEqual(manager.api_handler.buy_item.await_count, 2)
+        browser_auth.assert_awaited_once()
+        self.assertTrue(browser_auth.await_args.kwargs["auto_steam_login"])
+        self.assertTrue(manager.purchase_submission_enabled)
+        self.assertTrue(any("Purchase succeeded after auto re-auth" in event for event in manager.events))
+        await manager.stop_login_status_checker()
+
     async def test_login_status_checker_combines_expired_session_with_reauth_result(self):
         manager = self.make_task_manager()
         manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
         manager.api_handler.login = AsyncMock(return_value=0)
 
-        with patch("resources.task_manager.asyncio.sleep", new=AsyncMock(return_value=None)):
+        with patch("bdo_marketplace_tools.services.task_manager.asyncio.sleep", new=AsyncMock(return_value=None)):
             await manager.login_status_checker()
 
         self.assertEqual(len(manager.events), 1)
         self.assertIn("Session expired. Re-authentication failed.", manager.events[0])
 
+    async def test_login_status_checker_prompts_browser_refresh_in_steam_mode(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
+        manager.api_handler.login = AsyncMock(return_value=1)
+        manager.purchase_submission_enabled = True
+        manager.refresh_browser_session = AsyncMock(return_value=True)
+
+        with patch("bdo_marketplace_tools.services.task_manager.asyncio.sleep", new=AsyncMock(return_value=None)):
+            await manager.login_status_checker()
+
+        manager.api_handler.login.assert_not_called()
+        manager.refresh_browser_session.assert_not_called()
+        self.assertFalse(manager.purchase_submission_enabled)
+        self.assertTrue(any("Steam Account refresh required" in event for event in manager.events))
+
+    async def test_expired_steam_session_auto_reauths_when_current_run_gate_is_enabled(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_auto_reauth_enabled = True
+        manager.purchase_submission_enabled = True
+
+        async def refresh_side_effect(*args, **kwargs):
+            manager.api_handler.login_status = True
+            return True
+
+        manager.refresh_browser_session = AsyncMock(side_effect=refresh_side_effect)
+
+        recovered = await manager.handle_expired_session()
+
+        self.assertTrue(recovered)
+        manager.refresh_browser_session.assert_awaited_once_with(auto_steam_login=True)
+        self.assertTrue(manager.purchase_submission_enabled)
+        self.assertTrue(manager.api_handler.login_status)
+        self.assertTrue(any("automatic Steam Account re-authentication" in event for event in manager.events))
+
 
 class TextualAppTests(unittest.IsolatedAsyncioTestCase):
     def make_app(self, launch_mode="live"):
-        with patch("resources.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
-            manager = BackgroundTasks(FakeAPI())
+        with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()), patch(
+            "bdo_marketplace_tools.services.task_manager.load_account_mode",
+            return_value=PA_CREDENTIALS_MODE,
+        ), patch("bdo_marketplace_tools.services.task_manager.load_steam_browser_profile_prepared", return_value=True):
+            manager = BackgroundTasks(FakeAPI(), persist_ui_settings=False)
         return MarketplaceToolsApp(manager, manager.api_handler, launch_mode=launch_mode)
 
     async def test_app_launches_and_navigates_sidebar(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertEqual(app.theme, DEFAULT_THEME)
                 self.assertEqual(len(list(app.query("AppHeader"))), 1)
                 self.assertEqual(len(list(app.query("HeaderIcon"))), 0)
                 self.assertEqual(len(list(app.query("HeaderClock"))), 1)
+                self.assertEqual(app.query_one("#app-header-title", Static).content, "Marketplace Tools")
+                self.assertEqual(app.query_one("#brand", Static).content, "Marketplace Tools")
+                self.assertEqual(app.query_one("#build-info", Static).content, f"v{APP_VERSION}")
+                self.assertLessEqual(
+                    len(str(app.query_one("#build-info", Static).content)),
+                    int(len(f"build v{APP_VERSION}") * 0.7),
+                )
+                self.assertNotIn("BETA", str(app.query_one("#app-header-title", Static).content))
+                self.assertNotIn("BETA", str(app.query_one("#brand", Static).content))
                 await pilot.click("#app-header")
                 self.assertFalse(app.query_one("#app-header").has_class("-tall"))
                 self.assertEqual(app.query_one("#banner").render(), BANNER_ART)
@@ -1015,7 +2432,12 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("1")
                 self.assertEqual(app.current_view, "settings")
                 self.assertFalse(app.query_one("#banner").display)
-                self.assertTrue(app.query_one("#screen-title").display)
+                self.assertFalse(app.query_one("#screen-title").display)
+                self.assertEqual(app.query_one("#settings-summary", Static).border_title, "App Settings")
+                await pilot.press("2")
+                self.assertEqual(app.current_view, "wallet")
+                self.assertIn(("wallet", "Inventory"), app.NAV_ITEMS)
+                self.assertEqual(app.query_one("#screen-title", Static).content, "Marketplace Inventory")
                 await pilot.press("3")
                 self.assertEqual(app.current_view, "stats")
                 self.assertEqual(len(list(app.query("#stats-output"))), 0)
@@ -1026,55 +2448,205 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dashboard_banner_shows_when_terminal_is_large_enough(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(150, 45)):
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertTrue(app.query_one("#banner").display)
 
     async def test_dashboard_content_remains_scrollable(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)):
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertEqual(app.query_one("#content").styles.overflow_y, "auto")
                 self.assertGreaterEqual(app.query_one("#event-log").size.height, 6)
                 self.assertLessEqual(app.query_one("#sidebar").region.width, 23)
-                self.assertEqual(app.query_one("#event-log").styles.border_title_color, Color(255, 145, 60))
+                self.assertEqual(app.query_one("#event-log").styles.border_title_color, Color(216, 211, 200))
+                self.assertEqual(app.query_one("#event-log").styles.scrollbar_color, Color(52, 52, 52))
+                self.assertEqual(app.query_one("#event-log").styles.scrollbar_size_vertical, 1)
 
     async def test_credentials_validation_and_password_masking(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch(
-            "resources.textual_ui.save_credentials"
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch(
+            "bdo_marketplace_tools.ui.app.save_credentials"
         ) as save_mock:
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.click("#tile-credentials")
                 await pilot.pause()
+                self.assertEqual(len(list(app.screen_stack[-1].query("#email-input"))), 0)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#password-input"))), 0)
+
+                await pilot.click("#credential-action-tile")
+                await pilot.pause()
                 password_input = app.query_visible_one("#password-input")
                 self.assertTrue(password_input.password)
-
-                await pilot.click("#save-credentials")
-                self.assertIn("Email field cannot be empty", app.status_message)
+                self.assertTrue(app.query_visible_one("#save-pa-credentials", Button).disabled)
 
                 app.query_visible_one("#email-input").value = "user@example.com"
+                await pilot.pause()
+                self.assertTrue(app.query_visible_one("#save-pa-credentials", Button).disabled)
+
                 app.query_visible_one("#password-input").value = "secret"
-                await pilot.click("#save-credentials")
+                await pilot.pause()
+                self.assertFalse(app.query_visible_one("#save-pa-credentials", Button).disabled)
+                await pilot.click("#save-pa-credentials")
                 save_mock.assert_called_once_with("user@example.com", "secret")
                 self.assertIn("Credentials saved", app.status_message)
-                self.assertEqual([type(screen).__name__ for screen in app.screen_stack], ["Screen"])
+                self.assertEqual(type(app.screen_stack[-1]).__name__, "CredentialsModal")
 
-    async def test_saved_credentials_are_labeled_set_not_authenticated_ready(self):
+    async def test_pa_credentials_modal_shows_invalid_email_warning_inline(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=("user@example.com", "secret")):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch(
+            "bdo_marketplace_tools.ui.app.save_credentials"
+        ) as save_mock:
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.click("#tile-credentials")
+                await pilot.pause()
+                await pilot.click("#credential-action-tile")
+                await pilot.pause()
+                app.query_visible_one("#email-input").value = "not-an-email"
+                app.query_visible_one("#password-input").value = "secret"
+                await pilot.pause()
+                self.assertFalse(app.query_visible_one("#save-pa-credentials", Button).disabled)
+
+                await pilot.click("#save-pa-credentials")
+                await pilot.pause()
+
+                self.assertIn(
+                    "Enter a valid email address",
+                    str(app.query_visible_one("#pa-credentials-warning", Static).render()),
+                )
+                self.assertEqual(app.status_message, "")
+                save_mock.assert_not_called()
+
+    async def test_saved_credentials_are_labeled_pa_account_not_authenticated_ready(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")):
             async with app.run_test(size=(100, 36)):
                 credential_status, credential_detail, credential_level, _, _ = app.credential_state()
 
-        self.assertEqual(credential_status, "Set")
+        self.assertEqual(credential_status, "PA Account")
         self.assertEqual(credential_detail, "us**@example.com")
-        self.assertEqual(credential_level, "success")
+        self.assertEqual(credential_level, "gold")
+
+    async def test_credentials_modal_clear_pa_account_action_clears_saved_credentials(self):
+        app = self.make_app()
+        stored_credentials = [("user@example.com", "secret")]
+
+        def load_saved_credentials():
+            return stored_credentials[0]
+
+        def clear_saved_credentials():
+            stored_credentials[0] = (None, None)
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", side_effect=load_saved_credentials), patch(
+            "bdo_marketplace_tools.ui.app.clear_credentials",
+            side_effect=clear_saved_credentials,
+        ) as clear_mock:
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.click("#tile-credentials")
+                await pilot.pause()
+
+                clear_action = app.query_visible_one("#clear-credentials", Button)
+                self.assertTrue(clear_action.display)
+                self.assertEqual(clear_action.styles.color, Color(209, 106, 106))
+                await pilot.click("#clear-credentials")
+                await pilot.pause(0.1)
+
+        clear_mock.assert_called_once()
+        self.assertIsNone(app.api_handler.email)
+        self.assertIsNone(app.api_handler.password)
+        self.assertIn("Saved credentials cleared", app.status_message)
+
+    async def test_session_modal_pa_credentials_guard_controls_refresh_button(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.click("#tile-session")
+                await pilot.pause()
+
+                self.assertEqual(type(app.screen_stack[-1]).__name__, "SessionModal")
+                self.assertEqual(len(list(app.screen_stack[-1].query("#session-status-tile"))), 0)
+                self.assertFalse(app.query_visible_one("#refresh-session", Button).disabled)
+                self.assertFalse(app.query_visible_one("#refresh-session", Button).can_focus)
+                console = Console(width=100, color_system=None)
+                with console.capture() as capture:
+                    console.print(app.query_visible_one("#session-account-tile", Static).content)
+                session_account_text = capture.get()
+                with console.capture() as capture:
+                    console.print(app.query_visible_one("#session-credentials-tile", Static).content)
+                session_credentials_text = capture.get()
+                self.assertIn("us**@example.com", session_account_text)
+                self.assertIn("Set", session_credentials_text)
+                self.assertNotIn("us**@example.com", session_credentials_text)
+
+                await pilot.click("#refresh-session")
+                await pilot.pause()
+                self.assertEqual(type(app.screen_stack[-1]).__name__, "SessionRefreshConfirmScreen")
+
+    async def test_online_session_widget_uses_shared_authenticated_detail(self):
+        pa_app = self.make_app()
+        pa_app.api_handler.login_status = True
+        pa_app.api_handler.email = "user@example.com"
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")):
+            async with pa_app.run_test(size=(100, 36)):
+                self.assertEqual(pa_app.session_status_state(), ("ONLINE", "Authenticated", "success"))
+                session_tile = [
+                    item for item in pa_app.dashboard_tile_data(pa_app.dashboard_snapshot()) if item[0] == "session"
+                ][0]
+                self.assertEqual(session_tile[2], "Authenticated")
+
+        steam_app = self.make_app()
+        steam_app.task_manager.account_mode = STEAM_BROWSER_MODE
+        steam_app.api_handler.account_mode = STEAM_BROWSER_MODE
+        steam_app.api_handler.login_status = True
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with steam_app.run_test(size=(100, 36)):
+                self.assertEqual(steam_app.session_status_state(), ("ONLINE", "Authenticated", "success"))
+                session_tile = [
+                    item for item in steam_app.dashboard_tile_data(steam_app.dashboard_snapshot()) if item[0] == "session"
+                ][0]
+                self.assertEqual(session_tile[2], "Authenticated")
+
+    async def test_login_refresh_without_pa_credentials_does_not_log_backend_warning(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)):
+                await app.login_refresh()
+
+        self.assertEqual(list(app.task_manager.events), [])
+        self.assertIn("Add Pearl Abyss credentials", app.status_message)
+
+    async def test_app_settings_clear_saved_session_button_resets_marketplace_session(self):
+        app = self.make_app()
+        app.api_handler.login_status = True
+        app.task_manager.purchase_submission_enabled = True
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.press("1")
+                self.assertEqual(app.current_view, "settings")
+                self.assertEqual(len(list(app.query("#clear-saved-session"))), 1)
+                self.assertIsInstance(app.query_one("#clear-saved-session"), ModalAction)
+                self.assertEqual(str(app.query_one("#clear-saved-session").styles.background), "Color(0, 0, 0, a=0)")
+                self.assertEqual(app.query_one("#session-debug-panel").border_title, "Session Debug")
+                self.assertEqual(len(list(app.query("#session-debug-panel Button"))), 0)
+                self.assertEqual(len(list(app.query("#settings-summary Button"))), 0)
+
+                await pilot.click("#clear-saved-session")
+                await pilot.pause(0.1)
+
+        self.assertTrue(app.api_handler.session_cleared)
+        self.assertFalse(app.api_handler.login_status)
+        self.assertFalse(app.task_manager.purchase_submission_enabled)
+        self.assertIn("Saved marketplace session cleared", app.status_message)
+        self.assertTrue(any("Manual session reset. Marketplace session cleared" in event for event in app.task_manager.events))
 
     async def test_dashboard_live_metrics_refresh(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 app.task_manager.session_detected_outfits = 4
                 app.task_manager.session_successful_purchases = 2
@@ -1099,7 +2671,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Buy Delay", rendered_tiles)
                 self.assertIn("Runtime", rendered_tiles)
                 self.assertIn("No account", rendered_tiles)
-                self.assertIn("Marketplace auth", rendered_tiles)
+                self.assertIn("Refresh required", rendered_tiles)
                 self.assertIn("15-30s", rendered_tiles)
                 self.assertIn("Slow", rendered_tiles)
                 self.assertIn("1-2.5s", rendered_tiles)
@@ -1131,7 +2703,12 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.click("#tile-credentials")
                 await pilot.pause()
                 self.assertEqual(app.current_view, "dashboard")
+                self.assertEqual(len(list(app.screen_stack[-1].query("#password-input"))), 0)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#clear-credentials"))), 1)
+                await pilot.click("#credential-action-tile")
+                await pilot.pause()
                 self.assertTrue(app.query_visible_one("#password-input", Input).password)
+                await pilot.press("escape")
                 await pilot.press("escape")
                 await pilot.click("#tile-polling")
                 await pilot.pause()
@@ -1181,16 +2758,180 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.click("#tile-session")
                 await pilot.pause()
                 self.assertEqual(app.current_view, "dashboard")
-                self.assertEqual(type(app.screen_stack[-1]).__name__, "SessionRefreshConfirmScreen")
+                self.assertEqual(type(app.screen_stack[-1]).__name__, "SessionModal")
+                self.assertEqual(len(list(app.screen_stack[-1].query("#session-status-tile"))), 0)
+                self.assertTrue(app.query_visible_one("#refresh-session", Button).disabled)
+                self.assertFalse(app.query_visible_one("#refresh-session", Button).can_focus)
+                console = Console(width=100, color_system=None)
+                with console.capture() as capture:
+                    console.print(app.query_visible_one("#session-credentials-tile", Static).content)
+                session_credentials_text = capture.get()
+                self.assertIn("Missing", session_credentials_text)
+                self.assertIn("Open Credentials first", session_credentials_text)
                 await pilot.press("escape")
                 await pilot.click("#tile-success")
                 self.assertEqual(app.current_view, "dashboard")
                 await pilot.click("#tile-runtime")
                 self.assertEqual(app.current_view, "dashboard")
 
+    async def test_credentials_modal_can_select_steam_browser_session_mode(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch(
+            "bdo_marketplace_tools.services.task_manager.save_account_mode",
+            return_value=STEAM_BROWSER_MODE,
+        ):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.press("1")
+                self.assertEqual(len(list(app.query("#account-mode-select"))), 0)
+                self.assertEqual(len(list(app.query("#save-settings"))), 0)
+
+                await pilot.press("escape")
+                await pilot.click("#tile-credentials")
+                await pilot.pause()
+                mode_select = app.query_visible_one("#account-mode-select", Select)
+                self.assertIn("OS keyring password", str(app.query_visible_one("#credentials-mode-note", Static).render()))
+                self.assertEqual(len(list(app.query("#credentials-email-tile"))), 0)
+                self.assertEqual(len(list(app.query("#credentials-password-tile"))), 0)
+                self.assertEqual(len(list(app.query("#credentials-status-tile"))), 0)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#email-input"))), 0)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#password-input"))), 0)
+                setup_tile_widget = app.query_visible_one("#credential-action-tile", Static)
+                self.assertEqual(setup_tile_widget.border_title, "Pearl Abyss Account")
+                self.assertTrue(setup_tile_widget.display)
+                self.assertIn("modal-info-clickable", setup_tile_widget.classes)
+                console = Console(width=100, color_system=None)
+                with console.capture() as capture:
+                    console.print(setup_tile_widget.content)
+                setup_tile = capture.get()
+                self.assertIn("No account configured", setup_tile)
+                self.assertIn("Click to enter credentials", setup_tile)
+                mode_select.value = STEAM_BROWSER_MODE
+                await pilot.pause()
+                self.assertTrue(app.task_manager.uses_steam_browser_session())
+                self.assertEqual(app.api_handler.account_mode, STEAM_BROWSER_MODE)
+                self.assertEqual(setup_tile_widget.border_title, "Steam Initial Setup")
+                self.assertTrue(setup_tile_widget.display)
+                self.assertNotIn("modal-info-clickable", setup_tile_widget.classes)
+                self.assertIn("modal-info-muted", setup_tile_widget.classes)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#email-input"))), 0)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#password-input"))), 0)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#save-credential-mode"))), 0)
+                steam_note = str(app.query_visible_one("#credentials-mode-note", Static).render())
+                self.assertIn("visible browser", steam_note)
+                self.assertIn("does not use saved email or password", steam_note)
+
+                self.assertTrue(app.task_manager.uses_steam_browser_session())
+                self.assertEqual(app.api_handler.account_mode, STEAM_BROWSER_MODE)
+                self.assertIn("Login method set to Steam Account", app.status_message)
+                self.assertEqual(app.credential_state()[0], "Steam Account")
+                self.assertEqual(app.credential_state()[2], "steam")
+                self.assertEqual(app.session_status_state(), ("OFFLINE", "Refresh required", "error"))
+                self.assertFalse(app.query_visible_one("#clear-credentials", Button).display)
+                self.assertEqual(type(app.screen_stack[-1]).__name__, "CredentialsModal")
+
+                await pilot.press("escape")
+                await pilot.click("#tile-session")
+                await pilot.pause()
+                self.assertEqual(type(app.screen_stack[-1]).__name__, "SessionModal")
+                self.assertEqual(len(list(app.screen_stack[-1].query("#session-status-tile"))), 0)
+                self.assertFalse(app.query_visible_one("#refresh-session", Button).disabled)
+                with console.capture() as capture:
+                    console.print(app.query_visible_one("#session-credentials-tile", Static).content)
+                steam_session_tile = capture.get()
+                self.assertIn("Initial Setup", str(app.query_visible_one("#session-credentials-tile", Static).border_title))
+                self.assertIn("Complete", steam_session_tile)
+                self.assertIn("Ready for market login", steam_session_tile)
+
+    async def test_credentials_modal_shows_initial_steam_setup_only_until_profile_prepared(self):
+        app = self.make_app()
+        app.task_manager.steam_browser_profile_prepared = False
+
+        async def mark_prepared(*_args, **_kwargs):
+            app.task_manager.steam_browser_profile_prepared = True
+            return True
+
+        app.task_manager.prepare_steam_browser_profile = AsyncMock(side_effect=mark_prepared)
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch(
+            "bdo_marketplace_tools.services.task_manager.save_account_mode",
+            return_value=STEAM_BROWSER_MODE,
+        ) as save_mode:
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.press("escape")
+                await pilot.click("#tile-credentials")
+                await pilot.pause()
+
+                self.assertEqual(len(list(app.query("#prepare-steam-profile"))), 0)
+                setup_tile_widget = app.query_visible_one("#credential-action-tile", Static)
+                self.assertEqual(setup_tile_widget.border_title, "Pearl Abyss Account")
+                self.assertTrue(setup_tile_widget.display)
+                console = Console(width=100, color_system=None)
+                with console.capture() as capture:
+                    console.print(setup_tile_widget.content)
+                setup_tile = capture.get()
+                self.assertIn("No account configured", setup_tile)
+                self.assertIn("Click to enter credentials", setup_tile)
+
+                mode_select = app.query_visible_one("#account-mode-select", Select)
+                mode_select.value = STEAM_BROWSER_MODE
+                await pilot.pause()
+
+                self.assertEqual(app.task_manager.account_mode, STEAM_BROWSER_MODE)
+                self.assertEqual(setup_tile_widget.border_title, "Steam Initial Setup")
+                self.assertTrue(setup_tile_widget.display)
+                self.assertIn("modal-info-clickable", setup_tile_widget.classes)
+                self.assertNotIn("modal-info-muted", setup_tile_widget.classes)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#save-credential-mode"))), 0)
+                self.assertIn("Run Steam Setup once", str(app.query_visible_one("#credentials-mode-note", Static).render()))
+
+                await pilot.click("#credential-action-tile")
+                await pilot.pause(0.2)
+
+                app.task_manager.prepare_steam_browser_profile.assert_awaited_once_with(allow_inactive_mode=True)
+                save_mode.assert_called_once_with(STEAM_BROWSER_MODE)
+                self.assertEqual(app.task_manager.account_mode, STEAM_BROWSER_MODE)
+                self.assertTrue(app.task_manager.steam_browser_profile_prepared)
+                self.assertTrue(setup_tile_widget.display)
+                self.assertNotIn("modal-info-clickable", setup_tile_widget.classes)
+                self.assertIn("modal-info-muted", setup_tile_widget.classes)
+                with console.capture() as capture:
+                    console.print(app.query_visible_one("#credential-action-tile", Static).content)
+                setup_tile = capture.get()
+                self.assertIn("Complete", setup_tile)
+                self.assertIn("Ready for market login", setup_tile)
+                self.assertIn("Initial Steam setup saved", app.status_message)
+
+    async def test_switching_back_to_pa_mode_reuses_saved_credentials(self):
+        app = self.make_app()
+        app.task_manager.account_mode = STEAM_BROWSER_MODE
+        app.api_handler.account_mode = STEAM_BROWSER_MODE
+        app.task_manager.steam_browser_profile_prepared = True
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")), patch(
+            "bdo_marketplace_tools.ui.app.save_credentials"
+        ) as save_mock, patch("bdo_marketplace_tools.services.task_manager.save_account_mode", return_value=PA_CREDENTIALS_MODE):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.click("#tile-credentials")
+                await pilot.pause()
+                self.assertEqual(len(list(app.screen_stack[-1].query("#email-input"))), 0)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#password-input"))), 0)
+
+                mode_select = app.query_visible_one("#account-mode-select", Select)
+                mode_select.value = PA_CREDENTIALS_MODE
+                await pilot.pause()
+                setup_tile_widget = app.query_visible_one("#credential-action-tile", Static)
+                self.assertEqual(setup_tile_widget.border_title, "Pearl Abyss Account")
+                self.assertIn("modal-info-clickable", setup_tile_widget.classes)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#save-credential-mode"))), 0)
+
+        save_mock.assert_not_called()
+        self.assertEqual(app.task_manager.account_mode, PA_CREDENTIALS_MODE)
+        self.assertEqual(app.api_handler.email, "user@example.com")
+        self.assertEqual(app.api_handler.password, "secret")
+        self.assertIn("Login method set to Pearl Abyss Account", app.status_message)
+
     async def test_buy_delay_modal_saves_valid_decimals_and_keeps_invalid_open(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.click("#tile-buy-delay")
                 await pilot.pause()
@@ -1216,6 +2957,48 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Buy delay must use non-negative seconds", app.status_message)
                 self.assertEqual(type(app.screen_stack[-1]).__name__, "BuyDelayModal")
 
+    async def test_modal_input_edits_do_not_apply_until_save(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.click("#tile-polling")
+                await pilot.pause()
+                await pilot.click("#polling-preset-2")
+                await pilot.pause()
+                self.assertEqual(app.query_visible_one("#custom-delay-min-input", Input).value, "5")
+                self.assertEqual(app.query_visible_one("#custom-delay-max-input", Input).value, "10")
+                self.assertIn("preset-selected", app.query_visible_one("#polling-preset-2").classes)
+                self.assertEqual(app.task_manager.delay, "3")
+                self.assertEqual(app.task_manager.current_delay_bounds(), (15, 30))
+                app.query_visible_one("#custom-delay-min-input", Input).value = "8"
+                app.query_visible_one("#custom-delay-max-input", Input).value = "13"
+                await pilot.pause()
+                self.assertEqual(app.task_manager.delay, "3")
+                self.assertEqual(app.task_manager.current_delay_bounds(), (15, 30))
+                await pilot.click("#save-polling")
+                await pilot.pause()
+                self.assertEqual(app.task_manager.delay, "custom")
+                self.assertEqual(app.task_manager.current_delay_bounds(), (8, 13))
+
+                await pilot.click("#tile-buy-delay")
+                await pilot.pause()
+                app.query_visible_one("#purchase-delay-min-input", Input).value = "4.5"
+                app.query_visible_one("#purchase-delay-max-input", Input).value = "8"
+                await pilot.pause()
+                self.assertEqual(app.task_manager.purchase_delay_bounds, (1.0, 2.5))
+                await pilot.click("#save-buy-delay")
+                await pilot.pause()
+                self.assertEqual(app.task_manager.purchase_delay_bounds, (4.5, 8.0))
+
+                await pilot.click("#tile-spent")
+                await pilot.pause()
+                app.query_visible_one("#spend-cap-input", Input).value = "250"
+                await pilot.pause()
+                self.assertIsNone(app.task_manager.max_spend)
+                await pilot.click("#save-spend-cap")
+                await pilot.pause()
+                self.assertEqual(app.task_manager.max_spend, 250)
+
     async def test_stats_page_uses_tiles_without_local_file_path(self):
         app = self.make_app()
         app.task_manager.session_detected_outfits = 5
@@ -1225,7 +3008,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app.task_manager.lifetime_silver_spent = 12_000_000_000
         app.task_manager.reload_lifetime_stats = lambda: None
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.press("3")
                 self.assertIsInstance(app.query_one("#refresh-stats"), ModalAction)
@@ -1254,9 +3037,28 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Local Data File", rendered)
         self.assertEqual(app.status_message, "Stats refreshed.")
 
+    async def test_marketplace_inventory_page_is_wip_and_uses_standard_action(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.press("2")
+                self.assertEqual(app.current_view, "wallet")
+                self.assertIn(("wallet", "Inventory"), app.NAV_ITEMS)
+                self.assertEqual(app.query_one("#screen-title", Static).content, "Marketplace Inventory")
+                self.assertIn("WIP", str(app.query_one("#wallet-wip-note", Static).content))
+                self.assertEqual(app.query_one("#wallet-wip-note", Static).styles.margin.top, 1)
+                self.assertIsInstance(app.query_one("#refresh-wallet"), ModalAction)
+                self.assertEqual(str(app.query_one("#refresh-wallet").styles.background), "Color(0, 0, 0, a=0)")
+                self.assertEqual(list(app.query("#wallet-actions Button")), [])
+
+                await pilot.click("#refresh-wallet")
+                await pilot.pause()
+
+        self.assertIn("Inventory loaded", app.status_message)
+
     async def test_purchase_success_rate_uses_color_spectrum(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)):
                 cases = [
                     (0, 0, "error"),
@@ -1274,11 +3076,13 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(STATUS_STYLES["error"], "bold rgb(209,106,106)")
                 self.assertEqual(STATUS_STYLES["success"], "bold rgb(126,184,138)")
                 self.assertEqual(STATUS_STYLES["info"], "bold rgb(232,229,220)")
+                self.assertEqual(STATUS_STYLES["steam"], "bold rgb(19,100,151)")
+                self.assertEqual(STATUS_STYLES["gold"], "bold rgb(218,177,86)")
 
     async def test_sidebar_test_log_button_adds_dashboard_event(self):
         app = self.make_app(launch_mode="test")
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch(
-            "resources.textual_ui.random.choice",
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch(
+            "bdo_marketplace_tools.ui.app.random.choice",
             return_value=("Synthetic layout probe.", "success"),
         ):
             async with app.run_test(size=(100, 36)) as pilot:
@@ -1292,7 +3096,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_dashboard_event_log_rehydrates_after_navigation(self):
         app = self.make_app()
         app.task_manager.add_event("Persistent event before navigation.", "success")
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
                 self.assertIn("Persistent event before navigation.", event_text)
@@ -1306,9 +3110,36 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Persistent event before navigation.", event_text)
                 self.assertEqual(app._dashboard_snapshot, app.dashboard_snapshot())
 
+    async def test_dashboard_event_log_switches_between_core_and_ui_streams(self):
+        app = self.make_app()
+        app.task_manager.add_event("Core monitor detail.", "success")
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                app.set_status("UI setting saved.", "info")
+                await pilot.pause()
+
+                self.assertEqual(app.query_one("#event-log-toolbar-title", Static).content, "Event Log View:")
+                self.assertEqual(app.query_one("#event-log-toolbar").styles.height.value, 1)
+                self.assertIn("log-filter-selected", app.query_one("#log-filter-core").classes)
+                self.assertEqual(app.query_one("#log-filter-core", Static).content, "Core logs")
+                self.assertEqual(app.query_one("#log-filter-ui", Static).content, "UI logs")
+                event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
+                self.assertIn("Core monitor detail.", event_text)
+                self.assertNotIn("UI setting saved.", event_text)
+
+                await pilot.click("#log-filter-ui")
+                await pilot.pause()
+
+                self.assertEqual(app.event_log_mode, "ui")
+                self.assertEqual(app.task_manager.event_log_view, "ui")
+                self.assertIn("log-filter-selected", app.query_one("#log-filter-ui").classes)
+                event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
+                self.assertIn("UI setting saved.", event_text)
+                self.assertNotIn("Core monitor detail.", event_text)
+
     async def test_debug_controls_are_test_mode_only(self):
         live_app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with live_app.run_test(size=(100, 36)):
                 self.assertEqual(list(live_app.query("#test-controls")), [])
                 await live_app.add_test_log()
@@ -1316,15 +3147,87 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Debug actions", live_app.status_message)
 
         test_app = self.make_app(launch_mode="test")
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with test_app.run_test(size=(100, 36)):
                 self.assertEqual(len(list(test_app.query("#test-controls"))), 1)
                 self.assertEqual(len(list(test_app.query("#toggle-test-session"))), 1)
+                self.assertEqual(len(list(test_app.query("#toggle-auto-reauth"))), 1)
+                self.assertEqual(len(list(test_app.query("#expire-test-session"))), 1)
+                self.assertEqual(len(list(test_app.query("#run-reauth-check"))), 1)
+                self.assertEqual(len(list(test_app.query("#open-blank-browser"))), 1)
+                self.assertEqual(len(list(test_app.query("#reset-steam-setup"))), 1)
+                self.assertEqual(len(list(test_app.query("#clear-browser-cookies"))), 1)
                 self.assertEqual(len(list(test_app.query("#start-test-monitor"))), 1)
                 self.assertEqual(len(list(test_app.query("#start-test-buy"))), 1)
                 self.assertEqual(len(list(test_app.query("#stop-test-monitor"))), 1)
                 self.assertEqual(len(list(test_app.query("#fake-detection"))), 1)
                 self.assertEqual(len(list(test_app.query("#fake-buy-success"))), 1)
+
+    async def test_reauthentication_debug_buttons_call_test_hooks(self):
+        app = self.make_app(launch_mode="test")
+        app.task_manager.debug_toggle_steam_auto_reauth = Mock(return_value=True)
+        app.task_manager.debug_invalidate_marketplace_session = Mock(return_value=True)
+        app.task_manager.debug_run_reauthentication_check = AsyncMock(return_value=True)
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                self.assertIn("Auto Reauth", str(app.query_one("#toggle-auto-reauth", Button).render()))
+                self.assertIn("Reauth Check", str(app.query_one("#run-reauth-check", Button).render()))
+
+                await pilot.click("#toggle-auto-reauth")
+                await pilot.pause(0.1)
+
+                app.task_manager.debug_toggle_steam_auto_reauth.assert_called_once()
+                self.assertIn("automatic re-authentication enabled", app.status_message)
+
+                previous_status = app.status_message
+                await pilot.click("#expire-test-session")
+                await pilot.pause(0.1)
+
+                app.task_manager.debug_invalidate_marketplace_session.assert_called_once()
+                self.assertEqual(app.status_message, previous_status)
+
+                await pilot.click("#run-reauth-check")
+                await pilot.pause(0.1)
+
+                app.task_manager.debug_run_reauthentication_check.assert_awaited_once()
+                self.assertIn("re-authentication check succeeded", app.status_message)
+
+    async def test_blank_browser_debug_button_starts_worker(self):
+        app = self.make_app(launch_mode="test")
+        app.task_manager.debug_open_blank_browser_diagnostic = AsyncMock(return_value=True)
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                self.assertIn("Blank Browser", str(app.query_one("#open-blank-browser", Button).render()))
+
+                await pilot.click("#open-blank-browser")
+                await pilot.pause(0.2)
+
+                app.task_manager.debug_open_blank_browser_diagnostic.assert_awaited_once()
+                self.assertIn("Blank Chrome diagnostic browser closed", app.status_message)
+
+    async def test_steam_setup_debug_buttons_call_test_hooks(self):
+        app = self.make_app(launch_mode="test")
+        app.task_manager.debug_clear_steam_initial_setup_status = Mock(return_value=True)
+        app.task_manager.debug_clear_steam_browser_cookies = AsyncMock(return_value=True)
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                self.assertIn("Reset Steam Setup", str(app.query_one("#reset-steam-setup", Button).render()))
+                self.assertIn("Clear Browser Cookies", str(app.query_one("#clear-browser-cookies", Button).render()))
+
+                await pilot.click("#reset-steam-setup")
+                await pilot.pause(0.1)
+
+                app.task_manager.debug_clear_steam_initial_setup_status.assert_called_once()
+                self.assertIn("Initial Steam setup status reset", app.status_message)
+
+                await pilot.click("#clear-browser-cookies")
+                await pilot.pause(0.2)
+
+                app.task_manager.debug_clear_steam_browser_cookies.assert_awaited_once()
+                self.assertIn("Browser cookies cleared", app.status_message)
 
     async def test_single_item_test_monitor_sidebar_controls_use_separate_task(self):
         app = self.make_app(launch_mode="test")
@@ -1333,7 +3236,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_test_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch.object(
             app.task_manager,
             "single_item_test_checker",
             new=idle_test_checker,
@@ -1364,7 +3267,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_test_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch.object(
             app.task_manager,
             "single_item_test_checker",
             new=idle_test_checker,
@@ -1396,7 +3299,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_polling_modal_saves_preset_equivalent_range_as_preset(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.click("#tile-polling")
                 await pilot.pause()
@@ -1414,7 +3317,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app.task_manager.purchase_submission_enabled = True
         app.api_handler.login_status = False
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)):
                 await app.start_monitor()
 
@@ -1431,7 +3334,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app.api_handler.is_session_expired = AsyncMock(return_value=-1)
         app.api_handler.login = AsyncMock(return_value=0)
 
-        with patch("resources.textual_ui.load_credentials", return_value=("user@example.com", "secret")):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")):
             async with app.run_test(size=(100, 36)):
                 await app.login_refresh()
 
@@ -1446,7 +3349,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app = self.make_app(launch_mode="test")
         app.task_manager.purchase_submission_enabled = True
         app.task_manager.buy_item = AsyncMock()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.click("#fake-detection")
 
@@ -1457,7 +3360,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_fake_buy_success_button_updates_metrics_and_saves(self):
         app = self.make_app(launch_mode="test")
         with patch.object(app.task_manager, "save_local_data") as save_mock, patch(
-            "resources.textual_ui.load_credentials",
+            "bdo_marketplace_tools.ui.app.load_credentials",
             return_value=(None, None),
         ):
             async with app.run_test(size=(100, 36)) as pilot:
@@ -1476,7 +3379,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch.object(
             app.task_manager,
             "checker",
             new=idle_checker,
@@ -1514,7 +3417,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch.object(
             app.task_manager,
             "checker",
             new=idle_checker,
@@ -1536,7 +3439,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch.object(
             app.task_manager,
             "checker",
             new=idle_checker,
@@ -1563,7 +3466,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch.object(
             app.task_manager,
             "checker",
             new=idle_checker,
@@ -1596,7 +3499,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=("user@example.com", "secret")), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")), patch.object(
             app.task_manager,
             "checker",
             new=idle_checker,
@@ -1627,7 +3530,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=("user@example.com", "secret")), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")), patch.object(
             app.task_manager,
             "checker",
             new=idle_checker,
@@ -1661,7 +3564,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=("user@example.com", "secret")), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")), patch.object(
             app.task_manager,
             "checker",
             new=idle_checker,

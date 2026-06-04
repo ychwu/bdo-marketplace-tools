@@ -29,11 +29,11 @@ goto collect_args
 if not defined INSIDE_WT if not defined WT_SESSION if not defined BDO_DISABLE_WT (
     where wt.exe >nul 2>&1
     if not errorlevel 1 (
-        start "BDO OutfitBot" wt.exe -w new --size %WT_COLUMNS%,%WT_LINES% -d "%PROJECT_DIR%" cmd.exe /c call "%~f0" --inside-wt %APP_ARGS%
+        start "Marketplace Tools" wt.exe -w new --size %WT_COLUMNS%,%WT_LINES% -d "%PROJECT_DIR%" cmd.exe /c call "%~f0" --inside-wt %APP_ARGS%
         exit /b 0
     )
 
-    start "BDO OutfitBot" cmd.exe /c call "%~f0" --inside-wt %APP_ARGS%
+    start "Marketplace Tools" cmd.exe /c call "%~f0" --inside-wt %APP_ARGS%
     exit /b 0
 )
 

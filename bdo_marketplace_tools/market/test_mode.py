@@ -7,7 +7,7 @@ small live listing before switching the same architecture back to outfit rows.
 
 import requests
 
-from market.api_handler import PUBLIC_MARKET_HEADERS, MarketplaceResponseError
+from bdo_marketplace_tools.market.api_handler import PUBLIC_MARKET_HEADERS, MarketplaceResponseError
 
 
 SINGLE_ITEM_TEST_TARGET = {

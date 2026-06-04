@@ -1,6 +1,7 @@
 # Marketplace Tools
 
 [![Python](https://img.shields.io/badge/Python-3.14%2B-blue)](https://www.python.org/downloads/)
+![Version](https://img.shields.io/badge/Version-1.0.0--beta-blueviolet)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6)
 ![UI](https://img.shields.io/badge/UI-Textual-orange)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -49,7 +50,8 @@ This project is currently undergoing a codebase rewrite and Textual UI migration
 
 Last verified compatibility: July 14, 2025.
 
-Steam accounts and OTP-enabled accounts are not supported (yet). Only launcher accounts without OTP are supported.
+Pearl Abyss launcher accounts are supported through saved email/password credentials.
+Steam accounts are supported through a visible browser session: choose `Steam Account` in the Credentials dashboard modal, run Steam Initial Setup once, then use `Refresh Session` from the dashboard. Initial setup uses the app-owned browser profile to visit the main Black Desert site, handle required-only cookie consent when available, and open Steam's official login page so you can manually log into Steam. The app only observes local browser state, such as Steam login cookie names or the loaded Store account menu, then closes the browser when Steam login is detected. Steam credentials and OTP values are never stored by the app.
 
 ## Running the App
 
@@ -96,5 +98,5 @@ For questions or bug reports, use the project issue tracker or the listed Discor
 
 ## Planned Work
 
-- Steam account compatibility.
+- Manual QA for fresh and existing Steam browser profiles.
 - More configurable marketplace categories.
