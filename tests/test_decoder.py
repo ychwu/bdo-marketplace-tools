@@ -1,7 +1,7 @@
-import io
+﻿import io
 import unittest
 
-from market.decoder import decode, get_freqs, make_tree, read, unpack
+from bdo_marketplace_tools.market.decoder import decode, get_freqs, make_tree, read, unpack
 
 
 SAMPLE_RESPONSE = bytes.fromhex(

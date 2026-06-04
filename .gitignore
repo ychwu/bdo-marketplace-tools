@@ -153,13 +153,7 @@ cython_debug/
 
 *.pkl
 *.json
-resources/session.pkl
-resources/session_test.pkl
-resources/session.json
-resources/local_data.json
-resources/info.json
-resources/app_settings.json
-resources/browser_profiles/
+data/
 agent/
 agents.md
 AGENTS.md

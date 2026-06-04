@@ -4,9 +4,9 @@ import os
 
 import colorama
 
-from market.api_handler import APIHandler
-from resources.task_manager import BackgroundTasks
-from resources.textual_ui import MarketplaceToolsApp
+from bdo_marketplace_tools.market.api_handler import APIHandler
+from bdo_marketplace_tools.services.task_manager import BackgroundTasks
+from bdo_marketplace_tools.ui.app import MarketplaceToolsApp
 
 
 TEST_MODE_ENV = "BDO_MARKET_TEST_MODE"

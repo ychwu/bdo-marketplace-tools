@@ -23,18 +23,20 @@ Python CLI app for monitoring the *Black Desert Online* marketplace through auth
 - Custom silver spend cap per session, stopping future purchases if cap is met.
 - Tracks current session's outfit detections, successful purchases, and silver spent. 
 - Tracks lifetime silver spent, and successful purchases.
-- Provides logging for actions, purchases, detection, and errors.
+- Provides dashboard event logs with separate Core and UI views for technical monitor/session events versus interface confirmations.
 - Allows saved marketplace session cookies to be cleared from App Settings for a fresh login/session.
-- Provides a marketplace wallet view for checking stored silver, Value Pack state, and marketplace inventory data (WIP).
+- Remembers applied UI choices such as login method, polling speed, buy delay, spend cap, watch/buy mode, and event-log view across restarts.
+- Provides a Marketplace Inventory WIP view for checking stored silver, Value Pack state, and marketplace inventory data.
 
 ### Technical Features
 
 - Marketplace API integration for listing scans, wallet data, session refresh, authentication, and `BuyItem` purchase requests.
+- Professional package layout under `bdo_marketplace_tools`, with market API logic, services, storage, and Textual UI separated into dedicated modules.
 - Steam Account browser-session support through a visible Patchright Chrome login, cookie import into the existing marketplace session, and current-run gated automatic Steam re-authentication after the first validated refresh.
 - Concurrent marketplace polling with isolated unauthenticated `requests.Session` clients for male and female outfit categories, preserving connection reuse without sharing authenticated state.
 - Custom Huffman response decoder for packed marketplace payloads, optimized for repeated high-frequency scans.
 - Async monitor orchestration around blocking HTTP calls using `asyncio.to_thread()`, randomized polling windows, capped retry backoff, task lifecycle guards, and crash-aware monitor state.
-- Secure session and credential persistence with JSON cookie storage, legacy pickle-session migration, local email initialization, and OS keyring-backed password storage.
+- Secure session and credential persistence under ignored `data/` runtime files, with versioned app settings, JSON cookie storage, fresh-start defaults, startup validation only for sessions last known valid, and OS keyring-backed password storage.
 - Manual session-reset workflow that clears only marketplace cookies while preserving saved credentials.
 - Safety-gated purchase pipeline with explicit buy-mode confirmation, spend-cap enforcement, configurable per-item buy delay, session-expiration recovery, and one-time retry on expired marketplace sessions.
 - Structured purchase result parsing that separates fulfilled purchases from pre-order placements, records actual execution prices, and maps known marketplace result codes into actionable event-log messages.
@@ -46,12 +48,24 @@ Python CLI app for monitoring the *Black Desert Online* marketplace through auth
 
 This project is currently undergoing a codebase rewrite and Textual UI migration. Features may be incomplete, unstable, or temporarily broken while the modernization work is in progress.
 
+## Versioning
+
+App/version metadata lives in `bdo_marketplace_tools/version.py` and is copied into `data/app_settings.json` under the `version` block whenever settings are read or saved. The same settings file stores non-secret app preferences such as login method, saved email, Steam setup state, saved-session last-known-valid state, polling, buy delay, spend cap, watch/buy mode, and event-log view. The UI App Settings screen shows the app version, release channel, and settings schema version for troubleshooting.
+
+Versioning rule:
+
+- Bump `APP_VERSION` for user-facing behavior, API/session handling, purchase flow, storage, or troubleshooting changes.
+- Bump `SETTINGS_SCHEMA_VERSION` only when the shape or meaning of `data/app_settings.json` changes.
+- Update `agent/CHANGELOG.md` for every behavior, API, storage, auth/session, or UI workflow change.
+- Update README or local API docs when the change affects users, setup, endpoint behavior, auth flow, runtime files, or troubleshooting.
+- Never include cookies, passwords, request tokens, or raw sensitive session data in version notes.
+
 ## Supported Versions
 
 Last verified compatibility: July 14, 2025.
 
 Pearl Abyss launcher accounts are supported through saved email/password credentials.
-Steam accounts are supported through a visible browser session: choose `Steam Account` in the Credentials dashboard modal, complete Steam Initial Setup once, then use `Refresh Session` from the dashboard. Startup expired Steam sessions still require a manual browser refresh first. After one successful validated Steam refresh in the current app run, later refreshes can automatically click the normal PA/Steam continuation buttons when available. Steam mode does not use saved email/password credentials. OTP pages may be completed manually in that browser; the app does not store OTP values or submit OTP silently.
+Steam accounts are supported through a visible browser session: choose `Steam Account` in the Credentials dashboard modal, complete Steam Initial Setup once, then use `Refresh Session` from the dashboard. Startup checks saved Steam sessions only after the saved cookies were previously validated; expired or unknown sessions require a manual browser refresh first. After one successful validated Steam refresh in the current app run, later refreshes can automatically click the normal PA/Steam continuation buttons when available. Steam mode does not use saved email/password credentials. OTP pages may be completed manually in that browser; the app does not store OTP values or submit OTP silently.
 
 ## Running the App
 

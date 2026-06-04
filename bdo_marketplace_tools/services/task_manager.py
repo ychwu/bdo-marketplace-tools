@@ -1,90 +1,72 @@
 import asyncio
-import json
 import random
 import time
 from collections import deque
 from datetime import datetime
-from pathlib import Path
 
-from market.api_handler import DEFAULT_PURCHASE_DELAY_BOUNDS, MarketplaceAPIError
-from market.browser_auth import (
+from bdo_marketplace_tools.market.api_handler import DEFAULT_PURCHASE_DELAY_BOUNDS, MarketplaceAPIError
+from bdo_marketplace_tools.market.browser_auth import (
     BrowserAuthError,
     acquire_steam_market_cookies,
     open_blank_steam_browser_diagnostic,
     prepare_steam_browser_profile,
 )
-from market.pricing import apply_price_rules, purchase_record_count, purchase_record_spend
-from market.test_mode import SINGLE_ITEM_TEST_TARGET, check_single_item_stock
-from resources.account_mode import (
+from bdo_marketplace_tools.market.pricing import apply_price_rules, purchase_record_count, purchase_record_spend
+from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET, check_single_item_stock
+from bdo_marketplace_tools.storage.app_settings import (
     STEAM_BROWSER_MODE,
     account_mode_detail,
     account_mode_label,
+    default_app_settings,
     load_account_mode,
+    load_saved_session_last_known_valid,
     load_steam_browser_profile_prepared,
+    load_ui_settings,
     normalize_account_mode,
     save_account_mode,
+    save_buy_mode,
+    save_event_log_view,
+    save_polling_settings,
+    save_purchase_delay_bounds,
+    save_saved_session_last_known_valid,
+    save_spend_cap,
     save_steam_browser_profile_prepared,
 )
-from resources.display import EVENT_LEVEL_COLORS, format_duration
+from bdo_marketplace_tools.storage.local_stats import DEFAULT_LOCAL_STATS, load_local_stats, save_local_stats
+from bdo_marketplace_tools.storage.paths import LOCAL_STATS_PATH
+from bdo_marketplace_tools.ui.display import EVENT_LEVEL_COLORS, format_duration
 
-LOCAL_DATA_PATH = Path(__file__).with_name("local_data.json")
-DEFAULT_LOCAL_DATA = {
-    "successful_purchases": 0,
-    "silver_spent": 0,
-}
+LOCAL_DATA_PATH = LOCAL_STATS_PATH
+DEFAULT_LOCAL_DATA = DEFAULT_LOCAL_STATS
 DEBUG_OUTFIT_LISTING = [["debug-premium-outfit", "1", "2020000000"]]
 MAX_ERROR_BACKOFF_MULTIPLIER = 6
 SIMULATED_SESSION_EMAIL = "test-session@example.local"
 
 
-def _safe_int(value):
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
 def _load_local_data():
-    try:
-        with LOCAL_DATA_PATH.open("r", encoding="utf-8") as data_file:
-            data = json.load(data_file)
-    except FileNotFoundError:
-        _create_default_local_data()
-        return DEFAULT_LOCAL_DATA.copy()
-    except (json.JSONDecodeError, OSError):
-        return DEFAULT_LOCAL_DATA.copy()
-
-    return {
-        "successful_purchases": _safe_int(data.get("successful_purchases")),
-        "silver_spent": _safe_int(data.get("silver_spent")),
-    }
+    return load_local_stats(path=LOCAL_DATA_PATH)
 
 
 def _create_default_local_data():
-    LOCAL_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with LOCAL_DATA_PATH.open("w", encoding="utf-8") as data_file:
-        json.dump(DEFAULT_LOCAL_DATA, data_file, indent=2)
-        data_file.write("\n")
+    save_local_stats(DEFAULT_LOCAL_DATA, include_timestamp=False, path=LOCAL_DATA_PATH)
 
 
 def _save_local_data(data):
-    payload = DEFAULT_LOCAL_DATA.copy()
-    payload.update(data)
-    payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    LOCAL_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with LOCAL_DATA_PATH.open("w", encoding="utf-8") as data_file:
-        json.dump(payload, data_file, indent=2)
-        data_file.write("\n")
+    save_local_stats(data, path=LOCAL_DATA_PATH)
 
 
 class BackgroundTasks:
-    def __init__(self, api_handler, test_mode_enabled=False):
+    def __init__(self, api_handler, test_mode_enabled=False, persist_ui_settings=True):
         local_data = _load_local_data()
         self.api_handler = api_handler
         self.test_mode_enabled = bool(test_mode_enabled)
+        self.persist_ui_settings = bool(persist_ui_settings)
         self.account_mode = load_account_mode()
         self.api_handler.account_mode = self.account_mode
         self.steam_browser_profile_prepared = load_steam_browser_profile_prepared()
+        self.saved_session_last_known_valid = (
+            load_saved_session_last_known_valid() if self.persist_ui_settings else False
+        )
         self.steam_auto_reauth_enabled = False
         self.checker_task = None
         self.single_item_test_checker_task = None
@@ -98,12 +80,21 @@ class BackgroundTasks:
             "2": ("Balanced", (5, 10)),
             "3": ("Slow", (15, 30)),
         }
-        self.delay = "3"
-        self.custom_delay_range = (15, 30)
-        self.purchase_delay_bounds = DEFAULT_PURCHASE_DELAY_BOUNDS
+        ui_settings = load_ui_settings() if self.persist_ui_settings else default_app_settings()["ui"]
+        polling_settings = ui_settings["polling"]
+        self.delay = polling_settings["selected"]
+        self.custom_delay_range = tuple(polling_settings["custom_range"])
+        if self.delay == "custom":
+            self.delay = self.matching_delay_choice(self.custom_delay_range) or "custom"
+        elif self.delay not in self.delay_choices:
+            self.delay = "3"
+        self.purchase_delay_bounds = tuple(ui_settings["buy_delay"]["range"])
         self.events = deque(maxlen=9)
-        self.purchase_submission_enabled = False
-        self.max_spend = None
+        self.core_events = deque(maxlen=9)
+        self.ui_events = deque(maxlen=9)
+        self.event_log_view = ui_settings.get("event_log_view", "core")
+        self.purchase_submission_enabled = bool(ui_settings["buy_mode"])
+        self.max_spend = ui_settings["spend_cap"]
         self.checker_started_at = None
         self.single_item_test_checker_started_at = None
         self.session_detected_outfits = 0
@@ -131,10 +122,32 @@ class BackgroundTasks:
             }
         )
 
-    def add_event(self, message, level="info"):
+    def add_event(self, message, level="info", channel="core"):
         timestamp = datetime.now().strftime("%H:%M:%S")
         style = EVENT_LEVEL_COLORS.get(level, EVENT_LEVEL_COLORS["info"])
-        self.events.append(f"[dim]{timestamp}[/dim] [{style}]{message}[/{style}]")
+        event = f"[dim]{timestamp}[/dim] [{style}]{message}[/{style}]"
+        normalized_channel = str(channel or "core").strip().lower()
+        if normalized_channel not in {"core", "ui"}:
+            normalized_channel = "core"
+        self.events.append(event)
+        if normalized_channel == "ui":
+            self.ui_events.append(event)
+        else:
+            self.core_events.append(event)
+
+    def events_for_channel(self, channel):
+        if str(channel or "").strip().lower() == "ui":
+            return tuple(self.ui_events)
+        return tuple(self.core_events)
+
+    def set_event_log_view(self, view):
+        normalized = str(view or "core").strip().lower()
+        if normalized not in {"core", "ui"}:
+            raise ValueError("Unknown event log view.")
+        self.event_log_view = normalized
+        if self.persist_ui_settings:
+            self.event_log_view = save_event_log_view(normalized)
+        return self.event_log_view
 
     def current_delay_label(self):
         if self.delay == "custom":
@@ -175,6 +188,19 @@ class BackgroundTasks:
             raise ValueError("Custom delay must use positive seconds with min less than or equal to max.")
         self.custom_delay_range = (low, high)
         self.delay = self.matching_delay_choice(self.custom_delay_range) or "custom"
+        self._persist_polling_settings()
+
+    def set_delay_choice(self, delay):
+        delay = str(delay)
+        if delay not in self.delay_choices:
+            raise ValueError("Unknown polling delay preset.")
+        self.delay = delay
+        self.custom_delay_range = tuple(self.delay_choices[delay][1])
+        self._persist_polling_settings()
+
+    def set_custom_delay_choice(self):
+        self.delay = "custom"
+        self._persist_polling_settings()
 
     def set_purchase_delay_range(self, low, high):
         low = float(low)
@@ -182,6 +208,38 @@ class BackgroundTasks:
         if low < 0 or high < 0 or low > high:
             raise ValueError("Purchase delay must use non-negative seconds with min less than or equal to max.")
         self.purchase_delay_bounds = (low, high)
+        if self.persist_ui_settings:
+            save_purchase_delay_bounds(self.purchase_delay_bounds)
+
+    def set_spend_cap(self, spend_cap):
+        spend_cap = int(spend_cap or 0)
+        if spend_cap < 0:
+            raise ValueError("Spend cap must be 0 or a positive integer.")
+        self.max_spend = spend_cap or None
+        if self.persist_ui_settings:
+            save_spend_cap(self.max_spend)
+
+    def set_purchase_submission_enabled(self, enabled):
+        self.purchase_submission_enabled = bool(enabled)
+        if self.persist_ui_settings:
+            save_buy_mode(self.purchase_submission_enabled)
+        return self.purchase_submission_enabled
+
+    def _persist_polling_settings(self):
+        if self.persist_ui_settings:
+            save_polling_settings(self.delay, self.custom_delay_range)
+
+    def _set_saved_session_last_known_valid(self, valid):
+        self.saved_session_last_known_valid = bool(valid)
+        if self.persist_ui_settings:
+            self.saved_session_last_known_valid = save_saved_session_last_known_valid(valid)
+        return self.saved_session_last_known_valid
+
+    def _api_has_session_cookies(self):
+        if hasattr(self.api_handler, "has_session_cookies"):
+            return self.api_handler.has_session_cookies()
+        session = getattr(self.api_handler, "session", None)
+        return bool(getattr(session, "cookies", None))
 
     def _format_seconds(self, value):
         value = float(value)
@@ -237,7 +295,7 @@ class BackgroundTasks:
     async def reset_authentication_context(self, reason):
         await self.stop_login_status_checker()
         self.steam_auto_reauth_enabled = False
-        self.purchase_submission_enabled = False
+        self.set_purchase_submission_enabled(False)
 
         if self.purchase_in_progress:
             self.pending_auth_reset_reason = reason
@@ -263,12 +321,13 @@ class BackgroundTasks:
     def _clear_marketplace_session(self, reason):
         self.pending_auth_reset_reason = None
         self.steam_auto_reauth_enabled = False
-        self.purchase_submission_enabled = False
+        self.set_purchase_submission_enabled(False)
         self.simulated_session_enabled = False
         if hasattr(self.api_handler, "clear_session"):
             self.api_handler.clear_session()
         else:
             self.api_handler.login_status = False
+        self._set_saved_session_last_known_valid(False)
         self.add_event(f"{reason}. Marketplace session cleared. Refresh Session before buying.", "warning")
 
     def monitor_status_label(self):
@@ -507,6 +566,7 @@ class BackgroundTasks:
 
         self.simulated_session_enabled = False
         self.debug_force_purchase_session_expired = True
+        self._set_saved_session_last_known_valid(False)
         if self.uses_steam_browser_session() and getattr(self.api_handler, "login_status", False):
             self.steam_auto_reauth_enabled = True
         return True
@@ -582,13 +642,16 @@ class BackgroundTasks:
             else:
                 reauthenticated = await self.api_handler.ensure_session_valid()
         except MarketplaceAPIError as exc:
+            self._set_saved_session_last_known_valid(False)
             self.add_event(f"Re-authentication failed: {exc}", "error")
             return False
 
         if reauthenticated:
+            self._set_saved_session_last_known_valid(True)
             self.add_event("Re-authentication succeeded. Retrying purchase request.", "success")
             return True
 
+        self._set_saved_session_last_known_valid(False)
         self.add_event("Re-authentication failed.", "error")
         return False
 
@@ -603,7 +666,7 @@ class BackgroundTasks:
         if not enabled and getattr(self.api_handler, "email", None) == SIMULATED_SESSION_EMAIL:
             self.api_handler.email = None
         if not enabled:
-            self.purchase_submission_enabled = False
+            self.set_purchase_submission_enabled(False)
         return True
 
     def _simulated_purchase_summary(self, buy_list, label="Test-mode purchase simulated"):
@@ -741,6 +804,7 @@ class BackgroundTasks:
 
         if status == 0:
             self.api_handler.login_status = True
+            self._set_saved_session_last_known_valid(True)
             if self.uses_steam_browser_session():
                 self.steam_auto_reauth_enabled = True
             self.add_event("Existing marketplace session is valid.", "success")
@@ -752,6 +816,7 @@ class BackgroundTasks:
             return
 
         if not self.api_handler.email or not self.api_handler.password:
+            self._set_saved_session_last_known_valid(False)
             if session_check_error:
                 self.add_event(
                     f"Session check failed: {session_check_error}. Configure credentials before logging in.",
@@ -765,6 +830,7 @@ class BackgroundTasks:
             status = await self.api_handler.login()
         except MarketplaceAPIError as exc:
             self.api_handler.login_status = False
+            self._set_saved_session_last_known_valid(False)
             if session_check_error:
                 self.add_event(f"Session check failed: {session_check_error}. Login failed: {exc}", "error")
             else:
@@ -774,6 +840,7 @@ class BackgroundTasks:
         if status == 1:
             self.api_handler.login_status = True
             self.api_handler.save_session()
+            self._set_saved_session_last_known_valid(True)
             if session_check_error:
                 self.add_event(
                     f"Session check failed: {session_check_error}. Fresh login successful; session saved.",
@@ -783,6 +850,7 @@ class BackgroundTasks:
                 self.add_event("Login successful; session saved.", "success")
             self.start_login_status_checker()
         else:
+            self._set_saved_session_last_known_valid(False)
             if session_check_error:
                 self.add_event(f"Session check failed: {session_check_error}. Login failed.", "error")
             else:
@@ -794,6 +862,7 @@ class BackgroundTasks:
             prepared = await self.prepare_steam_browser_profile()
             if not prepared:
                 self.api_handler.login_status = False
+                self._set_saved_session_last_known_valid(False)
                 return False
 
         if auto_steam_login is None:
@@ -816,6 +885,7 @@ class BackgroundTasks:
             )
         except BrowserAuthError as exc:
             self.api_handler.login_status = False
+            self._set_saved_session_last_known_valid(False)
             self.add_event(f"Steam Account refresh failed: {exc}", "error")
             return False
 
@@ -823,11 +893,13 @@ class BackgroundTasks:
             session_valid = await self.api_handler.validate_and_save_imported_session(cookies)
         except MarketplaceAPIError as exc:
             self.api_handler.login_status = False
+            self._set_saved_session_last_known_valid(False)
             self.add_event(f"Steam Account session validation failed: {exc}", "error")
             return False
 
         if session_valid:
             self.api_handler.login_status = True
+            self._set_saved_session_last_known_valid(True)
             newly_enabled = not self.steam_auto_reauth_enabled
             self.steam_auto_reauth_enabled = True
             if newly_enabled:
@@ -841,6 +913,7 @@ class BackgroundTasks:
             return True
 
         self.api_handler.login_status = False
+        self._set_saved_session_last_known_valid(False)
         self.add_event("Steam Account session validation failed. Complete login in the browser and retry.", "error")
         return False
 
@@ -848,6 +921,23 @@ class BackgroundTasks:
         self.add_event(message, level)
 
     async def initial_login_check(self):
+        if not self.saved_session_last_known_valid:
+            self.api_handler.login_status = False
+            if self.uses_steam_browser_session():
+                self.add_event(
+                    "No previously validated Steam Account session is saved. Refresh Session to open the login browser.",
+                    "warning",
+                )
+            else:
+                self.add_event("No previously validated marketplace session is saved. Refresh Session to log in.", "warning")
+            return
+
+        if not self._api_has_session_cookies():
+            self.api_handler.login_status = False
+            self._set_saved_session_last_known_valid(False)
+            self.add_event("No saved marketplace session cookies found. Refresh Session to log in.", "warning")
+            return
+
         try:
             status = await self.api_handler.is_session_expired()
         except MarketplaceAPIError as exc:
@@ -857,12 +947,14 @@ class BackgroundTasks:
 
         if status == 0:
             self.api_handler.login_status = True
+            self._set_saved_session_last_known_valid(True)
             if self.uses_steam_browser_session():
                 self.steam_auto_reauth_enabled = True
             self.start_login_status_checker()
             self.add_event("Saved marketplace session is valid.", "success")
         else:
             self.api_handler.login_status = False
+            self._set_saved_session_last_known_valid(False)
             if self.uses_steam_browser_session():
                 self.add_event(
                     "Saved Steam Account session is invalid or expired. Refresh Session to open the login browser.",
@@ -902,7 +994,7 @@ class BackgroundTasks:
                     return True
 
             if self.purchase_submission_enabled:
-                self.purchase_submission_enabled = False
+                self.set_purchase_submission_enabled(False)
                 self.add_event(
                     "Session expired. Steam Account refresh required; buy mode paused.",
                     "warning",
@@ -917,14 +1009,17 @@ class BackgroundTasks:
         try:
             login_status = await self.api_handler.login()
         except MarketplaceAPIError as exc:
+            self._set_saved_session_last_known_valid(False)
             self.add_event(f"Session expired. Re-authentication failed: {exc}", "error")
             return False
 
         if login_status == 1:
             self.api_handler.login_status = True
             self.api_handler.save_session()
+            self._set_saved_session_last_known_valid(True)
             self.add_event("Session expired. Re-authentication successful.", "success")
             return True
 
+        self._set_saved_session_last_known_valid(False)
         self.add_event("Session expired. Re-authentication failed.", "error")
         return False

@@ -3,12 +3,13 @@ import inspect
 from pathlib import Path
 from urllib.parse import urlparse
 
-from market.api_handler import GAME_TRADE_URL, TRADE_URL
+from bdo_marketplace_tools.market.api_handler import GAME_TRADE_URL, TRADE_URL
+from bdo_marketplace_tools.storage.paths import (
+    STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH,
+    STEAM_MARKET_PROFILE_PATH,
+)
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-STEAM_MARKET_PROFILE_PATH = PROJECT_ROOT / "resources" / "browser_profiles" / "steam-market"
-STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH = PROJECT_ROOT / "resources" / "browser_profiles" / "steam-market-diagnostic"
 AUTH_START_URL = f"{TRADE_URL}/"
 STEAM_PROFILE_PREP_START_URL = "https://www.naeu.playblackdesert.com/en-US"
 MARKET_COOKIE_URLS = (

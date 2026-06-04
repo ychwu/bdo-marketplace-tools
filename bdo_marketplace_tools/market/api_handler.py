@@ -1,22 +1,20 @@
 import asyncio
 import json
-import pickle
 import random
 import stat
-from pathlib import Path
 
 import requests
 
-from market.decoder import unpack
-from resources.account_mode import PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE, load_account_mode
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SESSION_COOKIE_PATH = PROJECT_ROOT / "resources" / "session.json"
-LEGACY_SESSION_PATHS = (
-    PROJECT_ROOT / "resources" / "session.pkl",
-    PROJECT_ROOT / "session.pkl",
+from bdo_marketplace_tools.market.decoder import unpack
+from bdo_marketplace_tools.storage.app_settings import (
+    PA_CREDENTIALS_MODE,
+    STEAM_BROWSER_MODE,
+    load_account_mode,
+    save_saved_session_last_known_valid,
 )
+from bdo_marketplace_tools.storage.paths import SESSION_COOKIE_PATH
+
+
 REQUEST_TIMEOUT = (5, 20)
 TRADE_URL = "https://na-trade.naeu.playblackdesert.com"
 GAME_TRADE_URL = "https://na-game-trade.naeu.playblackdesert.com"
@@ -140,6 +138,9 @@ class APIHandler:
     def _has_session_cookies(self):
         session = getattr(self, "session", None)
         return bool(getattr(session, "cookies", None))
+
+    def has_session_cookies(self):
+        return self._has_session_cookies()
 
     def uses_browser_session(self):
         return getattr(self, "account_mode", PA_CREDENTIALS_MODE) == STEAM_BROWSER_MODE
@@ -341,7 +342,7 @@ class APIHandler:
 
         if await self.login() == 1:
             self.login_status = True
-            self.save_session()
+            self.save_session(last_known_valid=True)
             return True
 
         self.login_status = False
@@ -638,7 +639,7 @@ class APIHandler:
 
         raise MarketplaceResponseError("session refresh response did not include _resultCode or resultCode")
 
-    def save_session(self):
+    def save_session(self, *, last_known_valid=None):
         SESSION_COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": 1,
@@ -648,12 +649,16 @@ class APIHandler:
             json.dump(payload, file, indent=2)
             file.write("\n")
         self._restrict_session_file_permissions()
+        if last_known_valid is not None:
+            save_saved_session_last_known_valid(bool(last_known_valid))
 
     def clear_session(self, save=True):
         self.session = requests.Session()
         self.login_status = False
         if save:
-            self.save_session()
+            self.save_session(last_known_valid=False)
+        else:
+            save_saved_session_last_known_valid(False)
 
     def _restrict_session_file_permissions(self):
         try:
@@ -686,21 +691,6 @@ class APIHandler:
                 return 0
             except (OSError, json.JSONDecodeError, TypeError, ValueError):
                 pass
-
-        for legacy_path in LEGACY_SESSION_PATHS:
-            if not legacy_path.exists():
-                continue
-            try:
-                with legacy_path.open("rb") as file:
-                    legacy_session = pickle.load(file)
-                if isinstance(legacy_session, requests.Session):
-                    self.session = legacy_session
-                    self.save_session()
-                    return 0
-            except Exception:
-                if not SESSION_COOKIE_PATH.exists():
-                    self.save_session()
-                return -1
 
         if not SESSION_COOKIE_PATH.exists():
             self.save_session()
@@ -754,7 +744,7 @@ class APIHandler:
 
         if status == 0:
             self.login_status = True
-            self.save_session()
+            self.save_session(last_known_valid=True)
             return True
 
         self.session = previous_session

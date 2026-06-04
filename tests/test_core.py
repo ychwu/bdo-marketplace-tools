@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import json
 import requests
 import tempfile
@@ -10,7 +10,7 @@ import main as app_main
 from rich.console import Console
 from textual.color import Color
 from textual.widgets import Button, Input, Select, Static
-from market.api_handler import (
+from bdo_marketplace_tools.market.api_handler import (
     APIHandler,
     DEFAULT_PURCHASE_DELAY_BOUNDS,
     MARKET_AJAX_HEADER,
@@ -19,7 +19,8 @@ from market.api_handler import (
     marketplace_silver_balance,
     purchase_result_message,
 )
-from market.browser_auth import (
+from bdo_marketplace_tools.market.browser_auth import (
+    BrowserAuthError,
     COOKIE_CONSENT_MANUAL,
     COOKIE_CONSENT_NOT_FOUND,
     COOKIE_CONSENT_SAVED,
@@ -28,6 +29,8 @@ from market.browser_auth import (
     STEAM_AUTO_LOGIN_MANUAL_NEEDED,
     STEAM_AUTO_LOGIN_SKIPPED,
     STEAM_BROWSER_CHANNEL,
+    STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH,
+    STEAM_MARKET_PROFILE_PATH,
     _accept_required_cookie_consent_if_available,
     _browser_launch_error_message,
     _classify_url,
@@ -37,7 +40,7 @@ from market.browser_auth import (
     _should_attempt_steam_auto_login,
     _status_for_state,
 )
-from market.pricing import (
+from bdo_marketplace_tools.market.pricing import (
     CLASSIC_OUTFIT_MAX_PRICE,
     OUTFIT_SET_MAX_PRICE,
     PREMIUM_OUTFIT_MAX_PRICE,
@@ -45,18 +48,26 @@ from market.pricing import (
     purchase_record_count,
     purchase_record_spend,
 )
-from market.test_mode import SINGLE_ITEM_TEST_TARGET, check_single_item_stock, parse_single_item_stock_response
-from resources import account_mode as account_mode_module
-from resources import credentials as credentials_module
-from resources import task_manager as task_manager_module
-from resources.account_mode import PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE
-from resources.task_manager import BackgroundTasks
-from resources.textual_ui import BANNER_ART, DEFAULT_THEME, STATUS_STYLES, DashboardTile, MarketplaceToolsApp, ModalAction
+from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET, check_single_item_stock, parse_single_item_stock_response
+from bdo_marketplace_tools.storage import app_settings as account_mode_module
+from bdo_marketplace_tools.storage import credentials as credentials_module
+from bdo_marketplace_tools.services import task_manager as task_manager_module
+from bdo_marketplace_tools.storage.app_settings import PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE
+from bdo_marketplace_tools.services.task_manager import BackgroundTasks
+from bdo_marketplace_tools.ui.app import BANNER_ART, DEFAULT_THEME, STATUS_STYLES, DashboardTile, MarketplaceToolsApp, ModalAction
+from bdo_marketplace_tools.version import APP_CHANNEL, APP_VERSION, PROJECT_NAME, SETTINGS_SCHEMA_VERSION
 
 
 LOCAL_DATA = {
     "successful_purchases": 0,
     "silver_spent": 0,
+}
+
+EXPECTED_APP_SETTINGS_VERSION = {
+    "schema": SETTINGS_SCHEMA_VERSION,
+    "app": APP_VERSION,
+    "channel": APP_CHANNEL,
+    "project": PROJECT_NAME,
 }
 
 
@@ -68,7 +79,14 @@ class FakeAPI:
     session_cleared = False
 
     async def get_mp_inventory(self):
-        return {"wallet": [{"currency": "silver", "amount": 123}]}
+        return {
+            "myWalletList": [
+                {"mainKey": 1, "subKey": 0, "name": "Silver", "count": "123456789"},
+            ],
+            "useValuePackage": True,
+            "totalWeight": 12,
+            "maxWeight": 100,
+        }
 
     async def check_stock(self):
         return []
@@ -82,6 +100,9 @@ class FakeAPI:
 
     def save_session(self):
         pass
+
+    def has_session_cookies(self):
+        return bool(getattr(self, "session_has_cookies", self.login_status))
 
     def clear_session(self, save=True):
         self.login_status = False
@@ -102,8 +123,8 @@ class FakeApp:
 class LaunchModeTests(unittest.IsolatedAsyncioTestCase):
     async def test_test_mode_skips_startup_session_check(self):
         fake_api = FakeAPI()
-        with patch("resources.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
-            fake_manager = BackgroundTasks(fake_api)
+        with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
+            fake_manager = BackgroundTasks(fake_api, persist_ui_settings=False)
         fake_manager.initial_login_check = AsyncMock()
         FakeApp.instances = []
 
@@ -120,8 +141,8 @@ class LaunchModeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_mode_runs_startup_session_check(self):
         fake_api = FakeAPI()
-        with patch("resources.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
-            fake_manager = BackgroundTasks(fake_api)
+        with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
+            fake_manager = BackgroundTasks(fake_api, persist_ui_settings=False)
         fake_manager.initial_login_check = AsyncMock()
         FakeApp.instances = []
 
@@ -597,13 +618,10 @@ class APIResultTests(unittest.TestCase):
 
     def test_missing_session_file_is_initialized_with_empty_cookie_store(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            session_path = Path(temp_dir) / "resources" / "session.json"
+            session_path = Path(temp_dir) / "data" / "session.json"
             handler = object.__new__(APIHandler)
 
-            with patch("market.api_handler.SESSION_COOKIE_PATH", session_path), patch(
-                "market.api_handler.LEGACY_SESSION_PATHS",
-                (),
-            ):
+            with patch("bdo_marketplace_tools.market.api_handler.SESSION_COOKIE_PATH", session_path):
                 status = APIHandler.load_session(handler)
 
             self.assertEqual(status, -1)
@@ -643,9 +661,10 @@ class APIResultTests(unittest.TestCase):
 class LocalRuntimeFileTests(unittest.TestCase):
     def test_missing_account_mode_settings_defaults_to_pa_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            settings_path = Path(temp_dir) / "resources" / "app_settings.json"
+            temp_path = Path(temp_dir)
+            settings_path = temp_path / "data" / "app_settings.json"
 
-            with patch("resources.account_mode.APP_SETTINGS_PATH", settings_path):
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
                 self.assertEqual(account_mode_module.load_account_mode(), PA_CREDENTIALS_MODE)
                 self.assertFalse(account_mode_module.load_steam_browser_profile_prepared())
                 self.assertEqual(account_mode_module.save_account_mode(STEAM_BROWSER_MODE), STEAM_BROWSER_MODE)
@@ -662,40 +681,188 @@ class LocalRuntimeFileTests(unittest.TestCase):
 
             self.assertTrue(settings_path.exists())
             saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved_settings["account_mode"], STEAM_BROWSER_MODE)
-            self.assertTrue(saved_settings["steam_browser_profile_prepared"])
+            self.assertEqual(saved_settings["version"], EXPECTED_APP_SETTINGS_VERSION)
+            self.assertEqual(saved_settings["account"]["mode"], STEAM_BROWSER_MODE)
+            self.assertIsNone(saved_settings["account"]["email"])
+            self.assertTrue(saved_settings["steam_browser"]["profile_prepared"])
+            self.assertFalse(saved_settings["session"]["saved_session_last_known_valid"])
+            self.assertEqual(saved_settings["ui"]["polling"]["selected"], "3")
+            self.assertEqual(saved_settings["ui"]["polling"]["custom_range"], [15, 30])
+            self.assertEqual(saved_settings["ui"]["buy_delay"]["range"], [1.0, 2.5])
+            self.assertIsNone(saved_settings["ui"]["spend_cap"])
+            self.assertFalse(saved_settings["ui"]["buy_mode"])
+            self.assertEqual(saved_settings["ui"]["event_log_view"], "core")
+
+    def test_app_settings_persist_ui_preferences(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            settings_path = temp_path / "data" / "app_settings.json"
+
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
+                account_mode_module.save_polling_settings("custom", (8, 13))
+                account_mode_module.save_purchase_delay_bounds((4.5, 8))
+                account_mode_module.save_spend_cap(123456789)
+                account_mode_module.save_buy_mode(True)
+                account_mode_module.save_event_log_view("ui")
+                account_mode_module.save_saved_session_last_known_valid(True)
+                settings = account_mode_module.read_app_settings()
+
+            self.assertEqual(settings["ui"]["polling"]["selected"], "custom")
+            self.assertEqual(settings["ui"]["polling"]["custom_range"], [8, 13])
+            self.assertEqual(settings["ui"]["buy_delay"]["range"], [4.5, 8.0])
+            self.assertEqual(settings["ui"]["spend_cap"], 123456789)
+            self.assertTrue(settings["ui"]["buy_mode"])
+            self.assertEqual(settings["ui"]["event_log_view"], "ui")
+            self.assertTrue(settings["session"]["saved_session_last_known_valid"])
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
+                self.assertFalse(account_mode_module.save_saved_session_last_known_valid(False))
+                self.assertFalse(account_mode_module.load_saved_session_last_known_valid())
+                self.assertEqual(account_mode_module.save_event_log_view("bad-view"), "core")
+
+    def test_background_tasks_load_and_save_persisted_ui_preferences(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            settings_path = temp_path / "data" / "app_settings.json"
+
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
+                account_mode_module.save_polling_settings("custom", (8, 13))
+                account_mode_module.save_purchase_delay_bounds((4.5, 8))
+                account_mode_module.save_spend_cap(250)
+                account_mode_module.save_buy_mode(True)
+                account_mode_module.save_event_log_view("ui")
+
+                with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
+                    manager = BackgroundTasks(FakeAPI())
+
+                self.assertEqual(manager.delay, "custom")
+                self.assertEqual(manager.current_delay_bounds(), (8, 13))
+                self.assertEqual(manager.purchase_delay_bounds, (4.5, 8.0))
+                self.assertEqual(manager.max_spend, 250)
+                self.assertTrue(manager.purchase_submission_enabled)
+                self.assertEqual(manager.event_log_view, "ui")
+
+                manager.set_delay_choice("2")
+                manager.set_purchase_delay_range("1.25", "3.5")
+                manager.set_spend_cap(0)
+                manager.set_purchase_submission_enabled(False)
+                manager.set_event_log_view("core")
+
+                with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
+                    restored = BackgroundTasks(FakeAPI())
+
+            self.assertEqual(restored.delay, "2")
+            self.assertEqual(restored.current_delay_bounds(), (5, 10))
+            self.assertEqual(restored.purchase_delay_bounds, (1.25, 3.5))
+            self.assertIsNone(restored.max_spend)
+            self.assertFalse(restored.purchase_submission_enabled)
+            self.assertEqual(restored.event_log_view, "core")
+
+    def test_old_resource_settings_are_ignored_for_fresh_start(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            settings_path = temp_path / "data" / "app_settings.json"
+            old_settings_path = temp_path / "resources" / "app_settings.json"
+            old_info_path = temp_path / "resources" / "info.json"
+            old_settings_path.parent.mkdir(parents=True)
+            old_settings_path.write_text(
+                json.dumps(
+                    {
+                        "account_mode": STEAM_BROWSER_MODE,
+                        "steam_browser_profile_prepared": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            old_info_path.write_text(
+                json.dumps({"email": "user@example.com", "password": "old-secret"}),
+                encoding="utf-8",
+            )
+
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
+                settings = account_mode_module.read_app_settings()
+
+            self.assertEqual(settings["account"]["mode"], PA_CREDENTIALS_MODE)
+            self.assertIsNone(settings["account"]["email"])
+            self.assertFalse(settings["steam_browser"]["profile_prepared"])
+            saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved_settings, settings)
+
+    def test_app_settings_refresh_version_metadata_when_read(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            settings_path = temp_path / "data" / "app_settings.json"
+            settings_path.parent.mkdir(parents=True)
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "account": {"mode": STEAM_BROWSER_MODE, "email": "user@example.com"},
+                        "steam_browser": {"profile_prepared": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
+                settings = account_mode_module.read_app_settings()
+
+            self.assertEqual(settings["version"], EXPECTED_APP_SETTINGS_VERSION)
+            self.assertEqual(settings["account"]["mode"], STEAM_BROWSER_MODE)
+            self.assertEqual(settings["account"]["email"], "user@example.com")
+            saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved_settings["version"], EXPECTED_APP_SETTINGS_VERSION)
 
     def test_api_handler_initializes_account_mode_from_saved_settings(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
-            settings_path = temp_path / "resources" / "app_settings.json"
-            session_path = temp_path / "resources" / "session.json"
+            settings_path = temp_path / "data" / "app_settings.json"
+            session_path = temp_path / "data" / "session.json"
 
-            with patch("resources.account_mode.APP_SETTINGS_PATH", settings_path):
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
                 account_mode_module.save_account_mode(STEAM_BROWSER_MODE)
-                with patch("market.api_handler.SESSION_COOKIE_PATH", session_path), patch(
-                    "market.api_handler.LEGACY_SESSION_PATHS",
-                    (),
-                ):
+                with patch("bdo_marketplace_tools.market.api_handler.SESSION_COOKIE_PATH", session_path):
                     handler = APIHandler()
 
             self.assertEqual(handler.account_mode, STEAM_BROWSER_MODE)
 
-    def test_missing_credentials_file_is_initialized_empty(self):
+    def test_missing_app_settings_credentials_are_initialized_empty(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            info_path = Path(temp_dir) / "resources" / "info.json"
+            temp_path = Path(temp_dir)
+            settings_path = temp_path / "data" / "app_settings.json"
 
-            with patch("resources.credentials.INFO_PATH", info_path):
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
                 self.assertEqual(credentials_module.load_credentials(), (None, None))
 
-            self.assertTrue(info_path.exists())
-            self.assertEqual(json.loads(info_path.read_text(encoding="utf-8")), {})
+            self.assertTrue(settings_path.exists())
+            saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertIsNone(saved_settings["account"]["email"])
 
-    def test_missing_local_data_file_is_initialized_with_default_totals(self):
+    def test_credentials_use_project_keyring_namespace(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            local_data_path = Path(temp_dir) / "resources" / "local_data.json"
+            temp_path = Path(temp_dir)
+            settings_path = temp_path / "data" / "app_settings.json"
+            keyring_mock = Mock()
+            keyring_mock.get_password.return_value = "saved-secret"
 
-            with patch("resources.task_manager.LOCAL_DATA_PATH", local_data_path):
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path), patch.object(
+                credentials_module, "keyring", keyring_mock
+            ):
+                credentials_module.save_credentials("user@example.com", "new-secret")
+                self.assertEqual(credentials_module.load_credentials(), ("user@example.com", "saved-secret"))
+
+            keyring_mock.set_password.assert_called_once_with(
+                "bdo-marketplace-tools", "user@example.com", "new-secret"
+            )
+            keyring_mock.get_password.assert_called_once_with("bdo-marketplace-tools", "user@example.com")
+            saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved_settings["account"]["email"], "user@example.com")
+            self.assertNotIn("new-secret", json.dumps(saved_settings))
+
+    def test_missing_local_stats_file_is_initialized_with_default_totals(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_data_path = Path(temp_dir) / "data" / "local_stats.json"
+
+            with patch("bdo_marketplace_tools.services.task_manager.LOCAL_DATA_PATH", local_data_path):
                 data = task_manager_module._load_local_data()
 
             self.assertEqual(data, LOCAL_DATA)
@@ -703,6 +870,62 @@ class LocalRuntimeFileTests(unittest.TestCase):
             payload = json.loads(local_data_path.read_text(encoding="utf-8"))
             self.assertEqual(payload, LOCAL_DATA)
             self.assertNotIn("updated_at", payload)
+
+    def test_old_local_data_file_is_ignored_for_fresh_start(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            local_stats_path = temp_path / "data" / "local_stats.json"
+            old_local_data_path = temp_path / "resources" / "local_data.json"
+            old_local_data_path.parent.mkdir(parents=True)
+            old_local_data_path.write_text(
+                json.dumps({"successful_purchases": 7, "silver_spent": 12345}),
+                encoding="utf-8",
+            )
+
+            data = task_manager_module.load_local_stats(path=local_stats_path)
+
+            self.assertEqual(data, LOCAL_DATA)
+            self.assertTrue(local_stats_path.exists())
+            self.assertEqual(json.loads(local_stats_path.read_text(encoding="utf-8")), LOCAL_DATA)
+
+    def test_old_session_file_is_ignored_for_fresh_start(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            session_path = temp_path / "data" / "session.json"
+            old_session_path = temp_path / "resources" / "session.json"
+            old_session_path.parent.mkdir(parents=True)
+            old_session_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "cookies": [
+                            {
+                                "name": "TradeAuth_Session",
+                                "value": "abc123",
+                                "domain": "na-trade.naeu.playblackdesert.com",
+                                "path": "/",
+                                "secure": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            handler = object.__new__(APIHandler)
+
+            with patch("bdo_marketplace_tools.market.api_handler.SESSION_COOKIE_PATH", session_path):
+                status = APIHandler.load_session(handler)
+
+            self.assertEqual(status, -1)
+            self.assertIsNone(handler.session.cookies.get("TradeAuth_Session"))
+            self.assertTrue(session_path.exists())
+            self.assertEqual(json.loads(session_path.read_text(encoding="utf-8")), {"version": 1, "cookies": []})
+
+    def test_browser_profile_paths_use_data_directory(self):
+        self.assertIn("data", STEAM_MARKET_PROFILE_PATH.parts)
+        self.assertEqual(STEAM_MARKET_PROFILE_PATH.name, "steam-market")
+        self.assertIn("data", STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH.parts)
+        self.assertEqual(STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH.name, "steam-market-diagnostic")
 
 
 class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -911,7 +1134,7 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
         handler._purchase_result_code = APIHandler._purchase_result_code.__get__(handler, APIHandler)
 
         sleep_mock = AsyncMock()
-        with patch("market.api_handler.asyncio.sleep", new=sleep_mock):
+        with patch("bdo_marketplace_tools.market.api_handler.asyncio.sleep", new=sleep_mock):
             summary = await APIHandler.buy_item(handler, [["item", "2", "100"]])
 
         self.assertEqual(summary["attempted"], 2)
@@ -954,8 +1177,8 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
         handler._json_response = APIHandler._json_response.__get__(handler, APIHandler)
         handler._purchase_result_code = APIHandler._purchase_result_code.__get__(handler, APIHandler)
 
-        with patch("market.api_handler.random.uniform", return_value=4.5) as uniform_mock:
-            with patch("market.api_handler.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+        with patch("bdo_marketplace_tools.market.api_handler.random.uniform", return_value=4.5) as uniform_mock:
+            with patch("bdo_marketplace_tools.market.api_handler.asyncio.sleep", new=AsyncMock()) as sleep_mock:
                 summary = await APIHandler.buy_item(
                     handler,
                     [["item", "3", "100"]],
@@ -1043,7 +1266,7 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
         handler._purchase_result_details = APIHandler._purchase_result_details.__get__(handler, APIHandler)
         handler._optional_positive_int = APIHandler._optional_positive_int.__get__(handler, APIHandler)
 
-        with patch("market.api_handler.asyncio.sleep", new=AsyncMock()):
+        with patch("bdo_marketplace_tools.market.api_handler.asyncio.sleep", new=AsyncMock()):
             summary = await APIHandler.buy_item(handler, [["10007", "1", "82500"]])
 
         self.assertEqual(summary["purchased"], 1)
@@ -1190,11 +1413,24 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
 
 class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
     def make_task_manager(self, test_mode_enabled=False):
-        with patch("resources.task_manager._load_local_data", return_value=LOCAL_DATA.copy()), patch(
-            "resources.task_manager.load_account_mode",
+        with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()), patch(
+            "bdo_marketplace_tools.services.task_manager.load_account_mode",
             return_value=PA_CREDENTIALS_MODE,
-        ), patch("resources.task_manager.load_steam_browser_profile_prepared", return_value=True):
-            return BackgroundTasks(FakeAPI(), test_mode_enabled=test_mode_enabled)
+        ), patch("bdo_marketplace_tools.services.task_manager.load_steam_browser_profile_prepared", return_value=True):
+            return BackgroundTasks(FakeAPI(), test_mode_enabled=test_mode_enabled, persist_ui_settings=False)
+
+    async def test_event_logs_split_core_and_ui_streams_while_preserving_combined_events(self):
+        manager = self.make_task_manager()
+
+        manager.add_event("Core monitor detail.", "success")
+        manager.add_event("UI setting saved.", "info", channel="ui")
+
+        self.assertTrue(any("Core monitor detail." in event for event in manager.events))
+        self.assertTrue(any("UI setting saved." in event for event in manager.events))
+        self.assertTrue(any("Core monitor detail." in event for event in manager.events_for_channel("core")))
+        self.assertFalse(any("UI setting saved." in event for event in manager.events_for_channel("core")))
+        self.assertTrue(any("UI setting saved." in event for event in manager.events_for_channel("ui")))
+        self.assertFalse(any("Core monitor detail." in event for event in manager.events_for_channel("ui")))
 
     async def test_spend_cap_limits_items_by_price_order(self):
         manager = self.make_task_manager()
@@ -1290,11 +1526,11 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         stock_check = AsyncMock(return_value=[["10007", "2", "82500"]])
         manager.api_handler.buy_item = AsyncMock()
 
-        with patch("resources.task_manager.check_single_item_stock", stock_check), patch(
-            "resources.task_manager.random.uniform",
+        with patch("bdo_marketplace_tools.services.task_manager.check_single_item_stock", stock_check), patch(
+            "bdo_marketplace_tools.services.task_manager.random.uniform",
             return_value=3,
         ), patch(
-            "resources.task_manager.asyncio.sleep",
+            "bdo_marketplace_tools.services.task_manager.asyncio.sleep",
             new=AsyncMock(side_effect=asyncio.CancelledError),
         ):
             with self.assertRaises(asyncio.CancelledError):
@@ -1324,14 +1560,14 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         )
         manager.single_item_test_purchase_enabled = True
 
-        with patch("resources.task_manager.check_single_item_stock", stock_check), patch.object(
+        with patch("bdo_marketplace_tools.services.task_manager.check_single_item_stock", stock_check), patch.object(
             manager,
             "save_local_data",
         ) as save_mock, patch(
-            "resources.task_manager.random.uniform",
+            "bdo_marketplace_tools.services.task_manager.random.uniform",
             return_value=3,
         ), patch(
-            "resources.task_manager.asyncio.sleep",
+            "bdo_marketplace_tools.services.task_manager.asyncio.sleep",
             new=AsyncMock(side_effect=asyncio.CancelledError),
         ):
             with self.assertRaises(asyncio.CancelledError):
@@ -1393,8 +1629,8 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
 
         manager.set_custom_delay_range(8, 13)
         manager.api_handler.check_stock = AsyncMock(return_value=[])
-        with patch("resources.task_manager.random.uniform", return_value=9) as uniform_mock:
-            with patch("resources.task_manager.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
+        with patch("bdo_marketplace_tools.services.task_manager.random.uniform", return_value=9) as uniform_mock:
+            with patch("bdo_marketplace_tools.services.task_manager.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
                 with self.assertRaises(asyncio.CancelledError):
                     await manager.checker()
 
@@ -1405,7 +1641,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.set_custom_delay_range(5, 10)
         manager.consecutive_cycle_errors = 2
 
-        with patch("resources.task_manager.random.uniform", return_value=20) as uniform_mock:
+        with patch("bdo_marketplace_tools.services.task_manager.random.uniform", return_value=20) as uniform_mock:
             self.assertEqual(manager.next_sleep_duration(), 20)
 
         uniform_mock.assert_called_once_with(15, 30)
@@ -1494,7 +1730,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager = self.make_task_manager()
         manager.api_handler.check_stock = AsyncMock(return_value=[["bad-item", "not-a-number", "100"]])
 
-        with patch("resources.task_manager.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
+        with patch("bdo_marketplace_tools.services.task_manager.asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
             with self.assertRaises(asyncio.CancelledError):
                 await manager.checker()
 
@@ -1540,7 +1776,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
 
         with patch(
-            "resources.task_manager.acquire_steam_market_cookies",
+            "bdo_marketplace_tools.services.task_manager.acquire_steam_market_cookies",
             new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
         ) as browser_auth:
             await manager.login()
@@ -1550,6 +1786,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.login.assert_not_called()
         manager.api_handler.validate_and_save_imported_session.assert_awaited_once()
         self.assertTrue(manager.api_handler.login_status)
+        self.assertTrue(manager.saved_session_last_known_valid)
         self.assertTrue(manager.steam_auto_reauth_enabled)
         self.assertTrue(any("Steam Account session validated and saved" in event for event in manager.events))
         await manager.stop_login_status_checker()
@@ -1558,25 +1795,56 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager = self.make_task_manager()
         manager.account_mode = STEAM_BROWSER_MODE
         manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.saved_session_last_known_valid = True
+        manager.api_handler.session_has_cookies = True
         manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
 
-        with patch("resources.task_manager.acquire_steam_market_cookies", new=AsyncMock()) as browser_auth:
+        with patch("bdo_marketplace_tools.services.task_manager.acquire_steam_market_cookies", new=AsyncMock()) as browser_auth:
             await manager.initial_login_check()
 
         browser_auth.assert_not_called()
         self.assertFalse(manager.api_handler.login_status)
         self.assertFalse(manager.steam_auto_reauth_enabled)
+        self.assertFalse(manager.saved_session_last_known_valid)
         self.assertTrue(any("Refresh Session to open the login browser" in event for event in manager.events))
+
+    async def test_initial_login_check_skips_api_without_last_known_valid_saved_session(self):
+        manager = self.make_task_manager()
+        manager.saved_session_last_known_valid = False
+        manager.api_handler.session_has_cookies = True
+        manager.api_handler.is_session_expired = AsyncMock(return_value=0)
+
+        await manager.initial_login_check()
+
+        manager.api_handler.is_session_expired.assert_not_called()
+        self.assertFalse(manager.api_handler.login_status)
+        self.assertTrue(any("No previously validated marketplace session" in event for event in manager.events))
+
+    async def test_initial_login_check_clears_last_known_valid_when_cookies_are_missing(self):
+        manager = self.make_task_manager()
+        manager.saved_session_last_known_valid = True
+        manager.api_handler.session_has_cookies = False
+        manager.api_handler.is_session_expired = AsyncMock(return_value=0)
+
+        await manager.initial_login_check()
+
+        manager.api_handler.is_session_expired.assert_not_called()
+        self.assertFalse(manager.saved_session_last_known_valid)
+        self.assertFalse(manager.api_handler.login_status)
+        self.assertTrue(any("No saved marketplace session cookies found" in event for event in manager.events))
 
     async def test_initial_valid_steam_session_enables_auto_reauth_for_current_run(self):
         manager = self.make_task_manager()
         manager.account_mode = STEAM_BROWSER_MODE
         manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.saved_session_last_known_valid = True
+        manager.api_handler.session_has_cookies = True
         manager.api_handler.is_session_expired = AsyncMock(return_value=0)
 
         await manager.initial_login_check()
 
         self.assertTrue(manager.api_handler.login_status)
+        self.assertTrue(manager.saved_session_last_known_valid)
         self.assertTrue(manager.steam_auto_reauth_enabled)
         self.assertTrue(any("Saved marketplace session is valid" in event for event in manager.events))
         await manager.stop_login_status_checker()
@@ -1588,11 +1856,11 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.steam_browser_profile_prepared = False
         manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
 
-        with patch("resources.task_manager.prepare_steam_browser_profile", new=AsyncMock()) as profile_setup, patch(
-            "resources.task_manager.save_steam_browser_profile_prepared",
+        with patch("bdo_marketplace_tools.services.task_manager.prepare_steam_browser_profile", new=AsyncMock()) as profile_setup, patch(
+            "bdo_marketplace_tools.services.task_manager.save_steam_browser_profile_prepared",
             return_value=True,
         ) as save_prepared, patch(
-            "resources.task_manager.acquire_steam_market_cookies",
+            "bdo_marketplace_tools.services.task_manager.acquire_steam_market_cookies",
             new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
         ) as browser_auth:
             refreshed = await manager.refresh_browser_session()
@@ -1604,16 +1872,34 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(browser_auth.await_args.kwargs["auto_steam_login"])
         manager.api_handler.validate_and_save_imported_session.assert_awaited_once()
         self.assertTrue(manager.steam_browser_profile_prepared)
+        self.assertTrue(manager.saved_session_last_known_valid)
         self.assertTrue(manager.steam_auto_reauth_enabled)
         self.assertTrue(any("Initial Steam browser setup is required" in event for event in manager.events))
         self.assertTrue(any("Initial Steam browser setup saved" in event for event in manager.events))
         await manager.stop_login_status_checker()
+
+    async def test_failed_steam_refresh_clears_last_known_valid_session_flag(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.saved_session_last_known_valid = True
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_steam_market_cookies",
+            new=AsyncMock(side_effect=BrowserAuthError("browser closed")),
+        ):
+            refreshed = await manager.refresh_browser_session()
+
+        self.assertFalse(refreshed)
+        self.assertFalse(manager.saved_session_last_known_valid)
+        self.assertFalse(manager.api_handler.login_status)
 
     async def test_account_mode_change_stops_monitor_and_clears_session(self):
         manager = self.make_task_manager()
         manager.api_handler.login_status = True
         manager.purchase_submission_enabled = True
         manager.steam_auto_reauth_enabled = True
+        manager.saved_session_last_known_valid = True
 
         async def idle_checker():
             await asyncio.sleep(60)
@@ -1630,6 +1916,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(manager.api_handler.login_status)
         self.assertTrue(manager.api_handler.session_cleared)
         self.assertFalse(manager.steam_auto_reauth_enabled)
+        self.assertFalse(manager.saved_session_last_known_valid)
         self.assertTrue(any("Marketplace session cleared" in event for event in manager.events))
 
     async def test_account_mode_change_during_purchase_defers_session_clear_until_chain_finishes(self):
@@ -1637,6 +1924,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.login_status = True
         manager.purchase_submission_enabled = True
         manager.steam_auto_reauth_enabled = True
+        manager.saved_session_last_known_valid = True
         started = asyncio.Event()
         release = asyncio.Event()
 
@@ -1664,6 +1952,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(manager.api_handler.login_status)
         self.assertTrue(manager.api_handler.session_cleared)
         self.assertFalse(manager.steam_auto_reauth_enabled)
+        self.assertFalse(manager.saved_session_last_known_valid)
         self.assertTrue(any("buy chain done" in event for event in manager.events))
         self.assertTrue(any("Marketplace session cleared" in event for event in manager.events))
 
@@ -1671,6 +1960,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager = self.make_task_manager(test_mode_enabled=True)
         manager.api_handler.login_status = True
         manager.purchase_submission_enabled = True
+        manager.saved_session_last_known_valid = True
 
         async def idle_checker():
             await asyncio.sleep(60)
@@ -1687,6 +1977,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manager.api_handler.login_status)
         self.assertFalse(manager.api_handler.session_cleared)
         self.assertTrue(manager.debug_force_purchase_session_expired)
+        self.assertFalse(manager.saved_session_last_known_valid)
         self.assertEqual(len(manager.events), 0)
 
         await manager.stop_checker()
@@ -1696,6 +1987,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.account_mode = STEAM_BROWSER_MODE
         manager.api_handler.account_mode = STEAM_BROWSER_MODE
         manager.api_handler.login_status = True
+        manager.saved_session_last_known_valid = True
 
         invalidated = manager.debug_invalidate_marketplace_session()
 
@@ -1703,6 +1995,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manager.debug_force_purchase_session_expired)
         self.assertTrue(manager.steam_auto_reauth_enabled)
         self.assertTrue(manager.api_handler.login_status)
+        self.assertFalse(manager.saved_session_last_known_valid)
 
     async def test_debug_toggle_steam_auto_reauth_requires_test_mode_and_steam_mode(self):
         manager = self.make_task_manager(test_mode_enabled=False)
@@ -1761,7 +2054,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
     async def test_debug_blank_browser_diagnostic_opens_without_session_import(self):
         manager = self.make_task_manager(test_mode_enabled=True)
 
-        with patch("resources.task_manager.open_blank_steam_browser_diagnostic", new=AsyncMock()) as browser_diag:
+        with patch("bdo_marketplace_tools.services.task_manager.open_blank_steam_browser_diagnostic", new=AsyncMock()) as browser_diag:
             opened = await manager.debug_open_blank_browser_diagnostic()
 
         self.assertTrue(opened)
@@ -1818,7 +2111,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.buy_item = AsyncMock(side_effect=[expired_summary, success_summary])
 
         with patch(
-            "resources.task_manager.acquire_steam_market_cookies",
+            "bdo_marketplace_tools.services.task_manager.acquire_steam_market_cookies",
             new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
         ) as browser_auth:
             with patch.object(manager, "save_local_data"):
@@ -1836,7 +2129,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
         manager.api_handler.login = AsyncMock(return_value=0)
 
-        with patch("resources.task_manager.asyncio.sleep", new=AsyncMock(return_value=None)):
+        with patch("bdo_marketplace_tools.services.task_manager.asyncio.sleep", new=AsyncMock(return_value=None)):
             await manager.login_status_checker()
 
         self.assertEqual(len(manager.events), 1)
@@ -1851,7 +2144,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.purchase_submission_enabled = True
         manager.refresh_browser_session = AsyncMock(return_value=True)
 
-        with patch("resources.task_manager.asyncio.sleep", new=AsyncMock(return_value=None)):
+        with patch("bdo_marketplace_tools.services.task_manager.asyncio.sleep", new=AsyncMock(return_value=None)):
             await manager.login_status_checker()
 
         manager.api_handler.login.assert_not_called()
@@ -1883,16 +2176,16 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
 
 class TextualAppTests(unittest.IsolatedAsyncioTestCase):
     def make_app(self, launch_mode="live"):
-        with patch("resources.task_manager._load_local_data", return_value=LOCAL_DATA.copy()), patch(
-            "resources.task_manager.load_account_mode",
+        with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()), patch(
+            "bdo_marketplace_tools.services.task_manager.load_account_mode",
             return_value=PA_CREDENTIALS_MODE,
-        ), patch("resources.task_manager.load_steam_browser_profile_prepared", return_value=True):
-            manager = BackgroundTasks(FakeAPI())
+        ), patch("bdo_marketplace_tools.services.task_manager.load_steam_browser_profile_prepared", return_value=True):
+            manager = BackgroundTasks(FakeAPI(), persist_ui_settings=False)
         return MarketplaceToolsApp(manager, manager.api_handler, launch_mode=launch_mode)
 
     async def test_app_launches_and_navigates_sidebar(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertEqual(app.theme, DEFAULT_THEME)
@@ -1908,6 +2201,10 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.current_view, "settings")
                 self.assertFalse(app.query_one("#banner").display)
                 self.assertTrue(app.query_one("#screen-title").display)
+                await pilot.press("2")
+                self.assertEqual(app.current_view, "wallet")
+                self.assertIn(("wallet", "Inventory"), app.NAV_ITEMS)
+                self.assertEqual(app.query_one("#screen-title", Static).content, "Marketplace Inventory")
                 await pilot.press("3")
                 self.assertEqual(app.current_view, "stats")
                 self.assertEqual(len(list(app.query("#stats-output"))), 0)
@@ -1918,14 +2215,14 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dashboard_banner_shows_when_terminal_is_large_enough(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(150, 45)):
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertTrue(app.query_one("#banner").display)
 
     async def test_dashboard_content_remains_scrollable(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)):
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertEqual(app.query_one("#content").styles.overflow_y, "auto")
@@ -1935,28 +2232,61 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_credentials_validation_and_password_masking(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch(
-            "resources.textual_ui.save_credentials"
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch(
+            "bdo_marketplace_tools.ui.app.save_credentials"
         ) as save_mock:
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.click("#tile-credentials")
                 await pilot.pause()
+                self.assertEqual(len(list(app.screen_stack[-1].query("#email-input"))), 0)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#password-input"))), 0)
+
+                await pilot.click("#credential-action-tile")
+                await pilot.pause()
                 password_input = app.query_visible_one("#password-input")
                 self.assertTrue(password_input.password)
-
-                await pilot.click("#save-credentials")
-                self.assertIn("Email field cannot be empty", app.status_message)
+                self.assertTrue(app.query_visible_one("#save-pa-credentials", Button).disabled)
 
                 app.query_visible_one("#email-input").value = "user@example.com"
+                await pilot.pause()
+                self.assertTrue(app.query_visible_one("#save-pa-credentials", Button).disabled)
+
                 app.query_visible_one("#password-input").value = "secret"
-                await pilot.click("#save-credentials")
+                await pilot.pause()
+                self.assertFalse(app.query_visible_one("#save-pa-credentials", Button).disabled)
+                await pilot.click("#save-pa-credentials")
                 save_mock.assert_called_once_with("user@example.com", "secret")
                 self.assertIn("Credentials saved", app.status_message)
-                self.assertEqual([type(screen).__name__ for screen in app.screen_stack], ["Screen"])
+                self.assertEqual(type(app.screen_stack[-1]).__name__, "CredentialsModal")
+
+    async def test_pa_credentials_modal_shows_invalid_email_warning_inline(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch(
+            "bdo_marketplace_tools.ui.app.save_credentials"
+        ) as save_mock:
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.click("#tile-credentials")
+                await pilot.pause()
+                await pilot.click("#credential-action-tile")
+                await pilot.pause()
+                app.query_visible_one("#email-input").value = "not-an-email"
+                app.query_visible_one("#password-input").value = "secret"
+                await pilot.pause()
+                self.assertFalse(app.query_visible_one("#save-pa-credentials", Button).disabled)
+
+                await pilot.click("#save-pa-credentials")
+                await pilot.pause()
+
+                self.assertIn(
+                    "Enter a valid email address",
+                    str(app.query_visible_one("#pa-credentials-warning", Static).render()),
+                )
+                self.assertEqual(app.status_message, "")
+                save_mock.assert_not_called()
 
     async def test_saved_credentials_are_labeled_set_not_authenticated_ready(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=("user@example.com", "secret")):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")):
             async with app.run_test(size=(100, 36)):
                 credential_status, credential_detail, credential_level, _, _ = app.credential_state()
 
@@ -1969,7 +2299,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app.api_handler.login_status = True
         app.task_manager.purchase_submission_enabled = True
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.press("1")
                 self.assertEqual(app.current_view, "settings")
@@ -1986,7 +2316,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dashboard_live_metrics_refresh(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 app.task_manager.session_detected_outfits = 4
                 app.task_manager.session_successful_purchases = 2
@@ -2043,7 +2373,11 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.click("#tile-credentials")
                 await pilot.pause()
                 self.assertEqual(app.current_view, "dashboard")
+                self.assertEqual(len(list(app.screen_stack[-1].query("#password-input"))), 0)
+                await pilot.click("#credential-action-tile")
+                await pilot.pause()
                 self.assertTrue(app.query_visible_one("#password-input", Input).password)
+                await pilot.press("escape")
                 await pilot.press("escape")
                 await pilot.click("#tile-polling")
                 await pilot.pause()
@@ -2102,8 +2436,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_credentials_modal_can_select_steam_browser_session_mode(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch(
-            "resources.task_manager.save_account_mode",
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch(
+            "bdo_marketplace_tools.services.task_manager.save_account_mode",
             return_value=STEAM_BROWSER_MODE,
         ):
             async with app.run_test(size=(100, 36)) as pilot:
@@ -2119,40 +2453,39 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(list(app.query("#credentials-email-tile"))), 0)
                 self.assertEqual(len(list(app.query("#credentials-password-tile"))), 0)
                 self.assertEqual(len(list(app.query("#credentials-status-tile"))), 0)
-                setup_tile_widget = app.query_visible_one("#steam-setup-status-tile", Static)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#email-input"))), 0)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#password-input"))), 0)
+                setup_tile_widget = app.query_visible_one("#credential-action-tile", Static)
                 self.assertEqual(setup_tile_widget.border_title, "Pearl Abyss Account")
                 self.assertTrue(setup_tile_widget.display)
+                self.assertIn("modal-info-clickable", setup_tile_widget.classes)
                 console = Console(width=100, color_system=None)
                 with console.capture() as capture:
                     console.print(setup_tile_widget.content)
                 setup_tile = capture.get()
                 self.assertIn("No account configured", setup_tile)
-                self.assertIn("No saved email", setup_tile)
+                self.assertIn("Click to enter credentials", setup_tile)
                 mode_select.value = STEAM_BROWSER_MODE
                 await pilot.pause()
-                self.assertFalse(app.task_manager.uses_steam_browser_session())
-                self.assertEqual(app.api_handler.account_mode, PA_CREDENTIALS_MODE)
+                self.assertTrue(app.task_manager.uses_steam_browser_session())
+                self.assertEqual(app.api_handler.account_mode, STEAM_BROWSER_MODE)
                 self.assertEqual(setup_tile_widget.border_title, "Steam Initial Setup")
                 self.assertTrue(setup_tile_widget.display)
                 self.assertNotIn("modal-info-clickable", setup_tile_widget.classes)
                 self.assertIn("modal-info-muted", setup_tile_widget.classes)
-                self.assertTrue(app.query_visible_one("#email-input", Input).disabled)
-                self.assertTrue(app.query_visible_one("#password-input", Input).disabled)
-                self.assertTrue(app.query_visible_one("#clear-credentials", Button).disabled)
-                self.assertFalse(app.query_visible_one("#save-credentials", Button).disabled)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#email-input"))), 0)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#password-input"))), 0)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#save-credential-mode"))), 0)
                 steam_note = str(app.query_visible_one("#credentials-mode-note", Static).render())
                 self.assertIn("visible browser", steam_note)
                 self.assertIn("does not use saved email or password", steam_note)
 
-                await pilot.click("#save-credentials")
-                await pilot.pause()
-
                 self.assertTrue(app.task_manager.uses_steam_browser_session())
                 self.assertEqual(app.api_handler.account_mode, STEAM_BROWSER_MODE)
-                self.assertIn("Login method saved: Steam Account", app.status_message)
+                self.assertIn("Login method set to Steam Account", app.status_message)
                 self.assertEqual(app.credential_state()[0], "Steam Account")
                 self.assertEqual(app.session_status_state(), ("OFFLINE", "Refresh required", "warning"))
-                self.assertEqual([type(screen).__name__ for screen in app.screen_stack], ["Screen"])
+                self.assertEqual(type(app.screen_stack[-1]).__name__, "CredentialsModal")
 
     async def test_credentials_modal_shows_initial_steam_setup_only_until_profile_prepared(self):
         app = self.make_app()
@@ -2163,8 +2496,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
             return True
 
         app.task_manager.prepare_steam_browser_profile = AsyncMock(side_effect=mark_prepared)
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch(
-            "resources.task_manager.save_account_mode",
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch(
+            "bdo_marketplace_tools.services.task_manager.save_account_mode",
             return_value=STEAM_BROWSER_MODE,
         ) as save_mode:
             async with app.run_test(size=(100, 36)) as pilot:
@@ -2173,7 +2506,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 self.assertEqual(len(list(app.query("#prepare-steam-profile"))), 0)
-                setup_tile_widget = app.query_visible_one("#steam-setup-status-tile", Static)
+                setup_tile_widget = app.query_visible_one("#credential-action-tile", Static)
                 self.assertEqual(setup_tile_widget.border_title, "Pearl Abyss Account")
                 self.assertTrue(setup_tile_widget.display)
                 console = Console(width=100, color_system=None)
@@ -2181,33 +2514,32 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                     console.print(setup_tile_widget.content)
                 setup_tile = capture.get()
                 self.assertIn("No account configured", setup_tile)
-                self.assertIn("No saved email", setup_tile)
+                self.assertIn("Click to enter credentials", setup_tile)
 
                 mode_select = app.query_visible_one("#account-mode-select", Select)
                 mode_select.value = STEAM_BROWSER_MODE
                 await pilot.pause()
 
-                self.assertEqual(app.task_manager.account_mode, PA_CREDENTIALS_MODE)
+                self.assertEqual(app.task_manager.account_mode, STEAM_BROWSER_MODE)
                 self.assertEqual(setup_tile_widget.border_title, "Steam Initial Setup")
                 self.assertTrue(setup_tile_widget.display)
                 self.assertIn("modal-info-clickable", setup_tile_widget.classes)
                 self.assertNotIn("modal-info-muted", setup_tile_widget.classes)
-                self.assertTrue(app.query_visible_one("#save-credentials", Button).disabled)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#save-credential-mode"))), 0)
                 self.assertIn("Run Steam Setup once", str(app.query_visible_one("#credentials-mode-note", Static).render()))
 
-                await pilot.click("#steam-setup-status-tile")
+                await pilot.click("#credential-action-tile")
                 await pilot.pause(0.2)
 
                 app.task_manager.prepare_steam_browser_profile.assert_awaited_once_with(allow_inactive_mode=True)
-                save_mode.assert_not_called()
-                self.assertEqual(app.task_manager.account_mode, PA_CREDENTIALS_MODE)
+                save_mode.assert_called_once_with(STEAM_BROWSER_MODE)
+                self.assertEqual(app.task_manager.account_mode, STEAM_BROWSER_MODE)
                 self.assertTrue(app.task_manager.steam_browser_profile_prepared)
                 self.assertTrue(setup_tile_widget.display)
                 self.assertNotIn("modal-info-clickable", setup_tile_widget.classes)
                 self.assertIn("modal-info-muted", setup_tile_widget.classes)
-                self.assertFalse(app.query_visible_one("#save-credentials", Button).disabled)
                 with console.capture() as capture:
-                    console.print(app.query_visible_one("#steam-setup-status-tile", Static).content)
+                    console.print(app.query_visible_one("#credential-action-tile", Static).content)
                 setup_tile = capture.get()
                 self.assertIn("Complete", setup_tile)
                 self.assertIn("Ready for market login", setup_tile)
@@ -2219,34 +2551,32 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app.api_handler.account_mode = STEAM_BROWSER_MODE
         app.task_manager.steam_browser_profile_prepared = True
 
-        with patch("resources.textual_ui.load_credentials", return_value=("user@example.com", "secret")), patch(
-            "resources.textual_ui.save_credentials"
-        ) as save_mock, patch("resources.task_manager.save_account_mode", return_value=PA_CREDENTIALS_MODE):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")), patch(
+            "bdo_marketplace_tools.ui.app.save_credentials"
+        ) as save_mock, patch("bdo_marketplace_tools.services.task_manager.save_account_mode", return_value=PA_CREDENTIALS_MODE):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.click("#tile-credentials")
                 await pilot.pause()
-                self.assertEqual(app.query_visible_one("#email-input", Input).value, "user@example.com")
-                self.assertTrue(app.query_visible_one("#email-input", Input).disabled)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#email-input"))), 0)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#password-input"))), 0)
 
                 mode_select = app.query_visible_one("#account-mode-select", Select)
                 mode_select.value = PA_CREDENTIALS_MODE
                 await pilot.pause()
-                self.assertFalse(app.query_visible_one("#email-input", Input).disabled)
-                self.assertEqual(app.query_visible_one("#email-input", Input).value, "user@example.com")
-                self.assertEqual(app.query_visible_one("#password-input", Input).value, "")
+                setup_tile_widget = app.query_visible_one("#credential-action-tile", Static)
+                self.assertEqual(setup_tile_widget.border_title, "Pearl Abyss Account")
+                self.assertIn("modal-info-clickable", setup_tile_widget.classes)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#save-credential-mode"))), 0)
 
-                await pilot.click("#save-credentials")
-                await pilot.pause()
-
-        save_mock.assert_called_once_with("user@example.com")
+        save_mock.assert_not_called()
         self.assertEqual(app.task_manager.account_mode, PA_CREDENTIALS_MODE)
         self.assertEqual(app.api_handler.email, "user@example.com")
         self.assertEqual(app.api_handler.password, "secret")
-        self.assertIn("Credentials saved", app.status_message)
+        self.assertIn("Login method set to Pearl Abyss Account", app.status_message)
 
     async def test_buy_delay_modal_saves_valid_decimals_and_keeps_invalid_open(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.click("#tile-buy-delay")
                 await pilot.pause()
@@ -2272,6 +2602,48 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Buy delay must use non-negative seconds", app.status_message)
                 self.assertEqual(type(app.screen_stack[-1]).__name__, "BuyDelayModal")
 
+    async def test_modal_input_edits_do_not_apply_until_save(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.click("#tile-polling")
+                await pilot.pause()
+                await pilot.click("#polling-preset-2")
+                await pilot.pause()
+                self.assertEqual(app.query_visible_one("#custom-delay-min-input", Input).value, "5")
+                self.assertEqual(app.query_visible_one("#custom-delay-max-input", Input).value, "10")
+                self.assertIn("preset-selected", app.query_visible_one("#polling-preset-2").classes)
+                self.assertEqual(app.task_manager.delay, "3")
+                self.assertEqual(app.task_manager.current_delay_bounds(), (15, 30))
+                app.query_visible_one("#custom-delay-min-input", Input).value = "8"
+                app.query_visible_one("#custom-delay-max-input", Input).value = "13"
+                await pilot.pause()
+                self.assertEqual(app.task_manager.delay, "3")
+                self.assertEqual(app.task_manager.current_delay_bounds(), (15, 30))
+                await pilot.click("#save-polling")
+                await pilot.pause()
+                self.assertEqual(app.task_manager.delay, "custom")
+                self.assertEqual(app.task_manager.current_delay_bounds(), (8, 13))
+
+                await pilot.click("#tile-buy-delay")
+                await pilot.pause()
+                app.query_visible_one("#purchase-delay-min-input", Input).value = "4.5"
+                app.query_visible_one("#purchase-delay-max-input", Input).value = "8"
+                await pilot.pause()
+                self.assertEqual(app.task_manager.purchase_delay_bounds, (1.0, 2.5))
+                await pilot.click("#save-buy-delay")
+                await pilot.pause()
+                self.assertEqual(app.task_manager.purchase_delay_bounds, (4.5, 8.0))
+
+                await pilot.click("#tile-spent")
+                await pilot.pause()
+                app.query_visible_one("#spend-cap-input", Input).value = "250"
+                await pilot.pause()
+                self.assertIsNone(app.task_manager.max_spend)
+                await pilot.click("#save-spend-cap")
+                await pilot.pause()
+                self.assertEqual(app.task_manager.max_spend, 250)
+
     async def test_stats_page_uses_tiles_without_local_file_path(self):
         app = self.make_app()
         app.task_manager.session_detected_outfits = 5
@@ -2281,7 +2653,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app.task_manager.lifetime_silver_spent = 12_000_000_000
         app.task_manager.reload_lifetime_stats = lambda: None
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.press("3")
                 self.assertIsInstance(app.query_one("#refresh-stats"), ModalAction)
@@ -2310,9 +2682,27 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Local Data File", rendered)
         self.assertEqual(app.status_message, "Stats refreshed.")
 
+    async def test_marketplace_inventory_page_is_wip_and_uses_standard_action(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.press("2")
+                self.assertEqual(app.current_view, "wallet")
+                self.assertIn(("wallet", "Inventory"), app.NAV_ITEMS)
+                self.assertEqual(app.query_one("#screen-title", Static).content, "Marketplace Inventory")
+                self.assertIn("WIP", str(app.query_one("#wallet-wip-note", Static).content))
+                self.assertEqual(app.query_one("#wallet-wip-note", Static).styles.margin.top, 1)
+                self.assertIsInstance(app.query_one("#refresh-wallet"), ModalAction)
+                self.assertEqual(list(app.query("#wallet-actions Button")), [])
+
+                await pilot.click("#refresh-wallet")
+                await pilot.pause()
+
+        self.assertIn("Inventory loaded", app.status_message)
+
     async def test_purchase_success_rate_uses_color_spectrum(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)):
                 cases = [
                     (0, 0, "error"),
@@ -2333,8 +2723,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sidebar_test_log_button_adds_dashboard_event(self):
         app = self.make_app(launch_mode="test")
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch(
-            "resources.textual_ui.random.choice",
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch(
+            "bdo_marketplace_tools.ui.app.random.choice",
             return_value=("Synthetic layout probe.", "success"),
         ):
             async with app.run_test(size=(100, 36)) as pilot:
@@ -2348,7 +2738,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_dashboard_event_log_rehydrates_after_navigation(self):
         app = self.make_app()
         app.task_manager.add_event("Persistent event before navigation.", "success")
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
                 self.assertIn("Persistent event before navigation.", event_text)
@@ -2362,9 +2752,36 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Persistent event before navigation.", event_text)
                 self.assertEqual(app._dashboard_snapshot, app.dashboard_snapshot())
 
+    async def test_dashboard_event_log_switches_between_core_and_ui_streams(self):
+        app = self.make_app()
+        app.task_manager.add_event("Core monitor detail.", "success")
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                app.set_status("UI setting saved.", "info")
+                await pilot.pause()
+
+                self.assertEqual(app.query_one("#event-log-toolbar-title", Static).content, "Event Log View:")
+                self.assertEqual(app.query_one("#event-log-toolbar").styles.height.value, 1)
+                self.assertIn("log-filter-selected", app.query_one("#log-filter-core").classes)
+                self.assertEqual(app.query_one("#log-filter-core", Static).content, "Core logs")
+                self.assertEqual(app.query_one("#log-filter-ui", Static).content, "UI logs")
+                event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
+                self.assertIn("Core monitor detail.", event_text)
+                self.assertNotIn("UI setting saved.", event_text)
+
+                await pilot.click("#log-filter-ui")
+                await pilot.pause()
+
+                self.assertEqual(app.event_log_mode, "ui")
+                self.assertEqual(app.task_manager.event_log_view, "ui")
+                self.assertIn("log-filter-selected", app.query_one("#log-filter-ui").classes)
+                event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
+                self.assertIn("UI setting saved.", event_text)
+                self.assertNotIn("Core monitor detail.", event_text)
+
     async def test_debug_controls_are_test_mode_only(self):
         live_app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with live_app.run_test(size=(100, 36)):
                 self.assertEqual(list(live_app.query("#test-controls")), [])
                 await live_app.add_test_log()
@@ -2372,7 +2789,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Debug actions", live_app.status_message)
 
         test_app = self.make_app(launch_mode="test")
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with test_app.run_test(size=(100, 36)):
                 self.assertEqual(len(list(test_app.query("#test-controls"))), 1)
                 self.assertEqual(len(list(test_app.query("#toggle-test-session"))), 1)
@@ -2392,7 +2809,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app.task_manager.debug_invalidate_marketplace_session = Mock(return_value=True)
         app.task_manager.debug_run_reauthentication_check = AsyncMock(return_value=True)
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 self.assertIn("Auto Reauth", str(app.query_one("#toggle-auto-reauth", Button).render()))
                 self.assertIn("Reauth Check", str(app.query_one("#run-reauth-check", Button).render()))
@@ -2420,7 +2837,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app = self.make_app(launch_mode="test")
         app.task_manager.debug_open_blank_browser_diagnostic = AsyncMock(return_value=True)
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 self.assertIn("Blank Browser", str(app.query_one("#open-blank-browser", Button).render()))
 
@@ -2437,7 +2854,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_test_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch.object(
             app.task_manager,
             "single_item_test_checker",
             new=idle_test_checker,
@@ -2468,7 +2885,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_test_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch.object(
             app.task_manager,
             "single_item_test_checker",
             new=idle_test_checker,
@@ -2500,7 +2917,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_polling_modal_saves_preset_equivalent_range_as_preset(self):
         app = self.make_app()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.click("#tile-polling")
                 await pilot.pause()
@@ -2518,7 +2935,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app.task_manager.purchase_submission_enabled = True
         app.api_handler.login_status = False
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)):
                 await app.start_monitor()
 
@@ -2535,7 +2952,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app.api_handler.is_session_expired = AsyncMock(return_value=-1)
         app.api_handler.login = AsyncMock(return_value=0)
 
-        with patch("resources.textual_ui.load_credentials", return_value=("user@example.com", "secret")):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")):
             async with app.run_test(size=(100, 36)):
                 await app.login_refresh()
 
@@ -2550,7 +2967,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app = self.make_app(launch_mode="test")
         app.task_manager.purchase_submission_enabled = True
         app.task_manager.buy_item = AsyncMock()
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.click("#fake-detection")
 
@@ -2561,7 +2978,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_fake_buy_success_button_updates_metrics_and_saves(self):
         app = self.make_app(launch_mode="test")
         with patch.object(app.task_manager, "save_local_data") as save_mock, patch(
-            "resources.textual_ui.load_credentials",
+            "bdo_marketplace_tools.ui.app.load_credentials",
             return_value=(None, None),
         ):
             async with app.run_test(size=(100, 36)) as pilot:
@@ -2580,7 +2997,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch.object(
             app.task_manager,
             "checker",
             new=idle_checker,
@@ -2618,7 +3035,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch.object(
             app.task_manager,
             "checker",
             new=idle_checker,
@@ -2640,7 +3057,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch.object(
             app.task_manager,
             "checker",
             new=idle_checker,
@@ -2667,7 +3084,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch.object(
             app.task_manager,
             "checker",
             new=idle_checker,
@@ -2700,7 +3117,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=("user@example.com", "secret")), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")), patch.object(
             app.task_manager,
             "checker",
             new=idle_checker,
@@ -2731,7 +3148,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=("user@example.com", "secret")), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")), patch.object(
             app.task_manager,
             "checker",
             new=idle_checker,
@@ -2765,7 +3182,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         async def idle_checker():
             await asyncio.sleep(60)
 
-        with patch("resources.textual_ui.load_credentials", return_value=("user@example.com", "secret")), patch.object(
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")), patch.object(
             app.task_manager,
             "checker",
             new=idle_checker,
