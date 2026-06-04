@@ -1,7 +1,7 @@
 # Marketplace Tools
 
 [![Python](https://img.shields.io/badge/Python-3.14%2B-blue)](https://www.python.org/downloads/)
-![Version](https://img.shields.io/badge/Version-0.1.16--beta-blueviolet)
+![Version](https://img.shields.io/badge/Version-1.0.0--beta-blueviolet)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6)
 ![UI](https://img.shields.io/badge/UI-Textual-orange)
 ![License](https://img.shields.io/badge/License-MIT-green)

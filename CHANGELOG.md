@@ -10,6 +10,26 @@ threads should add an ignored pending changeset under `.changesets/` instead of 
 
 Pending changes are collected from ignored `.changesets/` files during a release pass.
 
+## 1.0.0-beta - 2026-06-04
+
+### Added
+
+- Steam compatibility reached its first release-ready milestone. Steam Account is now a second session acquisition path using the existing marketplace monitor and purchase pipeline after importing validated Central Market cookies from a visible app-owned Patchright Chrome profile.
+- Steam now supports persistent browser profiles, first-run browser setup, required-only cookie consent handling, manual Steam login/profile preparation, manual Steam/Pearl Abyss marketplace login, OAuth-return cookie capture, `/Home/AppSessionRefresh` validation, and existing session persistence through `APIHandler.save_session()`.
+- Steam reauthentication is integrated with the existing session recovery model. Startup still requires a manual refresh when the saved Steam session is expired or unknown, but after one validated Steam refresh in the current app run the visible browser flow can auto-click normal Pearl Abyss and Steam continuation buttons when available.
+- Test mode includes Steam diagnostics for auto-reauth toggling, synthetic session expiry, reauth checks, resetting Steam setup state, and clearing app-owned browser cookies without printing cookie values.
+
+### Changed
+
+- Tightened session safety around Steam support: account-mode changes stop the monitor, clear old marketplace session state, mark the app offline, reset the current-run Steam auto-reauth gate, and defer resets until active purchase chains finish when needed.
+- Steam-mode expired buy responses now run the shared browser refresh path and retry the purchase batch once after validation succeeds instead of attempting Pearl Abyss email/password login.
+- The Textual UI exposes Steam Account setup and refresh workflows from the Credentials and Session modals, keeps login-method labels consistent, persists selected account mode and Steam setup state, and separates Core versus UI event logs for clearer troubleshooting.
+- Supporting reliability work includes cookie-authoritative browser capture without arbitrary market-page stability waits, saved-session startup gating, persistent UI preferences, focused Steam/browser/session tests, and local documentation updates for Steam auth and release workflow.
+
+### Security
+
+- OTP and CAPTCHA remain manual-only, with sanitized status messages and no OTP, Steam credentials, or Steam cookies imported into the marketplace API session.
+
 ## 0.1.16-beta - 2026-06-04
 
 ### Added
