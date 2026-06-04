@@ -1,13 +1,24 @@
+<div align="center">
+
 # Marketplace Tools
 
-[![Python](https://img.shields.io/badge/Python-3.14%2B-blue)](https://www.python.org/downloads/)
-![Version](https://img.shields.io/badge/Version-1.0.0--beta-blueviolet)
-![Platform](https://img.shields.io/badge/Platform-Windows-0078D6)
-![License](https://img.shields.io/badge/License-MIT-green)
-![Steam](https://img.shields.io/badge/Steam-Supported-brightgreen)
-![Launcher](https://img.shields.io/badge/Launcher-Supported-brightgreen)
-![OTP Support](https://img.shields.io/badge/OTP%20Support-WIP-yellow)
-![Status](https://img.shields.io/badge/Status-Testing-yellow)
+<p>
+  <a href="https://www.python.org/downloads/">
+    <img alt="Python 3.14+" src="https://img.shields.io/badge/Python-3.14%2B-blue">
+  </a>
+  <img alt="Version 1.0.0-beta" src="https://img.shields.io/badge/Version-1.0.0--beta-blueviolet">
+  <img alt="Windows" src="https://img.shields.io/badge/Platform-Windows-0078D6">
+  <img alt="MIT License" src="https://img.shields.io/badge/License-MIT-green">
+</p>
+
+<p>
+  <img alt="Status: Testing" src="https://img.shields.io/badge/Status-Testing-yellow">
+  <img alt="Launcher Supported" src="https://img.shields.io/badge/Launcher-Supported-brightgreen">
+  <img alt="Steam Supported" src="https://img.shields.io/badge/Steam-Supported-brightgreen">
+  <img alt="OTP WIP" src="https://img.shields.io/badge/OTP-WIP-yellow">
+</p>
+
+</div>
 
 ![Marketplace Tools dashboard](docs/assets/dashboard.png)
 
