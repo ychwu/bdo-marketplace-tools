@@ -23,9 +23,19 @@ from market.browser_auth import (
     COOKIE_CONSENT_MANUAL,
     COOKIE_CONSENT_NOT_FOUND,
     COOKIE_CONSENT_SAVED,
+    STEAM_AUTO_LOGIN_CLICKED,
+    STEAM_AUTO_LOGIN_DISABLED,
+    STEAM_AUTO_LOGIN_MANUAL_NEEDED,
+    STEAM_AUTO_LOGIN_SKIPPED,
     STEAM_BROWSER_CHANNEL,
     _accept_required_cookie_consent_if_available,
     _browser_launch_error_message,
+    _classify_url,
+    _market_cookie_capture_ready,
+    _maybe_run_steam_auto_login,
+    _new_steam_auto_login_state,
+    _should_attempt_steam_auto_login,
+    _status_for_state,
 )
 from market.pricing import (
     CLASSIC_OUTFIT_MAX_PRICE,
@@ -267,6 +277,303 @@ class APIResultTests(unittest.TestCase):
             COOKIE_CONSENT_NOT_FOUND,
         )
         self.assertEqual(statuses, [])
+
+    def test_steam_auto_login_disabled_does_not_click_buttons(self):
+        clicked_selectors = []
+        statuses = []
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                clicked_selectors.append((self.selector, timeout))
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        result = asyncio.run(
+            _maybe_run_steam_auto_login(
+                FakePage(),
+                "pa",
+                enabled=False,
+                tracking=_new_steam_auto_login_state(),
+                status_callback=status_callback,
+            )
+        )
+
+        self.assertEqual(result, STEAM_AUTO_LOGIN_DISABLED)
+        self.assertEqual(clicked_selectors, [])
+        self.assertEqual(statuses, [])
+
+    def test_steam_auto_login_clicks_pa_steam_button(self):
+        clicked_selectors = []
+        statuses = []
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                if self.selector != "#btnSteam":
+                    raise RuntimeError("not found")
+                clicked_selectors.append((self.selector, timeout))
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        result = asyncio.run(
+            _maybe_run_steam_auto_login(
+                FakePage(),
+                "pa",
+                enabled=True,
+                tracking=_new_steam_auto_login_state(),
+                status_callback=status_callback,
+            )
+        )
+
+        self.assertEqual(result, STEAM_AUTO_LOGIN_CLICKED)
+        self.assertEqual(clicked_selectors, [("#btnSteam", 1000)])
+        self.assertEqual(statuses, [("Automatic Steam re-auth clicked Log in with Steam.", "info")])
+
+    def test_steam_auto_login_clicks_pa_steam_button_inside_frame(self):
+        clicked_selectors = []
+        statuses = []
+
+        class MissingFirstLocator:
+            async def click(self, timeout=None):
+                raise RuntimeError("not found")
+
+        class MissingLocator:
+            first = MissingFirstLocator()
+
+        class FrameFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                if self.selector != "#btnSteam":
+                    raise RuntimeError("not found")
+                clicked_selectors.append((self.selector, timeout))
+
+        class FrameLocator:
+            def __init__(self, selector):
+                self.first = FrameFirstLocator(selector)
+
+        class FakeFrame:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+
+            def locator(self, selector):
+                return FrameLocator(selector)
+
+        class FakePage:
+            url = "https://na-trade.naeu.playblackdesert.com/"
+            frames = [FakeFrame()]
+
+            def locator(self, selector):
+                return MissingLocator()
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        result = asyncio.run(
+            _maybe_run_steam_auto_login(
+                FakePage(),
+                "market",
+                enabled=True,
+                tracking=_new_steam_auto_login_state(),
+                status_callback=status_callback,
+            )
+        )
+
+        self.assertEqual(result, STEAM_AUTO_LOGIN_CLICKED)
+        self.assertEqual(clicked_selectors, [("#btnSteam", 1000)])
+        self.assertEqual(statuses, [("Automatic Steam re-auth clicked Log in with Steam.", "info")])
+
+    def test_steam_auto_login_does_not_probe_top_level_market_page_for_pa_button(self):
+        clicked_selectors = []
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                clicked_selectors.append((self.selector, timeout))
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://na-trade.naeu.playblackdesert.com/"
+            frames = []
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        result = asyncio.run(
+            _maybe_run_steam_auto_login(
+                FakePage(),
+                "market",
+                enabled=True,
+                tracking=_new_steam_auto_login_state(),
+            )
+        )
+
+        self.assertEqual(result, STEAM_AUTO_LOGIN_SKIPPED)
+        self.assertEqual(clicked_selectors, [])
+
+    def test_steam_auto_login_clicks_steam_sign_in_button(self):
+        clicked_selectors = []
+        statuses = []
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                if self.selector != "#imageLogin":
+                    raise RuntimeError("not found")
+                clicked_selectors.append((self.selector, timeout))
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://steamcommunity.com/openid/login"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        result = asyncio.run(
+            _maybe_run_steam_auto_login(
+                FakePage(),
+                "steam",
+                enabled=True,
+                tracking=_new_steam_auto_login_state(),
+                status_callback=status_callback,
+            )
+        )
+
+        self.assertEqual(result, STEAM_AUTO_LOGIN_CLICKED)
+        self.assertEqual(clicked_selectors, [("#imageLogin", 1000)])
+        self.assertEqual(statuses, [("Automatic Steam re-auth clicked Steam Sign In.", "info")])
+
+    def test_steam_auto_login_leaves_otp_status_only(self):
+        clicked_selectors = []
+        statuses = []
+        state, _is_callback = _classify_url("https://account.pearlabyss.com/en-us/Member/Login/CheckOtp")
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                clicked_selectors.append((self.selector, timeout))
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login/CheckOtp"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        result = asyncio.run(
+            _maybe_run_steam_auto_login(
+                FakePage(),
+                state,
+                enabled=True,
+                tracking=_new_steam_auto_login_state(),
+                status_callback=status_callback,
+            )
+        )
+
+        self.assertEqual(state, "otp")
+        self.assertEqual(_status_for_state(state), ("OTP required. Complete verification in the browser.", "warning"))
+        self.assertEqual(result, STEAM_AUTO_LOGIN_SKIPPED)
+        self.assertEqual(clicked_selectors, [])
+        self.assertEqual(statuses, [])
+
+    def test_steam_auto_login_missing_button_reports_manual_input_without_failing(self):
+        statuses = []
+
+        class FakeFirstLocator:
+            async def click(self, timeout=None):
+                raise RuntimeError("not found")
+
+        class FakeLocator:
+            first = FakeFirstLocator()
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+
+            def locator(self, selector):
+                return FakeLocator()
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        result = asyncio.run(
+            _maybe_run_steam_auto_login(
+                FakePage(),
+                "pa",
+                enabled=True,
+                tracking=_new_steam_auto_login_state(),
+                status_callback=status_callback,
+                now=10,
+                missing_notice_seconds=0,
+            )
+        )
+
+        self.assertEqual(result, STEAM_AUTO_LOGIN_MANUAL_NEEDED)
+        self.assertEqual(
+            statuses,
+            [("Automatic Steam re-auth is waiting for manual input on the Pearl Abyss page.", "warning")],
+        )
+
+    def test_steam_auto_login_skips_market_page_after_auth_flow_seen(self):
+        self.assertTrue(_should_attempt_steam_auto_login("market", False, False))
+        self.assertFalse(_should_attempt_steam_auto_login("market", True, False))
+        self.assertFalse(_should_attempt_steam_auto_login("market", False, True))
+        self.assertTrue(_should_attempt_steam_auto_login("pa", True, False))
+
+    def test_market_cookie_capture_allows_fast_auto_redirect_after_auth_flow(self):
+        cookies = [{"name": "anonymous-looking-cookie", "value": "ok"}]
+
+        self.assertFalse(_market_cookie_capture_ready(cookies, False, True, False))
+        self.assertTrue(_market_cookie_capture_ready(cookies, False, True, True))
+        self.assertTrue(_market_cookie_capture_ready(cookies, True, False, False))
+        self.assertFalse(_market_cookie_capture_ready(cookies, False, False, True))
 
     def test_browser_auth_launch_error_names_missing_google_chrome(self):
         message = _browser_launch_error_message(
@@ -1239,10 +1546,39 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
             await manager.login()
 
         browser_auth.assert_awaited_once()
+        self.assertFalse(browser_auth.await_args.kwargs["auto_steam_login"])
         manager.api_handler.login.assert_not_called()
         manager.api_handler.validate_and_save_imported_session.assert_awaited_once()
         self.assertTrue(manager.api_handler.login_status)
+        self.assertTrue(manager.steam_auto_reauth_enabled)
         self.assertTrue(any("Steam Account session validated and saved" in event for event in manager.events))
+        await manager.stop_login_status_checker()
+
+    async def test_initial_steam_expired_session_prompts_without_enabling_auto_reauth(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
+
+        with patch("resources.task_manager.acquire_steam_market_cookies", new=AsyncMock()) as browser_auth:
+            await manager.initial_login_check()
+
+        browser_auth.assert_not_called()
+        self.assertFalse(manager.api_handler.login_status)
+        self.assertFalse(manager.steam_auto_reauth_enabled)
+        self.assertTrue(any("Refresh Session to open the login browser" in event for event in manager.events))
+
+    async def test_initial_valid_steam_session_enables_auto_reauth_for_current_run(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.is_session_expired = AsyncMock(return_value=0)
+
+        await manager.initial_login_check()
+
+        self.assertTrue(manager.api_handler.login_status)
+        self.assertTrue(manager.steam_auto_reauth_enabled)
+        self.assertTrue(any("Saved marketplace session is valid" in event for event in manager.events))
         await manager.stop_login_status_checker()
 
     async def test_first_time_steam_refresh_prepares_profile_before_market_cookie_import(self):
@@ -1265,15 +1601,19 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         profile_setup.assert_awaited_once()
         save_prepared.assert_called_once_with(True)
         browser_auth.assert_awaited_once()
+        self.assertFalse(browser_auth.await_args.kwargs["auto_steam_login"])
         manager.api_handler.validate_and_save_imported_session.assert_awaited_once()
         self.assertTrue(manager.steam_browser_profile_prepared)
+        self.assertTrue(manager.steam_auto_reauth_enabled)
         self.assertTrue(any("Initial Steam browser setup is required" in event for event in manager.events))
         self.assertTrue(any("Initial Steam browser setup saved" in event for event in manager.events))
+        await manager.stop_login_status_checker()
 
     async def test_account_mode_change_stops_monitor_and_clears_session(self):
         manager = self.make_task_manager()
         manager.api_handler.login_status = True
         manager.purchase_submission_enabled = True
+        manager.steam_auto_reauth_enabled = True
 
         async def idle_checker():
             await asyncio.sleep(60)
@@ -1289,12 +1629,14 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(manager.purchase_submission_enabled)
         self.assertFalse(manager.api_handler.login_status)
         self.assertTrue(manager.api_handler.session_cleared)
+        self.assertFalse(manager.steam_auto_reauth_enabled)
         self.assertTrue(any("Marketplace session cleared" in event for event in manager.events))
 
     async def test_account_mode_change_during_purchase_defers_session_clear_until_chain_finishes(self):
         manager = self.make_task_manager()
         manager.api_handler.login_status = True
         manager.purchase_submission_enabled = True
+        manager.steam_auto_reauth_enabled = True
         started = asyncio.Event()
         release = asyncio.Event()
 
@@ -1321,6 +1663,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(manager.pending_auth_reset_reason)
         self.assertFalse(manager.api_handler.login_status)
         self.assertTrue(manager.api_handler.session_cleared)
+        self.assertFalse(manager.steam_auto_reauth_enabled)
         self.assertTrue(any("buy chain done" in event for event in manager.events))
         self.assertTrue(any("Marketplace session cleared" in event for event in manager.events))
 
@@ -1347,6 +1690,38 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(manager.events), 0)
 
         await manager.stop_checker()
+
+    async def test_debug_session_invalidation_enables_auto_reauth_for_online_steam_session(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.login_status = True
+
+        invalidated = manager.debug_invalidate_marketplace_session()
+
+        self.assertTrue(invalidated)
+        self.assertTrue(manager.debug_force_purchase_session_expired)
+        self.assertTrue(manager.steam_auto_reauth_enabled)
+        self.assertTrue(manager.api_handler.login_status)
+
+    async def test_debug_toggle_steam_auto_reauth_requires_test_mode_and_steam_mode(self):
+        manager = self.make_task_manager(test_mode_enabled=False)
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+
+        self.assertIsNone(manager.debug_toggle_steam_auto_reauth())
+        self.assertFalse(manager.steam_auto_reauth_enabled)
+
+        manager = self.make_task_manager(test_mode_enabled=True)
+        self.assertIsNone(manager.debug_toggle_steam_auto_reauth())
+        self.assertFalse(manager.steam_auto_reauth_enabled)
+
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        self.assertTrue(manager.debug_toggle_steam_auto_reauth())
+        self.assertTrue(manager.steam_auto_reauth_enabled)
+        self.assertFalse(manager.debug_toggle_steam_auto_reauth())
+        self.assertFalse(manager.steam_auto_reauth_enabled)
 
     async def test_debug_reauthentication_check_simulates_purchase_expiry_and_pa_relogin(self):
         manager = self.make_task_manager(test_mode_enabled=True)
@@ -1423,6 +1798,39 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("Purchase succeeded after retry" in event for event in manager.events))
         save_mock.assert_called_once()
 
+    async def test_steam_buy_expired_response_uses_enabled_auto_reauth_flow(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_auto_reauth_enabled = True
+        manager.purchase_submission_enabled = True
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
+        expired_summary = {
+            "purchase_records": [],
+            "results": [{"item_id": "10007", "result_code": 2000}],
+            "events": [{"level": "error", "message": "Login session expired."}],
+        }
+        success_summary = {
+            "purchase_records": [{"item_id": "10007", "price": 82500, "count": 1, "result_code": 0}],
+            "results": [{"item_id": "10007", "result_code": 0}],
+            "events": [{"level": "success", "message": "Purchase succeeded after auto re-auth."}],
+        }
+        manager.api_handler.buy_item = AsyncMock(side_effect=[expired_summary, success_summary])
+
+        with patch(
+            "resources.task_manager.acquire_steam_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ) as browser_auth:
+            with patch.object(manager, "save_local_data"):
+                await manager.buy_item([["10007", "1", "82500"]], adjust_pricing=False)
+
+        self.assertEqual(manager.api_handler.buy_item.await_count, 2)
+        browser_auth.assert_awaited_once()
+        self.assertTrue(browser_auth.await_args.kwargs["auto_steam_login"])
+        self.assertTrue(manager.purchase_submission_enabled)
+        self.assertTrue(any("Purchase succeeded after auto re-auth" in event for event in manager.events))
+        await manager.stop_login_status_checker()
+
     async def test_login_status_checker_combines_expired_session_with_reauth_result(self):
         manager = self.make_task_manager()
         manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
@@ -1441,13 +1849,36 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
         manager.api_handler.login = AsyncMock(return_value=1)
         manager.purchase_submission_enabled = True
+        manager.refresh_browser_session = AsyncMock(return_value=True)
 
         with patch("resources.task_manager.asyncio.sleep", new=AsyncMock(return_value=None)):
             await manager.login_status_checker()
 
         manager.api_handler.login.assert_not_called()
+        manager.refresh_browser_session.assert_not_called()
         self.assertFalse(manager.purchase_submission_enabled)
         self.assertTrue(any("Steam Account refresh required" in event for event in manager.events))
+
+    async def test_expired_steam_session_auto_reauths_when_current_run_gate_is_enabled(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_auto_reauth_enabled = True
+        manager.purchase_submission_enabled = True
+
+        async def refresh_side_effect(*args, **kwargs):
+            manager.api_handler.login_status = True
+            return True
+
+        manager.refresh_browser_session = AsyncMock(side_effect=refresh_side_effect)
+
+        recovered = await manager.handle_expired_session()
+
+        self.assertTrue(recovered)
+        manager.refresh_browser_session.assert_awaited_once_with(auto_steam_login=True)
+        self.assertTrue(manager.purchase_submission_enabled)
+        self.assertTrue(manager.api_handler.login_status)
+        self.assertTrue(any("automatic Steam Account re-authentication" in event for event in manager.events))
 
 
 class TextualAppTests(unittest.IsolatedAsyncioTestCase):
@@ -1689,17 +2120,26 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(list(app.query("#credentials-password-tile"))), 0)
                 self.assertEqual(len(list(app.query("#credentials-status-tile"))), 0)
                 setup_tile_widget = app.query_visible_one("#steam-setup-status-tile", Static)
-                self.assertEqual(setup_tile_widget.border_title, "Steam Initial Setup")
+                self.assertEqual(setup_tile_widget.border_title, "Pearl Abyss Account")
+                self.assertTrue(setup_tile_widget.display)
                 console = Console(width=100, color_system=None)
                 with console.capture() as capture:
                     console.print(setup_tile_widget.content)
                 setup_tile = capture.get()
-                self.assertIn("Complete", setup_tile)
+                self.assertIn("No account configured", setup_tile)
+                self.assertIn("No saved email", setup_tile)
                 mode_select.value = STEAM_BROWSER_MODE
                 await pilot.pause()
+                self.assertFalse(app.task_manager.uses_steam_browser_session())
+                self.assertEqual(app.api_handler.account_mode, PA_CREDENTIALS_MODE)
+                self.assertEqual(setup_tile_widget.border_title, "Steam Initial Setup")
+                self.assertTrue(setup_tile_widget.display)
+                self.assertNotIn("modal-info-clickable", setup_tile_widget.classes)
+                self.assertIn("modal-info-muted", setup_tile_widget.classes)
                 self.assertTrue(app.query_visible_one("#email-input", Input).disabled)
                 self.assertTrue(app.query_visible_one("#password-input", Input).disabled)
                 self.assertTrue(app.query_visible_one("#clear-credentials", Button).disabled)
+                self.assertFalse(app.query_visible_one("#save-credentials", Button).disabled)
                 steam_note = str(app.query_visible_one("#credentials-mode-note", Static).render())
                 self.assertIn("visible browser", steam_note)
                 self.assertIn("does not use saved email or password", steam_note)
@@ -1718,7 +2158,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app = self.make_app()
         app.task_manager.steam_browser_profile_prepared = False
 
-        async def mark_prepared():
+        async def mark_prepared(*_args, **_kwargs):
             app.task_manager.steam_browser_profile_prepared = True
             return True
 
@@ -1726,41 +2166,83 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         with patch("resources.textual_ui.load_credentials", return_value=(None, None)), patch(
             "resources.task_manager.save_account_mode",
             return_value=STEAM_BROWSER_MODE,
-        ):
+        ) as save_mode:
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.press("escape")
                 await pilot.click("#tile-credentials")
                 await pilot.pause()
 
-                setup_button = app.query_visible_one("#prepare-steam-profile", Button)
-                self.assertFalse(setup_button.display)
+                self.assertEqual(len(list(app.query("#prepare-steam-profile"))), 0)
                 setup_tile_widget = app.query_visible_one("#steam-setup-status-tile", Static)
-                self.assertEqual(setup_tile_widget.border_title, "Steam Initial Setup")
+                self.assertEqual(setup_tile_widget.border_title, "Pearl Abyss Account")
+                self.assertTrue(setup_tile_widget.display)
                 console = Console(width=100, color_system=None)
                 with console.capture() as capture:
                     console.print(setup_tile_widget.content)
                 setup_tile = capture.get()
-                self.assertIn("Incomplete", setup_tile)
+                self.assertIn("No account configured", setup_tile)
+                self.assertIn("No saved email", setup_tile)
 
                 mode_select = app.query_visible_one("#account-mode-select", Select)
                 mode_select.value = STEAM_BROWSER_MODE
                 await pilot.pause()
 
-                self.assertTrue(setup_button.display)
+                self.assertEqual(app.task_manager.account_mode, PA_CREDENTIALS_MODE)
+                self.assertEqual(setup_tile_widget.border_title, "Steam Initial Setup")
+                self.assertTrue(setup_tile_widget.display)
+                self.assertIn("modal-info-clickable", setup_tile_widget.classes)
+                self.assertNotIn("modal-info-muted", setup_tile_widget.classes)
+                self.assertTrue(app.query_visible_one("#save-credentials", Button).disabled)
                 self.assertIn("Run Steam Setup once", str(app.query_visible_one("#credentials-mode-note", Static).render()))
 
-                await pilot.click("#prepare-steam-profile")
+                await pilot.click("#steam-setup-status-tile")
                 await pilot.pause(0.2)
 
-                app.task_manager.prepare_steam_browser_profile.assert_awaited_once()
+                app.task_manager.prepare_steam_browser_profile.assert_awaited_once_with(allow_inactive_mode=True)
+                save_mode.assert_not_called()
+                self.assertEqual(app.task_manager.account_mode, PA_CREDENTIALS_MODE)
                 self.assertTrue(app.task_manager.steam_browser_profile_prepared)
-                self.assertFalse(setup_button.display)
+                self.assertTrue(setup_tile_widget.display)
+                self.assertNotIn("modal-info-clickable", setup_tile_widget.classes)
+                self.assertIn("modal-info-muted", setup_tile_widget.classes)
+                self.assertFalse(app.query_visible_one("#save-credentials", Button).disabled)
                 with console.capture() as capture:
                     console.print(app.query_visible_one("#steam-setup-status-tile", Static).content)
                 setup_tile = capture.get()
                 self.assertIn("Complete", setup_tile)
                 self.assertIn("Ready for market login", setup_tile)
                 self.assertIn("Initial Steam setup saved", app.status_message)
+
+    async def test_switching_back_to_pa_mode_reuses_saved_credentials(self):
+        app = self.make_app()
+        app.task_manager.account_mode = STEAM_BROWSER_MODE
+        app.api_handler.account_mode = STEAM_BROWSER_MODE
+        app.task_manager.steam_browser_profile_prepared = True
+
+        with patch("resources.textual_ui.load_credentials", return_value=("user@example.com", "secret")), patch(
+            "resources.textual_ui.save_credentials"
+        ) as save_mock, patch("resources.task_manager.save_account_mode", return_value=PA_CREDENTIALS_MODE):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.click("#tile-credentials")
+                await pilot.pause()
+                self.assertEqual(app.query_visible_one("#email-input", Input).value, "user@example.com")
+                self.assertTrue(app.query_visible_one("#email-input", Input).disabled)
+
+                mode_select = app.query_visible_one("#account-mode-select", Select)
+                mode_select.value = PA_CREDENTIALS_MODE
+                await pilot.pause()
+                self.assertFalse(app.query_visible_one("#email-input", Input).disabled)
+                self.assertEqual(app.query_visible_one("#email-input", Input).value, "user@example.com")
+                self.assertEqual(app.query_visible_one("#password-input", Input).value, "")
+
+                await pilot.click("#save-credentials")
+                await pilot.pause()
+
+        save_mock.assert_called_once_with("user@example.com")
+        self.assertEqual(app.task_manager.account_mode, PA_CREDENTIALS_MODE)
+        self.assertEqual(app.api_handler.email, "user@example.com")
+        self.assertEqual(app.api_handler.password, "secret")
+        self.assertIn("Credentials saved", app.status_message)
 
     async def test_buy_delay_modal_saves_valid_decimals_and_keeps_invalid_open(self):
         app = self.make_app()
@@ -1894,6 +2376,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
             async with test_app.run_test(size=(100, 36)):
                 self.assertEqual(len(list(test_app.query("#test-controls"))), 1)
                 self.assertEqual(len(list(test_app.query("#toggle-test-session"))), 1)
+                self.assertEqual(len(list(test_app.query("#toggle-auto-reauth"))), 1)
                 self.assertEqual(len(list(test_app.query("#expire-test-session"))), 1)
                 self.assertEqual(len(list(test_app.query("#run-reauth-check"))), 1)
                 self.assertEqual(len(list(test_app.query("#open-blank-browser"))), 1)
@@ -1905,12 +2388,20 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reauthentication_debug_buttons_call_test_hooks(self):
         app = self.make_app(launch_mode="test")
+        app.task_manager.debug_toggle_steam_auto_reauth = Mock(return_value=True)
         app.task_manager.debug_invalidate_marketplace_session = Mock(return_value=True)
         app.task_manager.debug_run_reauthentication_check = AsyncMock(return_value=True)
 
         with patch("resources.textual_ui.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
+                self.assertIn("Auto Reauth", str(app.query_one("#toggle-auto-reauth", Button).render()))
                 self.assertIn("Reauth Check", str(app.query_one("#run-reauth-check", Button).render()))
+
+                await pilot.click("#toggle-auto-reauth")
+                await pilot.pause(0.1)
+
+                app.task_manager.debug_toggle_steam_auto_reauth.assert_called_once()
+                self.assertIn("automatic re-authentication enabled", app.status_message)
 
                 previous_status = app.status_message
                 await pilot.click("#expire-test-session")

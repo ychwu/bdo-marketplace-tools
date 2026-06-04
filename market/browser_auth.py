@@ -39,6 +39,24 @@ COOKIEBOT_DIALOG_SELECTOR = "#CybotCookiebotDialog"
 COOKIE_CONSENT_SAVED = "saved"
 COOKIE_CONSENT_MANUAL = "manual"
 COOKIE_CONSENT_NOT_FOUND = "not_found"
+PA_STEAM_LOGIN_SELECTORS = (
+    "#btnSteam",
+    "button[data-type='steam']",
+    "button:has-text('Log in with Steam')",
+)
+STEAM_CONFIRM_LOGIN_SELECTORS = (
+    "#imageLogin",
+    "input[type='submit'][value='Sign In']",
+    "input.btn_green_white_innerfade",
+)
+STEAM_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
+STEAM_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
+BROWSER_AUTH_POLL_SECONDS = 0.25
+STEAM_AUTO_LOGIN_DISABLED = "disabled"
+STEAM_AUTO_LOGIN_CLICKED = "clicked"
+STEAM_AUTO_LOGIN_WAITING = "waiting"
+STEAM_AUTO_LOGIN_MANUAL_NEEDED = "manual_needed"
+STEAM_AUTO_LOGIN_SKIPPED = "skipped"
 
 
 class BrowserAuthError(RuntimeError):
@@ -55,6 +73,7 @@ async def acquire_steam_market_cookies(
     timeout_seconds=DEFAULT_BROWSER_AUTH_TIMEOUT_SECONDS,
     profile_path=STEAM_MARKET_PROFILE_PATH,
     start_url=AUTH_START_URL,
+    auto_steam_login=False,
 ):
     try:
         from patchright.async_api import async_playwright
@@ -65,11 +84,12 @@ async def acquire_steam_market_cookies(
 
     profile_path = Path(profile_path)
     profile_path.mkdir(parents=True, exist_ok=True)
-    await _emit_status(
-        status_callback,
-        "Opening Steam Account browser session in Chrome. Complete Steam/PA login in the browser.",
-        "info",
-    )
+    opening_message = "Opening Steam Account browser session in Chrome. Complete Steam/PA login in the browser."
+    if auto_steam_login:
+        opening_message = (
+            "Opening Steam Account browser session in Chrome. Automatic Steam re-auth will continue when possible."
+        )
+    await _emit_status(status_callback, opening_message, "info")
 
     context = None
     try:
@@ -81,7 +101,12 @@ async def acquire_steam_market_cookies(
             except Exception:
                 await _emit_status(status_callback, "Waiting for Steam/PA login in the browser.", "info")
 
-            return await _wait_for_market_cookies(context, status_callback, timeout_seconds)
+            return await _wait_for_market_cookies(
+                context,
+                status_callback,
+                timeout_seconds,
+                auto_steam_login=auto_steam_login,
+            )
     except BrowserAuthError:
         raise
     except Exception as exc:
@@ -177,11 +202,12 @@ async def open_blank_steam_browser_diagnostic(
                 pass
 
 
-async def _wait_for_market_cookies(context, status_callback, timeout_seconds):
+async def _wait_for_market_cookies(context, status_callback, timeout_seconds, *, auto_steam_login=False):
     deadline = asyncio.get_running_loop().time() + float(timeout_seconds)
     callback_seen = False
-    market_seen_at = None
+    auth_flow_seen = False
     emitted_states = set()
+    auto_login_state = _new_steam_auto_login_state()
 
     while asyncio.get_running_loop().time() < deadline:
         now = asyncio.get_running_loop().time()
@@ -194,24 +220,32 @@ async def _wait_for_market_cookies(context, status_callback, timeout_seconds):
             state, is_callback = _classify_url(getattr(page, "url", ""))
             if is_callback:
                 callback_seen = True
+            if state in {"pa", "steam", "otp"}:
+                auth_flow_seen = True
             if state == "market":
                 market_active = True
             if state and state not in emitted_states:
                 emitted_states.add(state)
                 message, level = _status_for_state(state)
                 await _emit_status(status_callback, message, level)
-        if market_active and market_seen_at is None:
-            market_seen_at = now
-        elif not market_active:
-            market_seen_at = None
-
+            auto_login_result = STEAM_AUTO_LOGIN_SKIPPED
+            if _should_attempt_steam_auto_login(state, auth_flow_seen, callback_seen):
+                auto_login_result = await _maybe_run_steam_auto_login(
+                    page,
+                    state,
+                    enabled=auto_steam_login,
+                    tracking=auto_login_state,
+                    status_callback=status_callback,
+                    now=now,
+                )
+            if auto_login_result in {STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_MANUAL_NEEDED}:
+                auth_flow_seen = True
         cookies = filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
-        market_stable = market_seen_at is not None and now - market_seen_at >= 3
-        if cookies and (callback_seen or (market_stable and _has_likely_market_auth_cookie(cookies))):
+        if _market_cookie_capture_ready(cookies, callback_seen, market_active, auth_flow_seen):
             await _emit_status(status_callback, "Marketplace cookies captured. Validating session.", "info")
             return cookies
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(BROWSER_AUTH_POLL_SECONDS)
 
     raise BrowserAuthError("Steam Account browser session timed out before Central Market cookies were captured.")
 
@@ -248,6 +282,146 @@ async def _accept_required_cookie_consent_if_available(page, status_callback=Non
             )
             return COOKIE_CONSENT_MANUAL
     return COOKIE_CONSENT_NOT_FOUND
+
+
+def _new_steam_auto_login_state():
+    return {
+        "clicked": set(),
+        "missing_started_at": {},
+        "missing_reported": set(),
+    }
+
+
+def _should_attempt_steam_auto_login(state, auth_flow_seen, callback_seen):
+    if state == "market" and (auth_flow_seen or callback_seen):
+        return False
+    return True
+
+
+async def _maybe_run_steam_auto_login(
+    page,
+    state,
+    *,
+    enabled,
+    tracking,
+    status_callback=None,
+    now=None,
+    missing_notice_seconds=STEAM_AUTO_LOGIN_MISSING_NOTICE_SECONDS,
+):
+    if not enabled:
+        return STEAM_AUTO_LOGIN_DISABLED
+
+    targets = _steam_auto_login_targets(page, state)
+    if not targets:
+        return STEAM_AUTO_LOGIN_SKIPPED
+
+    now = asyncio.get_running_loop().time() if now is None else now
+    result = STEAM_AUTO_LOGIN_SKIPPED
+    for scope, config_state in targets:
+        scope_result = await _maybe_run_steam_auto_login_target(
+            scope,
+            config_state,
+            tracking=tracking,
+            status_callback=status_callback,
+            now=now,
+            missing_notice_seconds=missing_notice_seconds,
+        )
+        if scope_result in {STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_MANUAL_NEEDED}:
+            return scope_result
+        if scope_result == STEAM_AUTO_LOGIN_WAITING:
+            result = STEAM_AUTO_LOGIN_WAITING
+
+    return result
+
+
+async def _maybe_run_steam_auto_login_target(
+    scope,
+    state,
+    *,
+    tracking,
+    status_callback,
+    now,
+    missing_notice_seconds,
+):
+    config = _steam_auto_login_config(state)
+    if config is None:
+        return STEAM_AUTO_LOGIN_SKIPPED
+
+    selector_key, selectors, clicked_message, missing_message = config
+    key = (id(scope), selector_key, getattr(scope, "url", ""))
+    if key in tracking["clicked"]:
+        return STEAM_AUTO_LOGIN_SKIPPED
+
+    if await _click_first_available_selector(scope, selectors, timeout=STEAM_AUTO_LOGIN_CLICK_TIMEOUT_MS):
+        tracking["clicked"].add(key)
+        tracking["missing_started_at"].pop(key, None)
+        await _emit_status(status_callback, clicked_message, "info")
+        return STEAM_AUTO_LOGIN_CLICKED
+
+    started_at = tracking["missing_started_at"].setdefault(key, now)
+    if now - started_at >= missing_notice_seconds and key not in tracking["missing_reported"]:
+        tracking["missing_reported"].add(key)
+        await _emit_status(status_callback, missing_message, "warning")
+        return STEAM_AUTO_LOGIN_MANUAL_NEEDED
+
+    return STEAM_AUTO_LOGIN_WAITING
+
+
+def _steam_auto_login_targets(page, state):
+    targets = []
+    seen = set()
+
+    def add_target(scope, target_state):
+        if target_state not in {"pa", "steam"}:
+            return
+        key = (id(scope), target_state)
+        if key in seen:
+            return
+        seen.add(key)
+        targets.append((scope, target_state))
+
+    add_target(page, _steam_auto_login_target_state(state))
+    for frame in getattr(page, "frames", []) or []:
+        frame_state, _is_callback = _classify_url(getattr(frame, "url", ""))
+        add_target(frame, _steam_auto_login_target_state(frame_state))
+
+    return targets
+
+
+def _steam_auto_login_target_state(state):
+    if state in {"pa", "steam"}:
+        return state
+    if state is None:
+        return "pa"
+    return None
+
+
+def _steam_auto_login_config(state):
+    if state == "pa":
+        return (
+            "pa_steam_login",
+            PA_STEAM_LOGIN_SELECTORS,
+            "Automatic Steam re-auth clicked Log in with Steam.",
+            "Automatic Steam re-auth is waiting for manual input on the Pearl Abyss page.",
+        )
+    if state == "steam":
+        return (
+            "steam_confirm_login",
+            STEAM_CONFIRM_LOGIN_SELECTORS,
+            "Automatic Steam re-auth clicked Steam Sign In.",
+            "Automatic Steam re-auth is waiting for manual input on the Steam page.",
+        )
+    return None
+
+
+async def _click_first_available_selector(page, selectors, timeout):
+    for selector in selectors:
+        try:
+            await page.locator(selector).first.click(timeout=timeout)
+            return True
+        except Exception:
+            continue
+    return False
 
 
 async def _cookiebot_dialog_hidden(page):
@@ -291,6 +465,16 @@ def _domain_applies_to_market(domain):
 
 def _has_likely_market_auth_cookie(cookies):
     return any(cookie.get("name") in LIKELY_MARKET_AUTH_COOKIE_NAMES for cookie in cookies)
+
+
+def _market_cookie_capture_ready(cookies, callback_seen, market_active, auth_flow_seen):
+    if not cookies:
+        return False
+    if callback_seen:
+        return True
+    if not market_active:
+        return False
+    return bool(auth_flow_seen or _has_likely_market_auth_cookie(cookies))
 
 
 def _classify_url(url):

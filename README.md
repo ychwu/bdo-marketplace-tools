@@ -30,7 +30,7 @@ Python CLI app for monitoring the *Black Desert Online* marketplace through auth
 ### Technical Features
 
 - Marketplace API integration for listing scans, wallet data, session refresh, authentication, and `BuyItem` purchase requests.
-- Tier 1 Steam browser-session support through a visible user-driven Patchright Chrome login and cookie import into the existing marketplace session.
+- Steam Account browser-session support through a visible Patchright Chrome login, cookie import into the existing marketplace session, and current-run gated automatic Steam re-authentication after the first validated refresh.
 - Concurrent marketplace polling with isolated unauthenticated `requests.Session` clients for male and female outfit categories, preserving connection reuse without sharing authenticated state.
 - Custom Huffman response decoder for packed marketplace payloads, optimized for repeated high-frequency scans.
 - Async monitor orchestration around blocking HTTP calls using `asyncio.to_thread()`, randomized polling windows, capped retry backoff, task lifecycle guards, and crash-aware monitor state.
@@ -51,7 +51,7 @@ This project is currently undergoing a codebase rewrite and Textual UI migration
 Last verified compatibility: July 14, 2025.
 
 Pearl Abyss launcher accounts are supported through saved email/password credentials.
-Steam accounts have experimental Tier 1 support through a visible browser session: choose `Steam Account` in the Credentials dashboard modal, then use `Refresh Session` and complete Steam/PA auth manually in the browser. Steam mode does not use saved email/password credentials. OTP pages may be completed manually in that browser; the app does not store OTP values or submit OTP silently.
+Steam accounts are supported through a visible browser session: choose `Steam Account` in the Credentials dashboard modal, complete Steam Initial Setup once, then use `Refresh Session` from the dashboard. Startup expired Steam sessions still require a manual browser refresh first. After one successful validated Steam refresh in the current app run, later refreshes can automatically click the normal PA/Steam continuation buttons when available. Steam mode does not use saved email/password credentials. OTP pages may be completed manually in that browser; the app does not store OTP values or submit OTP silently.
 
 ## Running the App
 

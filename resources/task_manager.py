@@ -85,6 +85,7 @@ class BackgroundTasks:
         self.account_mode = load_account_mode()
         self.api_handler.account_mode = self.account_mode
         self.steam_browser_profile_prepared = load_steam_browser_profile_prepared()
+        self.steam_auto_reauth_enabled = False
         self.checker_task = None
         self.single_item_test_checker_task = None
         self.login_checker_task = None
@@ -216,6 +217,8 @@ class BackgroundTasks:
 
     def set_account_mode(self, mode):
         normalized = normalize_account_mode(mode)
+        if normalized != self.account_mode:
+            self.steam_auto_reauth_enabled = False
         self.account_mode = save_account_mode(normalized)
         self.api_handler.account_mode = self.account_mode
         return self.account_mode
@@ -226,12 +229,14 @@ class BackgroundTasks:
         self.account_mode = save_account_mode(normalized)
         self.api_handler.account_mode = self.account_mode
         if normalized != previous_mode:
+            self.steam_auto_reauth_enabled = False
             await self.reset_authentication_context("Login method changed")
             return True
         return False
 
     async def reset_authentication_context(self, reason):
         await self.stop_login_status_checker()
+        self.steam_auto_reauth_enabled = False
         self.purchase_submission_enabled = False
 
         if self.purchase_in_progress:
@@ -257,6 +262,7 @@ class BackgroundTasks:
 
     def _clear_marketplace_session(self, reason):
         self.pending_auth_reset_reason = None
+        self.steam_auto_reauth_enabled = False
         self.purchase_submission_enabled = False
         self.simulated_session_enabled = False
         if hasattr(self.api_handler, "clear_session"):
@@ -501,7 +507,16 @@ class BackgroundTasks:
 
         self.simulated_session_enabled = False
         self.debug_force_purchase_session_expired = True
+        if self.uses_steam_browser_session() and getattr(self.api_handler, "login_status", False):
+            self.steam_auto_reauth_enabled = True
         return True
+
+    def debug_toggle_steam_auto_reauth(self):
+        if not self.test_mode_enabled or not self.uses_steam_browser_session():
+            return None
+
+        self.steam_auto_reauth_enabled = not self.steam_auto_reauth_enabled
+        return self.steam_auto_reauth_enabled
 
     async def debug_run_reauthentication_check(self):
         if not self.test_mode_enabled:
@@ -526,8 +541,8 @@ class BackgroundTasks:
         self.add_event("Blank browser diagnostic closed.", "info")
         return True
 
-    async def prepare_steam_browser_profile(self):
-        if not self.uses_steam_browser_session():
+    async def prepare_steam_browser_profile(self, *, allow_inactive_mode=False):
+        if not self.uses_steam_browser_session() and not allow_inactive_mode:
             self.add_event("Switch to Steam Account before running initial Steam setup.", "warning")
             return False
 
@@ -726,6 +741,8 @@ class BackgroundTasks:
 
         if status == 0:
             self.api_handler.login_status = True
+            if self.uses_steam_browser_session():
+                self.steam_auto_reauth_enabled = True
             self.add_event("Existing marketplace session is valid.", "success")
             self.start_login_status_checker()
             return
@@ -771,7 +788,7 @@ class BackgroundTasks:
             else:
                 self.add_event("Login failed.", "error")
 
-    async def refresh_browser_session(self, session_check_error=None):
+    async def refresh_browser_session(self, session_check_error=None, *, auto_steam_login=None):
         if self.steam_browser_profile_needs_setup():
             self.add_event("Initial Steam browser setup is required before the market login refresh.", "warning")
             prepared = await self.prepare_steam_browser_profile()
@@ -779,16 +796,24 @@ class BackgroundTasks:
                 self.api_handler.login_status = False
                 return False
 
+        if auto_steam_login is None:
+            auto_steam_login = self.steam_auto_reauth_enabled
+
         if session_check_error:
             self.add_event(
                 f"Session check failed: {session_check_error}. Opening Steam Account browser session.",
                 "warning",
             )
+        elif auto_steam_login:
+            self.add_event("Opening Steam Account browser session for automatic re-authentication.", "info")
         else:
             self.add_event("Opening Steam Account browser session for manual login.", "info")
 
         try:
-            cookies = await acquire_steam_market_cookies(status_callback=self._browser_auth_status)
+            cookies = await acquire_steam_market_cookies(
+                status_callback=self._browser_auth_status,
+                auto_steam_login=auto_steam_login,
+            )
         except BrowserAuthError as exc:
             self.api_handler.login_status = False
             self.add_event(f"Steam Account refresh failed: {exc}", "error")
@@ -803,7 +828,15 @@ class BackgroundTasks:
 
         if session_valid:
             self.api_handler.login_status = True
-            self.add_event("Steam Account session validated and saved.", "success")
+            newly_enabled = not self.steam_auto_reauth_enabled
+            self.steam_auto_reauth_enabled = True
+            if newly_enabled:
+                self.add_event(
+                    "Steam Account session validated and saved. Automatic Steam re-auth enabled for this app run.",
+                    "success",
+                )
+            else:
+                self.add_event("Steam Account session validated and saved.", "success")
             self.start_login_status_checker()
             return True
 
@@ -824,6 +857,8 @@ class BackgroundTasks:
 
         if status == 0:
             self.api_handler.login_status = True
+            if self.uses_steam_browser_session():
+                self.steam_auto_reauth_enabled = True
             self.start_login_status_checker()
             self.add_event("Saved marketplace session is valid.", "success")
         else:
@@ -860,6 +895,12 @@ class BackgroundTasks:
     async def handle_expired_session(self):
         self.api_handler.login_status = False
         if self.uses_steam_browser_session():
+            if self.steam_auto_reauth_enabled:
+                self.add_event("Session expired. Attempting automatic Steam Account re-authentication.", "warning")
+                if await self.refresh_browser_session(auto_steam_login=True):
+                    self.add_event("Session expired. Re-authentication successful.", "success")
+                    return True
+
             if self.purchase_submission_enabled:
                 self.purchase_submission_enabled = False
                 self.add_event(

@@ -497,7 +497,7 @@ class BuyDelayModal(DashboardModalScreen):
 class CredentialsModal(DashboardModalScreen):
     def compose(self) -> ComposeResult:
         app = self.app
-        _, _, _, email, _ = app.credential_state()
+        _, _, _, email, _ = app.pa_credential_state()
         mode_options = [(label, value) for value, label in ACCOUNT_MODE_LABELS.items()]
         with Vertical(classes="modal-card") as dialog:
             dialog.border_title = "Credentials"
@@ -509,13 +509,12 @@ class CredentialsModal(DashboardModalScreen):
             )
             yield Static(id="credentials-mode-note", classes="modal-note")
             with Horizontal(id="credentials-summary", classes="modal-summary-row"):
-                yield Static(id="steam-setup-status-tile", classes="modal-info-tile modal-info-muted modal-info-wide")
+                yield SteamSetupTile()
             yield Label("Email", id="credentials-email-label")
             yield Input(value=email or "", placeholder="account@example.com", id="email-input")
             yield Label("Password", id="credentials-password-label")
             yield Input(password=True, placeholder="Stored in OS keyring", id="password-input")
             with Horizontal(classes="modal-actions"):
-                yield Button("Steam Setup", id="prepare-steam-profile", variant="primary")
                 yield Button("Save", id="save-credentials", variant="primary")
                 yield Button("Clear", id="clear-credentials", variant="error")
                 yield Button("Close", id="close-modal")
@@ -599,6 +598,21 @@ class PollingPresetTile(Static):
         self.border_title = title
 
     def on_click(self) -> None:
+        self.post_message(self.Pressed(self))
+
+
+class SteamSetupTile(Static):
+    class Pressed(Message):
+        def __init__(self, tile: "SteamSetupTile") -> None:
+            super().__init__()
+            self.tile = tile
+
+    def __init__(self) -> None:
+        super().__init__("", id="steam-setup-status-tile", classes="modal-info-tile modal-info-muted modal-info-wide")
+
+    def on_click(self) -> None:
+        if "modal-info-clickable" not in self.classes:
+            return
         self.post_message(self.Pressed(self))
 
 
@@ -861,6 +875,7 @@ class MarketplaceToolsApp(App[None]):
                     with VerticalScroll(id="test-controls"):
                         yield Button("Add Test Log", id="add-test-log", compact=True)
                         yield Button("Toggle Test Session", id="toggle-test-session", compact=True)
+                        yield Button("Auto Reauth", id="toggle-auto-reauth", compact=True)
                         yield Button("Expire Session", id="expire-test-session", compact=True)
                         yield Button("Reauth Check", id="run-reauth-check", compact=True)
                         yield Button("Blank Browser", id="open-blank-browser", compact=True)
@@ -1046,15 +1061,17 @@ class MarketplaceToolsApp(App[None]):
                 return "Steam Setup", "Initial setup needed", "warning", None, None
             return "Steam Account", "Browser login", "info", None, None
 
+        state, detail, level, email, password = self.pa_credential_state()
+        self.api_handler.email = email
+        self.api_handler.password = password
+        return state, detail, level, email, password
+
+    def pa_credential_state(self) -> tuple[str, str, str, Optional[str], Optional[str]]:
         try:
             email, password = load_credentials()
         except CredentialStoreError as exc:
-            self.api_handler.email = None
-            self.api_handler.password = None
             return "Credential Store Error", str(exc), "error", None, None
 
-        self.api_handler.email = email
-        self.api_handler.password = password
         if email and password:
             return "Set", mask_email(email), "success", email, password
         if email:
@@ -1387,6 +1404,7 @@ class MarketplaceToolsApp(App[None]):
             return
 
         state, detail, _, _, password = self.credential_state()
+        pa_state, pa_detail, pa_level, pa_email, _pa_password = self.pa_credential_state()
         password_detail = "Stored in OS keyring" if password else "Not set"
         setup_complete = self.task_manager.steam_browser_profile_prepared
         setup_state = "Complete" if setup_complete else "Incomplete"
@@ -1404,14 +1422,24 @@ class MarketplaceToolsApp(App[None]):
             summary.update(table)
             return
 
-        self.refresh_modal_tile(
-            "steam-setup-status-tile",
-            "Steam Initial Setup",
-            setup_state,
-            setup_detail,
-            setup_level,
-            True,
-        )
+        if self.selected_account_mode() == STEAM_BROWSER_MODE:
+            self.refresh_modal_tile(
+                "steam-setup-status-tile",
+                "Steam Initial Setup",
+                setup_state,
+                setup_detail,
+                setup_level,
+                True,
+            )
+        else:
+            self.refresh_modal_tile(
+                "steam-setup-status-tile",
+                "Pearl Abyss Account",
+                pa_detail,
+                "Saved email" if pa_email else "No saved email",
+                pa_level,
+                pa_email is not None,
+            )
         self.refresh_credentials_mode_controls()
 
     def selected_account_mode(self) -> str:
@@ -1443,9 +1471,13 @@ class MarketplaceToolsApp(App[None]):
             )
 
         try:
-            setup_button = self.query_visible_one("#prepare-steam-profile", Button)
-            setup_button.display = steam_mode and not self.task_manager.steam_browser_profile_prepared
-            setup_button.disabled = not steam_mode
+            setup_tile = self.query_visible_one("#steam-setup-status-tile", SteamSetupTile)
+            if steam_mode and not self.task_manager.steam_browser_profile_prepared:
+                setup_tile.add_class("modal-info-clickable")
+                setup_tile.remove_class("modal-info-muted")
+            else:
+                setup_tile.remove_class("modal-info-clickable")
+                setup_tile.add_class("modal-info-muted")
         except Exception:
             pass
 
@@ -1454,6 +1486,20 @@ class MarketplaceToolsApp(App[None]):
                 self.query_visible_one(f"#{widget_id}").disabled = steam_mode
             except Exception:
                 pass
+        if not steam_mode:
+            try:
+                _state, _detail, _level, saved_email, _password = self.pa_credential_state()
+                email_input = self.query_visible_one("#email-input", Input)
+                if saved_email and not email_input.value.strip():
+                    email_input.value = saved_email
+            except Exception:
+                pass
+        try:
+            self.query_visible_one("#save-credentials", Button).disabled = (
+                steam_mode and not self.task_manager.steam_browser_profile_prepared
+            )
+        except Exception:
+            pass
 
     async def mount_settings(self, content: Container) -> None:
         table = Table.grid(padding=(0, 2))
@@ -1735,6 +1781,8 @@ class MarketplaceToolsApp(App[None]):
             await self.add_test_log()
         elif button_id == "toggle-test-session":
             await self.toggle_test_session()
+        elif button_id == "toggle-auto-reauth":
+            await self.toggle_test_steam_auto_reauth()
         elif button_id == "expire-test-session":
             await self.expire_test_session()
         elif button_id == "run-reauth-check":
@@ -1799,9 +1847,18 @@ class MarketplaceToolsApp(App[None]):
             return
         self.refresh_polling_preset_tiles()
 
+    def on_steam_setup_tile_pressed(self, event: SteamSetupTile.Pressed) -> None:
+        event.stop()
+        self.run_worker(
+            self.prepare_steam_browser_profile(),
+            name="prepare-steam-profile",
+            group="actions",
+            exclusive=True,
+        )
+
     async def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "account-mode-select":
-            self.refresh_credentials_mode_controls()
+            self.refresh_credentials_summary()
             return
 
         if event.select.id != "delay-select":
@@ -2043,6 +2100,20 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_modal_summaries()
         await self.return_to_dashboard()
 
+    async def toggle_test_steam_auto_reauth(self) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        enabled = self.task_manager.debug_toggle_steam_auto_reauth()
+        if enabled is None:
+            self.set_status("Select Steam Account before toggling automatic re-authentication.", "warning")
+        elif enabled:
+            self.set_status("Steam automatic re-authentication enabled for this test run.", "success")
+        else:
+            self.set_status("Steam automatic re-authentication disabled for this test run.", "warning")
+        self.refresh_modal_summaries()
+        await self.return_to_dashboard()
+
     async def expire_test_session(self) -> None:
         if not self._debug_action_allowed():
             return
@@ -2188,10 +2259,8 @@ class MarketplaceToolsApp(App[None]):
             self.set_status("Select Steam Account before running setup.", "warning")
             return
 
-        await self.task_manager.change_account_mode(STEAM_BROWSER_MODE)
-        self.sync_mode_switches(False)
         self.set_status("Opening initial Steam browser setup.")
-        prepared = await self.task_manager.prepare_steam_browser_profile()
+        prepared = await self.task_manager.prepare_steam_browser_profile(allow_inactive_mode=True)
         if prepared:
             self.set_status("Initial Steam setup saved. Refresh Session can now use the market login.")
         else:
@@ -2214,6 +2283,11 @@ class MarketplaceToolsApp(App[None]):
             return False
 
         if account_mode == STEAM_BROWSER_MODE:
+            if not self.task_manager.steam_browser_profile_prepared:
+                self.set_status("Complete Steam initial setup before saving Steam Account.", "warning")
+                self.refresh_credentials_summary()
+                return False
+
             await self.task_manager.change_account_mode(account_mode)
             self.sync_mode_switches(False)
             self.set_status(
@@ -2227,12 +2301,16 @@ class MarketplaceToolsApp(App[None]):
 
         email = self.query_visible_one("#email-input", Input).value.strip()
         password = self.query_visible_one("#password-input", Input).value
+        _saved_state, _saved_detail, _saved_level, saved_email, saved_password = self.pa_credential_state()
         if not email:
             self.set_status("Email field cannot be empty.", "warning")
             return False
         if "@" not in email or "." not in email.rsplit("@", 1)[-1]:
             self.set_status("Enter a valid email address.", "warning")
             return False
+        saved_email_matches = bool(saved_email and saved_email.strip().lower() == email.strip().lower())
+        if not password and saved_email_matches and saved_password:
+            password = saved_password
         if not password:
             self.set_status("Password field cannot be empty.", "warning")
             return False
@@ -2245,7 +2323,10 @@ class MarketplaceToolsApp(App[None]):
         self.api_handler.email = email
         self.api_handler.password = password
         try:
-            save_credentials(email, password)
+            if password == saved_password and saved_email_matches:
+                save_credentials(email)
+            else:
+                save_credentials(email, password)
         except CredentialStoreError as exc:
             self.task_manager.add_event(f"Unable to save credentials: {exc}", "error")
             self.set_status("Unable to save credentials.")
