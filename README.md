@@ -1,9 +1,11 @@
 # Marketplace Tools
 
-![Python](https://img.shields.io/badge/Python-3.x-blue)
+[![Python](https://img.shields.io/badge/Python-3.14%2B-blue)](https://www.python.org/downloads/)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6)
 ![UI](https://img.shields.io/badge/UI-Textual-orange)
-![Default Mode](https://img.shields.io/badge/Default-Watch--Only-green)
+![License](https://img.shields.io/badge/License-MIT-green)
+![Steam Support](https://img.shields.io/badge/Steam%20Support-WIP-yellow)
+![OTP Support](https://img.shields.io/badge/OTP%20Support-WIP-yellow)
 ![Status](https://img.shields.io/badge/Status-Rewrite%20In%20Progress-yellow)
 
 ![Marketplace Tools dashboard](docs/assets/dashboard.png)
