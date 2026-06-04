@@ -8,6 +8,7 @@ from bdo_marketplace_tools.market.api_handler import DEFAULT_PURCHASE_DELAY_BOUN
 from bdo_marketplace_tools.market.browser_auth import (
     BrowserAuthError,
     acquire_steam_market_cookies,
+    clear_steam_browser_profile_cookies,
     open_blank_steam_browser_diagnostic,
     prepare_steam_browser_profile,
 )
@@ -600,6 +601,28 @@ class BackgroundTasks:
             return False
 
         self.add_event("Blank browser diagnostic closed.", "info")
+        return True
+
+    def debug_clear_steam_initial_setup_status(self):
+        if not self.test_mode_enabled:
+            return False
+
+        self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(False)
+        self.steam_auto_reauth_enabled = False
+        self.add_event("Initial Steam setup status reset to incomplete.", "warning")
+        return True
+
+    async def debug_clear_steam_browser_cookies(self):
+        if not self.test_mode_enabled:
+            return False
+
+        try:
+            cleared_count = await clear_steam_browser_profile_cookies()
+        except BrowserAuthError as exc:
+            self.add_event(f"Steam browser cookie clear failed: {exc}", "error")
+            return False
+
+        self.add_event(f"Steam browser cookies cleared from the app-owned profile ({cleared_count} cookies).", "warning")
         return True
 
     async def prepare_steam_browser_profile(self, *, allow_inactive_mode=False):

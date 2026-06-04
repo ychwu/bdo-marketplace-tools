@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import random
 from typing import Optional
 
@@ -404,6 +404,8 @@ class MarketplaceToolsApp(App[None]):
                         yield Button("Expire Session", id="expire-test-session", compact=True)
                         yield Button("Reauth Check", id="run-reauth-check", compact=True)
                         yield Button("Blank Browser", id="open-blank-browser", compact=True)
+                        yield Button("Reset Steam Setup", id="reset-steam-setup", compact=True)
+                        yield Button("Clear Browser Cookies", id="clear-browser-cookies", compact=True)
                         yield Button("Start Test Scan", id="start-test-monitor", compact=True)
                         yield Button("Start Test Buy", id="start-test-buy", compact=True)
                         yield Button("Stop Test Scan", id="stop-test-monitor", compact=True)
@@ -1433,6 +1435,16 @@ class MarketplaceToolsApp(App[None]):
                     group="actions",
                     exclusive=True,
                 )
+        elif button_id == "reset-steam-setup":
+            await self.reset_test_steam_setup_status()
+        elif button_id == "clear-browser-cookies":
+            if self._debug_action_allowed():
+                self.run_worker(
+                    self.clear_test_browser_cookies(),
+                    name="clear-browser-cookies",
+                    group="actions",
+                    exclusive=True,
+                )
         elif button_id == "start-test-monitor":
             await self.start_single_item_test_monitor()
         elif button_id == "start-test-buy":
@@ -1821,6 +1833,28 @@ class MarketplaceToolsApp(App[None]):
         else:
             self.set_status("Blank Chrome diagnostic browser failed.")
         self.refresh_live_widgets()
+
+    async def reset_test_steam_setup_status(self) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        if self.task_manager.debug_clear_steam_initial_setup_status():
+            self.set_status("Initial Steam setup status reset.", "warning")
+            self.refresh_credentials_summary()
+            self.refresh_settings_summary()
+            self.refresh_live_widgets()
+        else:
+            self.set_status("Initial Steam setup status reset failed.", "warning")
+
+    async def clear_test_browser_cookies(self) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        cleared = await self.task_manager.debug_clear_steam_browser_cookies()
+        if cleared:
+            self.set_status("Browser cookies cleared from the Steam profile.", "warning")
+        else:
+            self.set_status("Browser cookie clear failed.", "warning")
 
     async def start_single_item_test_monitor(self, allow_purchase: bool = False) -> None:
         if not self._debug_action_allowed():

@@ -10,6 +10,21 @@ threads should add an ignored pending changeset under `.changesets/` instead of 
 
 Pending changes are collected from ignored `.changesets/` files during a release pass.
 
+## 0.1.16-beta - 2026-06-04
+
+### Added
+
+- Steam Initial Setup now opens Steam's official login page and closes automatically after observing a logged-in Steam browser profile without calling Steam APIs or storing Steam credentials.
+- Test mode now includes controls to reset Steam Initial Setup status and clear app-owned browser profile cookies without printing cookie values in the event log.
+
+### Fixed
+
+- Steam Initial Setup now closes promptly when no Cookiebot consent banner is present instead of waiting through slow missing-button timeouts.
+
+### Docs
+
+- Added a README version badge and clarified that README edits and badge updates are reserved for explicit user requests or the dedicated release thread.
+
 ## 0.1.15-beta - 2026-06-04
 
 ### Added

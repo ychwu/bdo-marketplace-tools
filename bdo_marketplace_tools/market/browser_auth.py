@@ -12,11 +12,18 @@ from bdo_marketplace_tools.storage.paths import (
 
 AUTH_START_URL = f"{TRADE_URL}/"
 STEAM_PROFILE_PREP_START_URL = "https://www.naeu.playblackdesert.com/en-US"
+STEAM_PROFILE_PREP_LOGIN_URL = "https://store.steampowered.com/login"
+STEAM_STORE_URL = "https://store.steampowered.com/"
+STEAM_COMMUNITY_URL = "https://steamcommunity.com/"
 MARKET_COOKIE_URLS = (
     f"{TRADE_URL}/",
     f"{GAME_TRADE_URL}/",
 )
 MARKET_COOKIE_HOSTS = tuple(urlparse(url).hostname for url in MARKET_COOKIE_URLS)
+STEAM_PROFILE_COOKIE_URLS = (
+    STEAM_STORE_URL,
+    STEAM_COMMUNITY_URL,
+)
 OTP_ROUTE_MARKERS = (
     "/en-us/Member/Login/CheckOtp",
     "/en-us/Member/Login/LoginOtpAuth",
@@ -29,6 +36,7 @@ LIKELY_MARKET_AUTH_COOKIE_NAMES = {
     "__RequestVerificationToken",
 }
 DEFAULT_BROWSER_AUTH_TIMEOUT_SECONDS = 900
+DEFAULT_STEAM_PROFILE_SETUP_TIMEOUT_SECONDS = 900
 STEAM_BROWSER_CHANNEL = "chrome"
 COOKIEBOT_REQUIRED_CONSENT_SELECTORS = (
     "#CybotCookiebotDialogBodyButtonDecline",
@@ -37,6 +45,8 @@ COOKIEBOT_REQUIRED_CONSENT_SELECTORS = (
     "button:has-text('Accept Required')",
 )
 COOKIEBOT_DIALOG_SELECTOR = "#CybotCookiebotDialog"
+COOKIEBOT_DIALOG_DETECTION_TIMEOUT_MS = 1500
+COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS = 1500
 COOKIE_CONSENT_SAVED = "saved"
 COOKIE_CONSENT_MANUAL = "manual"
 COOKIE_CONSENT_NOT_FOUND = "not_found"
@@ -53,11 +63,19 @@ STEAM_CONFIRM_LOGIN_SELECTORS = (
 STEAM_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
 STEAM_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
 BROWSER_AUTH_POLL_SECONDS = 0.25
+STEAM_PROFILE_SETUP_POLL_SECONDS = 0.5
 STEAM_AUTO_LOGIN_DISABLED = "disabled"
 STEAM_AUTO_LOGIN_CLICKED = "clicked"
 STEAM_AUTO_LOGIN_WAITING = "waiting"
 STEAM_AUTO_LOGIN_MANUAL_NEEDED = "manual_needed"
 STEAM_AUTO_LOGIN_SKIPPED = "skipped"
+STEAM_LOGIN_COOKIE_NAMES = {
+    "steamLoginSecure",
+}
+STEAM_LOGGED_IN_SELECTORS = (
+    "#account_pulldown",
+    ".user_avatar",
+)
 
 
 class BrowserAuthError(RuntimeError):
@@ -125,6 +143,8 @@ async def prepare_steam_browser_profile(
     *,
     profile_path=STEAM_MARKET_PROFILE_PATH,
     start_url=STEAM_PROFILE_PREP_START_URL,
+    steam_login_url=STEAM_PROFILE_PREP_LOGIN_URL,
+    timeout_seconds=DEFAULT_STEAM_PROFILE_SETUP_TIMEOUT_SECONDS,
 ):
     try:
         from patchright.async_api import async_playwright
@@ -137,7 +157,7 @@ async def prepare_steam_browser_profile(
     profile_path.mkdir(parents=True, exist_ok=True)
     await _emit_status(
         status_callback,
-        "Opening initial Steam browser setup in Chrome. Let the Black Desert site load, then close Chrome.",
+        "Opening initial Steam browser setup in Chrome. The window will close automatically when setup is saved.",
         "info",
     )
 
@@ -154,7 +174,20 @@ async def prepare_steam_browser_profile(
                 consent_result = COOKIE_CONSENT_MANUAL
 
             if consent_result == COOKIE_CONSENT_MANUAL:
-                await _wait_for_all_pages_closed(context)
+                await _wait_for_cookie_consent_manual_completion(page, context)
+
+            await _emit_status(
+                status_callback,
+                "Opening Steam login. Complete Steam login in the browser; the window will close once detected.",
+                "info",
+            )
+            try:
+                await page.goto(steam_login_url, wait_until="domcontentloaded", timeout=60000)
+            except Exception:
+                await _emit_status(status_callback, "Waiting for Steam login in the browser.", "info")
+            await _wait_for_steam_profile_login(context, status_callback, timeout_seconds)
+    except BrowserAuthError:
+        raise
     except Exception as exc:
         raise BrowserAuthError(_browser_launch_error_message(exc)) from exc
     finally:
@@ -193,6 +226,41 @@ async def open_blank_steam_browser_diagnostic(
                 await context.new_page()
 
             await _wait_for_all_pages_closed(context)
+    except Exception as exc:
+        raise BrowserAuthError(_browser_launch_error_message(exc)) from exc
+    finally:
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
+
+
+async def clear_steam_browser_profile_cookies(
+    *,
+    profile_path=STEAM_MARKET_PROFILE_PATH,
+):
+    try:
+        from patchright.async_api import async_playwright
+    except ImportError as exc:  # pragma: no cover - depends on optional runtime
+        raise BrowserAuthUnavailable(
+            "Patchright is not installed. Install requirements before clearing browser cookies."
+        ) from exc
+
+    profile_path = Path(profile_path)
+    profile_path.mkdir(parents=True, exist_ok=True)
+
+    context = None
+    try:
+        async with async_playwright() as playwright:
+            context = await _launch_persistent_chrome_context(playwright, profile_path)
+            if not context.pages:
+                await context.new_page()
+            cookies = await context.cookies()
+            await context.clear_cookies()
+            return len(cookies)
+    except BrowserAuthError:
+        raise
     except Exception as exc:
         raise BrowserAuthError(_browser_launch_error_message(exc)) from exc
     finally:
@@ -265,10 +333,67 @@ async def _wait_for_all_pages_closed(context):
         await asyncio.sleep(1)
 
 
+async def _wait_for_cookie_consent_manual_completion(page, context):
+    while True:
+        pages = [open_page for open_page in context.pages if not _page_is_closed(open_page)]
+        if not pages:
+            raise BrowserAuthError("Initial Steam setup was closed before the browser profile was prepared.")
+        if _page_is_closed(page):
+            raise BrowserAuthError("Initial Steam setup page was closed before the browser profile was prepared.")
+        if await _cookiebot_dialog_hidden(page):
+            return
+        await asyncio.sleep(STEAM_PROFILE_SETUP_POLL_SECONDS)
+
+
+async def _wait_for_steam_profile_login(context, status_callback, timeout_seconds):
+    deadline = asyncio.get_running_loop().time() + float(timeout_seconds)
+    while asyncio.get_running_loop().time() < deadline:
+        pages = [page for page in context.pages if not _page_is_closed(page)]
+        if not pages:
+            raise BrowserAuthError("Steam setup browser closed before Steam login was detected.")
+
+        if _has_steam_login_cookie(await context.cookies(list(STEAM_PROFILE_COOKIE_URLS))):
+            await _emit_status(status_callback, "Steam login detected in the browser profile.", "info")
+            return
+
+        for page in pages:
+            if await _steam_store_logged_in_dom_ready(page):
+                await _emit_status(status_callback, "Steam login detected in the browser profile.", "info")
+                return
+
+        await asyncio.sleep(STEAM_PROFILE_SETUP_POLL_SECONDS)
+
+    raise BrowserAuthError("Steam setup timed out before Steam login was detected.")
+
+
+def _has_steam_login_cookie(cookies):
+    for cookie in cookies or []:
+        if not isinstance(cookie, dict):
+            continue
+        if cookie.get("name") in STEAM_LOGIN_COOKIE_NAMES:
+            return True
+    return False
+
+
+async def _steam_store_logged_in_dom_ready(page):
+    if urlparse(getattr(page, "url", "") or "").hostname != "store.steampowered.com":
+        return False
+    for selector in STEAM_LOGGED_IN_SELECTORS:
+        try:
+            if await page.locator(selector).first.is_visible(timeout=500):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 async def _accept_required_cookie_consent_if_available(page, status_callback=None):
+    if not await _cookiebot_dialog_visible(page):
+        return COOKIE_CONSENT_NOT_FOUND
+
     for selector in COOKIEBOT_REQUIRED_CONSENT_SELECTORS:
         try:
-            await page.locator(selector).first.click(timeout=8000)
+            await page.locator(selector).first.click(timeout=COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS)
         except Exception:
             continue
 
@@ -283,6 +408,17 @@ async def _accept_required_cookie_consent_if_available(page, status_callback=Non
             )
             return COOKIE_CONSENT_MANUAL
     return COOKIE_CONSENT_NOT_FOUND
+
+
+async def _cookiebot_dialog_visible(page):
+    try:
+        await page.locator(COOKIEBOT_DIALOG_SELECTOR).wait_for(
+            state="visible",
+            timeout=COOKIEBOT_DIALOG_DETECTION_TIMEOUT_MS,
+        )
+        return True
+    except Exception:
+        return False
 
 
 def _new_steam_auto_login_state():

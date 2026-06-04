@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import json
 import requests
 import tempfile
@@ -21,6 +21,8 @@ from bdo_marketplace_tools.market.api_handler import (
 )
 from bdo_marketplace_tools.market.browser_auth import (
     BrowserAuthError,
+    COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS,
+    COOKIEBOT_DIALOG_DETECTION_TIMEOUT_MS,
     COOKIE_CONSENT_MANUAL,
     COOKIE_CONSENT_NOT_FOUND,
     COOKIE_CONSENT_SAVED,
@@ -29,16 +31,24 @@ from bdo_marketplace_tools.market.browser_auth import (
     STEAM_AUTO_LOGIN_MANUAL_NEEDED,
     STEAM_AUTO_LOGIN_SKIPPED,
     STEAM_BROWSER_CHANNEL,
+    STEAM_COMMUNITY_URL,
+    STEAM_LOGIN_COOKIE_NAMES,
     STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH,
     STEAM_MARKET_PROFILE_PATH,
+    STEAM_PROFILE_COOKIE_URLS,
+    STEAM_STORE_URL,
     _accept_required_cookie_consent_if_available,
     _browser_launch_error_message,
     _classify_url,
+    clear_steam_browser_profile_cookies,
+    _has_steam_login_cookie,
     _market_cookie_capture_ready,
     _maybe_run_steam_auto_login,
     _new_steam_auto_login_state,
     _should_attempt_steam_auto_login,
     _status_for_state,
+    _steam_store_logged_in_dom_ready,
+    _wait_for_steam_profile_login,
 )
 from bdo_marketplace_tools.market.pricing import (
     CLASSIC_OUTFIT_MAX_PRICE,
@@ -243,8 +253,17 @@ class APIResultTests(unittest.TestCase):
             asyncio.run(_accept_required_cookie_consent_if_available(FakePage(), status_callback=status_callback)),
             COOKIE_CONSENT_SAVED,
         )
-        self.assertEqual(clicked_selectors, [("#CybotCookiebotDialogBodyButtonDecline", 8000)])
-        self.assertEqual(wait_calls, [("#CybotCookiebotDialog", "hidden", 3000)])
+        self.assertEqual(
+            clicked_selectors,
+            [("#CybotCookiebotDialogBodyButtonDecline", COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS)],
+        )
+        self.assertEqual(
+            wait_calls,
+            [
+                ("#CybotCookiebotDialog", "visible", COOKIEBOT_DIALOG_DETECTION_TIMEOUT_MS),
+                ("#CybotCookiebotDialog", "hidden", 3000),
+            ],
+        )
         self.assertEqual(statuses, [("Required cookie consent saved in the Steam browser profile.", "info")])
 
     def test_cookiebot_required_consent_reports_click_when_dialog_remains(self):
@@ -258,6 +277,8 @@ class APIResultTests(unittest.TestCase):
             first = FakeFirstLocator()
 
             async def wait_for(self, state=None, timeout=None):
+                if state == "visible":
+                    return None
                 raise RuntimeError("dialog still visible")
 
         class FakePage:
@@ -277,14 +298,19 @@ class APIResultTests(unittest.TestCase):
         )
 
     def test_cookiebot_required_consent_returns_not_found_silently(self):
+        clicked_selectors = []
         statuses = []
 
         class FakeFirstLocator:
             async def click(self, timeout=None):
+                clicked_selectors.append(timeout)
                 raise RuntimeError("not found")
 
         class FakeLocator:
             first = FakeFirstLocator()
+
+            async def wait_for(self, state=None, timeout=None):
+                raise RuntimeError("dialog not visible")
 
         class FakePage:
             def locator(self, selector):
@@ -297,7 +323,153 @@ class APIResultTests(unittest.TestCase):
             asyncio.run(_accept_required_cookie_consent_if_available(FakePage(), status_callback=status_callback)),
             COOKIE_CONSENT_NOT_FOUND,
         )
+        self.assertEqual(clicked_selectors, [])
         self.assertEqual(statuses, [])
+
+    def test_steam_profile_login_detection_uses_auth_cookie_names_only(self):
+        self.assertEqual(STEAM_LOGIN_COOKIE_NAMES, {"steamLoginSecure"})
+        self.assertTrue(
+            _has_steam_login_cookie(
+                [
+                    {"name": "sessionid", "domain": ".steampowered.com"},
+                    {"name": "steamLoginSecure", "domain": ".steampowered.com"},
+                ]
+            )
+        )
+        self.assertFalse(
+            _has_steam_login_cookie(
+                [
+                    {"name": "sessionid", "domain": ".steampowered.com"},
+                    {"name": "browserid", "domain": ".steampowered.com"},
+                ]
+            )
+        )
+
+    def test_steam_profile_login_detection_observes_local_cookie_store(self):
+        statuses = []
+        cookie_url_calls = []
+
+        class FakePage:
+            url = STEAM_STORE_URL
+
+            def is_closed(self):
+                return False
+
+        class FakeContext:
+            pages = [FakePage()]
+
+            async def cookies(self, urls):
+                cookie_url_calls.append(tuple(urls))
+                return [{"name": "steamLoginSecure", "domain": ".steampowered.com"}]
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        asyncio.run(_wait_for_steam_profile_login(FakeContext(), status_callback, timeout_seconds=1))
+
+        self.assertEqual(cookie_url_calls, [STEAM_PROFILE_COOKIE_URLS])
+        self.assertEqual(
+            statuses,
+            [("Steam login detected in the browser profile.", "info")],
+        )
+        self.assertNotIn("api.steampowered.com", "".join(cookie_url_calls[0]))
+        self.assertIn(STEAM_STORE_URL, cookie_url_calls[0])
+        self.assertIn(STEAM_COMMUNITY_URL, cookie_url_calls[0])
+
+    def test_steam_profile_login_detection_observes_loaded_store_dom(self):
+        statuses = []
+        checked_selectors = []
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def is_visible(self, timeout=None):
+                checked_selectors.append((self.selector, timeout))
+                return self.selector == "#account_pulldown"
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = STEAM_STORE_URL
+
+            def is_closed(self):
+                return False
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        class FakeContext:
+            pages = [FakePage()]
+
+            async def cookies(self, urls):
+                return []
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        asyncio.run(_wait_for_steam_profile_login(FakeContext(), status_callback, timeout_seconds=1))
+
+        self.assertEqual(checked_selectors, [("#account_pulldown", 500)])
+        self.assertEqual(statuses, [("Steam login detected in the browser profile.", "info")])
+
+    def test_steam_profile_logged_in_dom_ignores_non_store_hosts(self):
+        class FakePage:
+            url = "https://steamcommunity.com/"
+
+            def locator(self, selector):
+                raise AssertionError("Non-store pages should not be queried for Store DOM markers.")
+
+        self.assertFalse(asyncio.run(_steam_store_logged_in_dom_ready(FakePage())))
+
+    def test_clear_steam_browser_profile_cookies_clears_persistent_context(self):
+        class FakePlaywrightManager:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeContext:
+            pages = []
+
+            def __init__(self):
+                self.cleared = False
+                self.closed = False
+                self.new_page_called = False
+
+            async def new_page(self):
+                self.new_page_called = True
+                return object()
+
+            async def cookies(self):
+                return [
+                    {"name": "steamLoginSecure", "value": "secret"},
+                    {"name": "sessionid", "value": "also-secret"},
+                ]
+
+            async def clear_cookies(self):
+                self.cleared = True
+
+            async def close(self):
+                self.closed = True
+
+        fake_context = FakeContext()
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "patchright.async_api.async_playwright",
+            return_value=FakePlaywrightManager(),
+        ), patch(
+            "bdo_marketplace_tools.market.browser_auth._launch_persistent_chrome_context",
+            new=AsyncMock(return_value=fake_context),
+        ):
+            cleared_count = asyncio.run(clear_steam_browser_profile_cookies(profile_path=Path(temp_dir)))
+
+        self.assertEqual(cleared_count, 2)
+        self.assertTrue(fake_context.new_page_called)
+        self.assertTrue(fake_context.cleared)
+        self.assertTrue(fake_context.closed)
 
     def test_steam_auto_login_disabled_does_not_click_buttons(self):
         clicked_selectors = []
@@ -2063,6 +2235,57 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(manager.api_handler.login_status)
         self.assertTrue(any("Blank browser diagnostic closed" in event for event in manager.events))
 
+    async def test_debug_clear_steam_initial_setup_status_is_test_mode_only(self):
+        manager = self.make_task_manager(test_mode_enabled=False)
+        manager.steam_browser_profile_prepared = True
+        manager.steam_auto_reauth_enabled = True
+
+        with patch("bdo_marketplace_tools.services.task_manager.save_steam_browser_profile_prepared") as save_setup:
+            self.assertFalse(manager.debug_clear_steam_initial_setup_status())
+
+        save_setup.assert_not_called()
+        self.assertTrue(manager.steam_browser_profile_prepared)
+        self.assertTrue(manager.steam_auto_reauth_enabled)
+
+        manager = self.make_task_manager(test_mode_enabled=True)
+        manager.steam_browser_profile_prepared = True
+        manager.steam_auto_reauth_enabled = True
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.save_steam_browser_profile_prepared",
+            return_value=False,
+        ) as save_setup:
+            self.assertTrue(manager.debug_clear_steam_initial_setup_status())
+
+        save_setup.assert_called_once_with(False)
+        self.assertFalse(manager.steam_browser_profile_prepared)
+        self.assertFalse(manager.steam_auto_reauth_enabled)
+        self.assertTrue(any("Initial Steam setup status reset" in event for event in manager.events))
+
+    async def test_debug_clear_steam_browser_cookies_clears_profile_without_logging_values(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.clear_steam_browser_profile_cookies",
+            new=AsyncMock(return_value=3),
+        ) as cookie_clear:
+            result = await manager.debug_clear_steam_browser_cookies()
+
+        self.assertTrue(result)
+        cookie_clear.assert_awaited_once()
+        self.assertTrue(any("Steam browser cookies cleared" in event for event in manager.events))
+        self.assertTrue(any("3 cookies" in event for event in manager.events))
+        self.assertFalse(any("steamLoginSecure" in event for event in manager.events))
+
+    async def test_debug_clear_steam_browser_cookies_is_test_mode_only(self):
+        manager = self.make_task_manager(test_mode_enabled=False)
+
+        with patch("bdo_marketplace_tools.services.task_manager.clear_steam_browser_profile_cookies") as cookie_clear:
+            result = await manager.debug_clear_steam_browser_cookies()
+
+        self.assertFalse(result)
+        cookie_clear.assert_not_called()
+
     async def test_steam_buy_expired_response_refreshes_browser_and_retries_once(self):
         manager = self.make_task_manager()
         manager.account_mode = STEAM_BROWSER_MODE
@@ -2932,6 +3155,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(list(test_app.query("#expire-test-session"))), 1)
                 self.assertEqual(len(list(test_app.query("#run-reauth-check"))), 1)
                 self.assertEqual(len(list(test_app.query("#open-blank-browser"))), 1)
+                self.assertEqual(len(list(test_app.query("#reset-steam-setup"))), 1)
+                self.assertEqual(len(list(test_app.query("#clear-browser-cookies"))), 1)
                 self.assertEqual(len(list(test_app.query("#start-test-monitor"))), 1)
                 self.assertEqual(len(list(test_app.query("#start-test-buy"))), 1)
                 self.assertEqual(len(list(test_app.query("#stop-test-monitor"))), 1)
@@ -2981,6 +3206,28 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
                 app.task_manager.debug_open_blank_browser_diagnostic.assert_awaited_once()
                 self.assertIn("Blank Chrome diagnostic browser closed", app.status_message)
+
+    async def test_steam_setup_debug_buttons_call_test_hooks(self):
+        app = self.make_app(launch_mode="test")
+        app.task_manager.debug_clear_steam_initial_setup_status = Mock(return_value=True)
+        app.task_manager.debug_clear_steam_browser_cookies = AsyncMock(return_value=True)
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                self.assertIn("Reset Steam Setup", str(app.query_one("#reset-steam-setup", Button).render()))
+                self.assertIn("Clear Browser Cookies", str(app.query_one("#clear-browser-cookies", Button).render()))
+
+                await pilot.click("#reset-steam-setup")
+                await pilot.pause(0.1)
+
+                app.task_manager.debug_clear_steam_initial_setup_status.assert_called_once()
+                self.assertIn("Initial Steam setup status reset", app.status_message)
+
+                await pilot.click("#clear-browser-cookies")
+                await pilot.pause(0.2)
+
+                app.task_manager.debug_clear_steam_browser_cookies.assert_awaited_once()
+                self.assertIn("Browser cookies cleared", app.status_message)
 
     async def test_single_item_test_monitor_sidebar_controls_use_separate_task(self):
         app = self.make_app(launch_mode="test")
