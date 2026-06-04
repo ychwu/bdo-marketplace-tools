@@ -2209,7 +2209,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("1")
                 self.assertEqual(app.current_view, "settings")
                 self.assertFalse(app.query_one("#banner").display)
-                self.assertTrue(app.query_one("#screen-title").display)
+                self.assertFalse(app.query_one("#screen-title").display)
+                self.assertEqual(app.query_one("#settings-summary", Static).border_title, "App Settings")
                 await pilot.press("2")
                 self.assertEqual(app.current_view, "wallet")
                 self.assertIn(("wallet", "Inventory"), app.NAV_ITEMS)
@@ -2238,6 +2239,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertGreaterEqual(app.query_one("#event-log").size.height, 6)
                 self.assertLessEqual(app.query_one("#sidebar").region.width, 23)
                 self.assertEqual(app.query_one("#event-log").styles.border_title_color, Color(216, 211, 200))
+                self.assertEqual(app.query_one("#event-log").styles.scrollbar_color, Color(52, 52, 52))
+                self.assertEqual(app.query_one("#event-log").styles.scrollbar_size_vertical, 1)
 
     async def test_credentials_validation_and_password_masking(self):
         app = self.make_app()
@@ -2293,15 +2296,105 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.status_message, "")
                 save_mock.assert_not_called()
 
-    async def test_saved_credentials_are_labeled_set_not_authenticated_ready(self):
+    async def test_saved_credentials_are_labeled_pa_account_not_authenticated_ready(self):
         app = self.make_app()
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")):
             async with app.run_test(size=(100, 36)):
                 credential_status, credential_detail, credential_level, _, _ = app.credential_state()
 
-        self.assertEqual(credential_status, "Set")
+        self.assertEqual(credential_status, "PA Account")
         self.assertEqual(credential_detail, "us**@example.com")
-        self.assertEqual(credential_level, "success")
+        self.assertEqual(credential_level, "gold")
+
+    async def test_credentials_modal_clear_pa_account_action_clears_saved_credentials(self):
+        app = self.make_app()
+        stored_credentials = [("user@example.com", "secret")]
+
+        def load_saved_credentials():
+            return stored_credentials[0]
+
+        def clear_saved_credentials():
+            stored_credentials[0] = (None, None)
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", side_effect=load_saved_credentials), patch(
+            "bdo_marketplace_tools.ui.app.clear_credentials",
+            side_effect=clear_saved_credentials,
+        ) as clear_mock:
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.click("#tile-credentials")
+                await pilot.pause()
+
+                clear_action = app.query_visible_one("#clear-credentials", Button)
+                self.assertTrue(clear_action.display)
+                self.assertEqual(clear_action.styles.color, Color(209, 106, 106))
+                await pilot.click("#clear-credentials")
+                await pilot.pause(0.1)
+
+        clear_mock.assert_called_once()
+        self.assertIsNone(app.api_handler.email)
+        self.assertIsNone(app.api_handler.password)
+        self.assertIn("Saved credentials cleared", app.status_message)
+
+    async def test_session_modal_pa_credentials_guard_controls_refresh_button(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.click("#tile-session")
+                await pilot.pause()
+
+                self.assertEqual(type(app.screen_stack[-1]).__name__, "SessionModal")
+                self.assertEqual(len(list(app.screen_stack[-1].query("#session-status-tile"))), 0)
+                self.assertFalse(app.query_visible_one("#refresh-session", Button).disabled)
+                self.assertFalse(app.query_visible_one("#refresh-session", Button).can_focus)
+                console = Console(width=100, color_system=None)
+                with console.capture() as capture:
+                    console.print(app.query_visible_one("#session-account-tile", Static).content)
+                session_account_text = capture.get()
+                with console.capture() as capture:
+                    console.print(app.query_visible_one("#session-credentials-tile", Static).content)
+                session_credentials_text = capture.get()
+                self.assertIn("us**@example.com", session_account_text)
+                self.assertIn("Set", session_credentials_text)
+                self.assertNotIn("us**@example.com", session_credentials_text)
+
+                await pilot.click("#refresh-session")
+                await pilot.pause()
+                self.assertEqual(type(app.screen_stack[-1]).__name__, "SessionRefreshConfirmScreen")
+
+    async def test_online_session_widget_uses_shared_authenticated_detail(self):
+        pa_app = self.make_app()
+        pa_app.api_handler.login_status = True
+        pa_app.api_handler.email = "user@example.com"
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=("user@example.com", "secret")):
+            async with pa_app.run_test(size=(100, 36)):
+                self.assertEqual(pa_app.session_status_state(), ("ONLINE", "Authenticated", "success"))
+                session_tile = [
+                    item for item in pa_app.dashboard_tile_data(pa_app.dashboard_snapshot()) if item[0] == "session"
+                ][0]
+                self.assertEqual(session_tile[2], "Authenticated")
+
+        steam_app = self.make_app()
+        steam_app.task_manager.account_mode = STEAM_BROWSER_MODE
+        steam_app.api_handler.account_mode = STEAM_BROWSER_MODE
+        steam_app.api_handler.login_status = True
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with steam_app.run_test(size=(100, 36)):
+                self.assertEqual(steam_app.session_status_state(), ("ONLINE", "Authenticated", "success"))
+                session_tile = [
+                    item for item in steam_app.dashboard_tile_data(steam_app.dashboard_snapshot()) if item[0] == "session"
+                ][0]
+                self.assertEqual(session_tile[2], "Authenticated")
+
+    async def test_login_refresh_without_pa_credentials_does_not_log_backend_warning(self):
+        app = self.make_app()
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)):
+                await app.login_refresh()
+
+        self.assertEqual(list(app.task_manager.events), [])
+        self.assertIn("Add Pearl Abyss credentials", app.status_message)
 
     async def test_app_settings_clear_saved_session_button_resets_marketplace_session(self):
         app = self.make_app()
@@ -2313,6 +2406,11 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("1")
                 self.assertEqual(app.current_view, "settings")
                 self.assertEqual(len(list(app.query("#clear-saved-session"))), 1)
+                self.assertIsInstance(app.query_one("#clear-saved-session"), ModalAction)
+                self.assertEqual(str(app.query_one("#clear-saved-session").styles.background), "Color(0, 0, 0, a=0)")
+                self.assertEqual(app.query_one("#session-debug-panel").border_title, "Session Debug")
+                self.assertEqual(len(list(app.query("#session-debug-panel Button"))), 0)
+                self.assertEqual(len(list(app.query("#settings-summary Button"))), 0)
 
                 await pilot.click("#clear-saved-session")
                 await pilot.pause(0.1)
@@ -2350,7 +2448,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Buy Delay", rendered_tiles)
                 self.assertIn("Runtime", rendered_tiles)
                 self.assertIn("No account", rendered_tiles)
-                self.assertIn("Marketplace auth", rendered_tiles)
+                self.assertIn("Refresh required", rendered_tiles)
                 self.assertIn("15-30s", rendered_tiles)
                 self.assertIn("Slow", rendered_tiles)
                 self.assertIn("1-2.5s", rendered_tiles)
@@ -2383,6 +2481,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertEqual(len(list(app.screen_stack[-1].query("#password-input"))), 0)
+                self.assertEqual(len(list(app.screen_stack[-1].query("#clear-credentials"))), 1)
                 await pilot.click("#credential-action-tile")
                 await pilot.pause()
                 self.assertTrue(app.query_visible_one("#password-input", Input).password)
@@ -2436,7 +2535,16 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.click("#tile-session")
                 await pilot.pause()
                 self.assertEqual(app.current_view, "dashboard")
-                self.assertEqual(type(app.screen_stack[-1]).__name__, "SessionRefreshConfirmScreen")
+                self.assertEqual(type(app.screen_stack[-1]).__name__, "SessionModal")
+                self.assertEqual(len(list(app.screen_stack[-1].query("#session-status-tile"))), 0)
+                self.assertTrue(app.query_visible_one("#refresh-session", Button).disabled)
+                self.assertFalse(app.query_visible_one("#refresh-session", Button).can_focus)
+                console = Console(width=100, color_system=None)
+                with console.capture() as capture:
+                    console.print(app.query_visible_one("#session-credentials-tile", Static).content)
+                session_credentials_text = capture.get()
+                self.assertIn("Missing", session_credentials_text)
+                self.assertIn("Open Credentials first", session_credentials_text)
                 await pilot.press("escape")
                 await pilot.click("#tile-success")
                 self.assertEqual(app.current_view, "dashboard")
@@ -2493,8 +2601,23 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.api_handler.account_mode, STEAM_BROWSER_MODE)
                 self.assertIn("Login method set to Steam Account", app.status_message)
                 self.assertEqual(app.credential_state()[0], "Steam Account")
-                self.assertEqual(app.session_status_state(), ("OFFLINE", "Refresh required", "warning"))
+                self.assertEqual(app.credential_state()[2], "steam")
+                self.assertEqual(app.session_status_state(), ("OFFLINE", "Refresh required", "error"))
+                self.assertFalse(app.query_visible_one("#clear-credentials", Button).display)
                 self.assertEqual(type(app.screen_stack[-1]).__name__, "CredentialsModal")
+
+                await pilot.press("escape")
+                await pilot.click("#tile-session")
+                await pilot.pause()
+                self.assertEqual(type(app.screen_stack[-1]).__name__, "SessionModal")
+                self.assertEqual(len(list(app.screen_stack[-1].query("#session-status-tile"))), 0)
+                self.assertFalse(app.query_visible_one("#refresh-session", Button).disabled)
+                with console.capture() as capture:
+                    console.print(app.query_visible_one("#session-credentials-tile", Static).content)
+                steam_session_tile = capture.get()
+                self.assertIn("Initial Setup", str(app.query_visible_one("#session-credentials-tile", Static).border_title))
+                self.assertIn("Complete", steam_session_tile)
+                self.assertIn("Ready for market login", steam_session_tile)
 
     async def test_credentials_modal_shows_initial_steam_setup_only_until_profile_prepared(self):
         app = self.make_app()
@@ -2702,6 +2825,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("WIP", str(app.query_one("#wallet-wip-note", Static).content))
                 self.assertEqual(app.query_one("#wallet-wip-note", Static).styles.margin.top, 1)
                 self.assertIsInstance(app.query_one("#refresh-wallet"), ModalAction)
+                self.assertEqual(str(app.query_one("#refresh-wallet").styles.background), "Color(0, 0, 0, a=0)")
                 self.assertEqual(list(app.query("#wallet-actions Button")), [])
 
                 await pilot.click("#refresh-wallet")
@@ -2729,6 +2853,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(STATUS_STYLES["error"], "bold rgb(209,106,106)")
                 self.assertEqual(STATUS_STYLES["success"], "bold rgb(126,184,138)")
                 self.assertEqual(STATUS_STYLES["info"], "bold rgb(232,229,220)")
+                self.assertEqual(STATUS_STYLES["steam"], "bold rgb(19,100,151)")
+                self.assertEqual(STATUS_STYLES["gold"], "bold rgb(218,177,86)")
 
     async def test_sidebar_test_log_button_adds_dashboard_event(self):
         app = self.make_app(launch_mode="test")

@@ -9,7 +9,7 @@
 ![Marketplace Tools dashboard](docs/assets/dashboard.png)
 
 
-Python CLI app for monitoring the *Black Desert Online* marketplace through authenticated HTTP/API requests. It maintains a persistent marketplace session, continuously checks for outfit listings at a custom polling interval, handles long-running monitoring sessions with custom built re-authentication workflow, and executes buy-order requests as soon as matching items become available, in millieseconds.
+Python CLI app for monitoring the *Black Desert Online* marketplace through authenticated HTTP/API requests. It maintains a persistent marketplace session, continuously checks for outfit listings at a custom polling interval, handles long-running monitoring sessions with a custom built re-authentication workflow, and executes buy-order requests as soon as matching items become available, in milliseconds.
 
 
 ## Features
@@ -23,7 +23,7 @@ Python CLI app for monitoring the *Black Desert Online* marketplace through auth
 - Custom silver spend cap per session, stopping future purchases if cap is met.
 - Tracks current session's outfit detections, successful purchases, and silver spent. 
 - Tracks lifetime silver spent, and successful purchases.
-- Provides dashboard event logs with separate Core and UI views for technical monitor/session events versus interface confirmations.
+- Provides dashboard event logs with separate Core and UI views for technical monitor/session events versus interface confirmations, with each stream keeping the latest 20 entries.
 - Allows saved marketplace session cookies to be cleared from App Settings for a fresh login/session.
 - Remembers applied UI choices such as login method, polling speed, buy delay, spend cap, watch/buy mode, and event-log view across restarts.
 - Provides a Marketplace Inventory WIP view for checking stored silver, Value Pack state, and marketplace inventory data.
@@ -41,7 +41,7 @@ Python CLI app for monitoring the *Black Desert Online* marketplace through auth
 - Safety-gated purchase pipeline with explicit buy-mode confirmation, spend-cap enforcement, configurable per-item buy delay, session-expiration recovery, and one-time retry on expired marketplace sessions.
 - Structured purchase result parsing that separates fulfilled purchases from pre-order placements, records actual execution prices, and maps known marketplace result codes into actionable event-log messages.
 - Resilient network and response validation for timeouts, malformed JSON, unexpected API shapes, invalid listing rows, stale pricing, duplicate orders, and unavailable items.
-- Textual-based terminal dashboard with live runtime metrics, modal control flows, wallet/status views, test-mode-only simulation controls, and headless UI workflow tests.
+- Textual-based terminal dashboard with live runtime metrics, modal control flows, inventory/status views, test-mode-only simulation controls, and headless UI workflow tests.
 - Focused unit coverage for listing parsing, pricing conversion, spend caps, session refresh behavior, purchase accounting, runtime file initialization, and dashboard workflows.
 
 ## Project Status
@@ -54,11 +54,27 @@ App/version metadata lives in `bdo_marketplace_tools/version.py` and is copied i
 
 Versioning rule:
 
-- Bump `APP_VERSION` for user-facing behavior, API/session handling, purchase flow, storage, or troubleshooting changes.
+- Ordinary implementation threads do not bump `APP_VERSION`.
+- Ordinary implementation threads record meaningful pending changes in ignored `.changesets/` files.
+- A dedicated release/versioning thread decides whether the collected changes are patch, minor, or major.
+- The release thread updates `APP_VERSION`, moves pending changes into the tracked root `CHANGELOG.md`, runs tests, and clears the consumed `.changesets/` files.
 - Bump `SETTINGS_SCHEMA_VERSION` only when the shape or meaning of `data/app_settings.json` changes.
-- Update `agent/CHANGELOG.md` for every behavior, API, storage, auth/session, or UI workflow change.
-- Update README or local API docs when the change affects users, setup, endpoint behavior, auth flow, runtime files, or troubleshooting.
+- Update README or local API docs when a change affects users, setup, endpoint behavior, auth flow, runtime files, or troubleshooting.
 - Never include cookies, passwords, request tokens, or raw sensitive session data in version notes.
+
+Changeset format:
+
+```md
+---
+type: fixed
+scope: session
+bump: patch
+---
+
+Short user-facing summary of the pending change.
+```
+
+Recommended `type` values are `added`, `changed`, `fixed`, `security`, `docs`, and `internal`. Recommended `bump` values are `patch`, `minor`, `major`, or `none`.
 
 ## Supported Versions
 
@@ -104,7 +120,7 @@ Known problematic result codes:
 - `resultCode=30`: identical order already exists. This has been observed with `resultMsg=eErrNoAlreadyReservationDay`.
 - `resultCode=34`: item unavailable, already taken, or the request would create a duplicate pre-order.
 - `resultCode=-14`: price mismatch. This can happen when PA decide to change max outfit prices. needs updating if that's the case.
-- `resultCode=2000`: marketplace login session expired upon buy attempt. The app attempts to refresh/re-authenticate and re buy the item.
+- `resultCode=2000`: marketplace login session expired upon buy attempt. The app attempts to refresh/re-authenticate and retry the item once.
 
 Unknown purchase codes are reported as `resultCode {code}` in the event log so they can be documented after a new capture.
 

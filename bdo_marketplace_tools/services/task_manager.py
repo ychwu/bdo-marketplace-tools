@@ -40,6 +40,7 @@ LOCAL_DATA_PATH = LOCAL_STATS_PATH
 DEFAULT_LOCAL_DATA = DEFAULT_LOCAL_STATS
 DEBUG_OUTFIT_LISTING = [["debug-premium-outfit", "1", "2020000000"]]
 MAX_ERROR_BACKOFF_MULTIPLIER = 6
+EVENT_LOG_LIMIT = 20
 SIMULATED_SESSION_EMAIL = "test-session@example.local"
 
 
@@ -89,9 +90,9 @@ class BackgroundTasks:
         elif self.delay not in self.delay_choices:
             self.delay = "3"
         self.purchase_delay_bounds = tuple(ui_settings["buy_delay"]["range"])
-        self.events = deque(maxlen=9)
-        self.core_events = deque(maxlen=9)
-        self.ui_events = deque(maxlen=9)
+        self.events = deque(maxlen=EVENT_LOG_LIMIT)
+        self.core_events = deque(maxlen=EVENT_LOG_LIMIT)
+        self.ui_events = deque(maxlen=EVENT_LOG_LIMIT)
         self.event_log_view = ui_settings.get("event_log_view", "core")
         self.purchase_submission_enabled = bool(ui_settings["buy_mode"])
         self.max_spend = ui_settings["spend_cap"]

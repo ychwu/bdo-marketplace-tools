@@ -5,7 +5,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Select, Static, Switch
 
 from bdo_marketplace_tools.storage.app_settings import ACCOUNT_MODE_LABELS
-from bdo_marketplace_tools.ui.display import COLOR_BRAND
+from bdo_marketplace_tools.ui.display import COLOR_BRAND, COLOR_ERROR
 from bdo_marketplace_tools.ui.widgets import ModalAction, PollingPresetTile, SteamSetupTile
 
 
@@ -179,6 +179,21 @@ class DashboardModalScreen(ModalScreen[None]):
         color: #d8d3c8;
     }
 
+    #clear-credentials {
+        border: round __COLOR_ERROR__;
+        color: __COLOR_ERROR__;
+    }
+
+    #clear-credentials:hover {
+        border: round __COLOR_ERROR__;
+        color: #f2c0c0;
+    }
+
+    #clear-credentials:focus {
+        border: round __COLOR_ERROR__;
+        color: __COLOR_ERROR__;
+    }
+
     .modal-action-tile {
         width: 18;
         height: 3;
@@ -252,7 +267,7 @@ class DashboardModalScreen(ModalScreen[None]):
     .modal-card Switch.-on .switch--slider {
         color: __COLOR_BRAND__;
     }
-    """.replace("__COLOR_BRAND__", COLOR_BRAND)
+    """.replace("__COLOR_BRAND__", COLOR_BRAND).replace("__COLOR_ERROR__", COLOR_ERROR)
 
     def close_modal(self) -> None:
         self.dismiss(None)
@@ -416,6 +431,7 @@ class CredentialsModal(DashboardModalScreen):
             with Horizontal(id="credentials-summary", classes="modal-summary-row"):
                 yield SteamSetupTile()
             with Horizontal(classes="modal-actions"):
+                yield Button("Clear PA Account", id="clear-credentials", variant="error")
                 yield Button("Close", id="close-modal")
 
 
@@ -445,11 +461,16 @@ class SessionModal(DashboardModalScreen):
             dialog.border_title = "Session"
             yield Static("Marketplace Session", classes="modal-heading")
             with Horizontal(id="session-summary", classes="modal-summary-row"):
-                yield Static(id="session-status-tile", classes="modal-info-tile modal-info-muted")
-                yield Static(id="session-account-tile", classes="modal-info-tile modal-info-muted")
+                yield Static(id="session-account-tile", classes="modal-info-tile modal-info-muted modal-info-wide")
+            with Horizontal(id="session-credentials-row", classes="modal-summary-row"):
+                yield Static(id="session-credentials-tile", classes="modal-info-tile modal-info-muted modal-info-wide")
             with Horizontal(classes="modal-actions"):
-                yield Button("Refresh Session", id="refresh-session", variant="primary")
-                yield Button("Close", id="close-modal")
+                refresh_button = Button("Refresh Session", id="refresh-session")
+                refresh_button.can_focus = False
+                yield refresh_button
+                close_button = Button("Close", id="close-modal")
+                close_button.can_focus = False
+                yield close_button
 
 
 class SessionRefreshConfirmScreen(ModalScreen[bool]):

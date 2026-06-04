@@ -135,6 +135,23 @@ class MarketplaceToolsApp(App[None]):
         margin-bottom: 1;
     }
 
+    .settings-panel {
+        border: round #3a3a3a;
+        border-title-color: #d8d3c8;
+        border-title-style: bold;
+        padding: 1;
+        margin-bottom: 1;
+    }
+
+    .settings-note {
+        color: __COLOR_TEXT_MUTED__;
+        margin-bottom: 1;
+    }
+
+    #settings-actions {
+        height: auto;
+    }
+
     .row {
         height: auto;
         margin-bottom: 1;
@@ -214,6 +231,15 @@ class MarketplaceToolsApp(App[None]):
         border: round #3a3a3a;
         border-title-color: #d8d3c8;
         border-title-style: bold;
+        scrollbar-size-vertical: 1;
+        scrollbar-size-horizontal: 1;
+        scrollbar-color: #343434;
+        scrollbar-color-hover: #4a4a4a;
+        scrollbar-color-active: #5f5f5f;
+        scrollbar-background: #111111;
+        scrollbar-background-hover: #111111;
+        scrollbar-background-active: #111111;
+        scrollbar-corner-color: #111111;
     }
 
     #event-log-toolbar {
@@ -272,13 +298,13 @@ class MarketplaceToolsApp(App[None]):
         content-align: center middle;
         border: round #d8d3c8;
         color: #d8d3c8;
-        background: #171717;
+        background: transparent;
     }
 
     .modal-action-tile:hover {
         border: round __COLOR_BRAND__;
         color: __COLOR_BRAND__;
-        background: #171717;
+        background: transparent;
     }
 
     .stats-section-title {
@@ -569,7 +595,7 @@ class MarketplaceToolsApp(App[None]):
             self.api_handler.password = None
             if self.task_manager.steam_browser_profile_needs_setup():
                 return "Steam Setup", "Initial setup needed", "warning", None, None
-            return "Steam Account", "Browser login", "info", None, None
+            return "Steam Account", "Browser login", "steam", None, None
 
         state, detail, level, email, password = self.pa_credential_state()
         self.api_handler.email = email
@@ -583,7 +609,7 @@ class MarketplaceToolsApp(App[None]):
             return "Credential Store Error", str(exc), "error", None, None
 
         if email and password:
-            return "Set", mask_email(email), "success", email, password
+            return "PA Account", mask_email(email), "gold", email, password
         if email:
             return "Password Needed", mask_email(email), "warning", email, password
         return "Not Set", "No account configured", "error", email, password
@@ -601,11 +627,11 @@ class MarketplaceToolsApp(App[None]):
             return "TEST", "Simulated auth", "warning"
         if self.task_manager.uses_steam_browser_session():
             if self.api_handler.login_status:
-                return "ONLINE", "Steam Account", "success"
-            return "OFFLINE", "Refresh required", "warning"
+                return "ONLINE", "Authenticated", "success"
+            return "OFFLINE", "Refresh required", "error"
         if self.api_handler.login_status:
-            return "ONLINE", "Marketplace auth", "success"
-        return "OFFLINE", "Marketplace auth", "error"
+            return "ONLINE", "Authenticated", "success"
+        return "OFFLINE", "Refresh required", "error"
 
     def session_account_label(self) -> str:
         if self.is_simulated_session:
@@ -810,7 +836,7 @@ class MarketplaceToolsApp(App[None]):
 
     def update_chrome_visibility(self) -> None:
         title = self.query_one("#screen-title", Static)
-        title.display = self.current_view != "dashboard"
+        title.display = self.current_view not in {"dashboard", "settings"}
 
     def sync_event_log(self) -> None:
         self.refresh_event_log_filter_controls()
@@ -994,6 +1020,11 @@ class MarketplaceToolsApp(App[None]):
             )
 
         try:
+            self.query_visible_one("#clear-credentials", Button).display = not steam_mode
+        except Exception:
+            pass
+
+        try:
             setup_tile = self.query_visible_one("#credential-action-tile", SteamSetupTile)
             if steam_mode and not self.task_manager.steam_browser_profile_prepared:
                 setup_tile.add_class("modal-info-clickable")
@@ -1026,26 +1057,26 @@ class MarketplaceToolsApp(App[None]):
             pass
 
     async def mount_settings(self, content: Container) -> None:
-        table = Table.grid(padding=(0, 2))
-        table.add_column(style="bold")
-        table.add_column()
-        table.add_row("App", APP_TITLE)
-        table.add_row("Version", APP_VERSION)
-        table.add_row("Channel", APP_CHANNEL)
-        table.add_row("Settings schema", str(SETTINGS_SCHEMA_VERSION))
-        table.add_row("Launch mode", self.launch_mode)
-        table.add_row("Theme", self.theme)
-        await content.mount(Static(table, classes="panel"))
-        await content.mount(Static(id="settings-summary", classes="panel"))
-        await content.mount(Static("Session Debug", classes="stats-section-title"))
-        await content.mount(
+        settings_panel = Static(id="settings-summary", classes="settings-panel")
+        settings_panel.border_title = "App Settings"
+        await content.mount(settings_panel)
+
+        session_debug = Vertical(id="session-debug-panel", classes="settings-panel")
+        session_debug.border_title = "Session Debug"
+        await content.mount(session_debug)
+        await session_debug.mount(
             Static(
                 "Clear the saved marketplace session cookies when login state looks stale or corrupted. "
                 "This does not clear saved credentials.",
-                classes="panel",
+                classes="settings-note",
             )
         )
-        await content.mount(Button("Clear Saved Session", id="clear-saved-session", variant="warning"))
+        await session_debug.mount(
+            Horizontal(
+                ModalAction("Clear Saved Session", "clear-saved-session"),
+                id="settings-actions",
+            )
+        )
         self.refresh_settings_summary()
 
     def refresh_settings_summary(self) -> None:
@@ -1053,17 +1084,31 @@ class MarketplaceToolsApp(App[None]):
             summary = self.query_visible_one("#settings-summary", Static)
         except Exception:
             return
-        table = Table.grid(padding=(0, 2))
-        table.add_column(style="bold")
-        table.add_column()
+
+        app_table = Table.grid(padding=(0, 2))
+        app_table.add_column(style="bold")
+        app_table.add_column()
+        app_table.add_row("App", APP_TITLE)
+        app_table.add_row("Version", APP_VERSION)
+        app_table.add_row("Channel", APP_CHANNEL)
+        app_table.add_row("Settings schema", str(SETTINGS_SCHEMA_VERSION))
+        app_table.add_row("Launch mode", self.launch_mode)
+        app_table.add_row("Theme", self.theme)
+
+        settings_table = Table.grid(padding=(0, 2))
+        settings_table.add_column(style="bold")
+        settings_table.add_column()
         mode = "Buy mode" if self.task_manager.purchase_submission_enabled else "Watch only"
-        table.add_row("Session mode", self.task_manager.account_mode_label())
-        table.add_row("Session refresh", self.task_manager.account_mode_detail())
-        table.add_row("Mode", mode)
-        table.add_row("Polling interval", f"{self.task_manager.current_delay_label()} ({self.task_manager.current_delay_range()})")
-        table.add_row("Spend cap", format_compact_silver(self.task_manager.max_spend))
-        table.add_row("Tracked categories", "Outfits: male and female marketplace categories")
-        summary.update(table)
+        settings_table.add_row("Session mode", self.task_manager.account_mode_label())
+        settings_table.add_row("Session refresh", self.task_manager.account_mode_detail())
+        settings_table.add_row("Mode", mode)
+        settings_table.add_row(
+            "Polling interval",
+            f"{self.task_manager.current_delay_label()} ({self.task_manager.current_delay_range()})",
+        )
+        settings_table.add_row("Spend cap", format_compact_silver(self.task_manager.max_spend))
+        settings_table.add_row("Tracked categories", "Outfits: male and female marketplace categories")
+        summary.update(Group(app_table, Text(""), settings_table))
 
     def refresh_spend_summary(self) -> None:
         try:
@@ -1147,15 +1192,38 @@ class MarketplaceToolsApp(App[None]):
             return
 
         account = self.session_account_label()
+        self.refresh_modal_tile("session-account-tile", "Account", account, self.task_manager.account_mode_label())
+        try:
+            credentials_row = self.query_visible_one("#session-credentials-row")
+            refresh_button = self.query_visible_one("#refresh-session", Button)
+        except Exception:
+            return
+
+        pa_mode = not self.task_manager.uses_steam_browser_session()
+        if not pa_mode:
+            setup_complete = self.task_manager.steam_browser_profile_prepared
+            self.refresh_modal_tile(
+                "session-credentials-tile",
+                "Initial Setup",
+                "Complete" if setup_complete else "Incomplete",
+                "Ready for market login" if setup_complete else "Open Credentials to run setup",
+                "success" if setup_complete else "warning",
+                True,
+            )
+            refresh_button.disabled = False
+            return
+
+        _state, detail, _level, email, password = self.pa_credential_state()
+        credentials_ready = bool(email and password)
         self.refresh_modal_tile(
-            "session-status-tile",
-            "Status",
-            self.session_status_state()[0].title(),
-            self.session_status_state()[1],
-            self.session_status_state()[2],
+            "session-credentials-tile",
+            "Credentials",
+            "Set" if credentials_ready else "Missing",
+            "" if credentials_ready else "Open Credentials first",
+            "success" if credentials_ready else "error",
             True,
         )
-        self.refresh_modal_tile("session-account-tile", "Account", account, self.task_manager.account_mode_label())
+        refresh_button.disabled = not credentials_ready
 
     def refresh_modal_summaries(self) -> None:
         self.refresh_credentials_summary()
@@ -1272,7 +1340,7 @@ class MarketplaceToolsApp(App[None]):
         )
 
     def on_modal_action_pressed(self, event: ModalAction.Pressed) -> None:
-        if event.action.action_id not in {"refresh-stats", "refresh-wallet"}:
+        if event.action.action_id not in {"refresh-stats", "refresh-wallet", "clear-saved-session", "clear-credentials"}:
             return
 
         event.stop()
@@ -1280,8 +1348,12 @@ class MarketplaceToolsApp(App[None]):
         if event.action.action_id == "refresh-stats":
             self.refresh_stats()
             self.set_status("Stats refreshed.", "info")
-        else:
+        elif event.action.action_id == "refresh-wallet":
             self.run_worker(self.refresh_wallet(), name="wallet-refresh", group="actions", exclusive=True)
+        elif event.action.action_id == "clear-saved-session":
+            self.run_worker(self.clear_saved_session(), name="clear-saved-session", group="actions", exclusive=True)
+        else:
+            self.run_worker(self.clear_saved_credentials(), name="clear-credentials", group="actions", exclusive=True)
 
     def on_log_filter_option_pressed(self, event: LogFilterOption.Pressed) -> None:
         event.stop()
@@ -1326,7 +1398,11 @@ class MarketplaceToolsApp(App[None]):
         elif button_id == "modal-stop-monitor":
             await self.stop_monitor(close_modal=True)
         elif button_id == "refresh-session":
-            self.run_worker(self.login_refresh(), name="login-refresh", group="actions", exclusive=True)
+            if self.session_refresh_requires_pa_credentials():
+                self.set_status("Add Pearl Abyss credentials before refreshing the marketplace session.")
+                self.refresh_modal_summaries()
+                return
+            self.push_screen(SessionRefreshConfirmScreen(), callback=self._handle_session_refresh_confirmation)
         elif button_id == "refresh-wallet":
             self.run_worker(self.refresh_wallet(), name="wallet-refresh", group="actions", exclusive=True)
         elif button_id == "refresh-stats":
@@ -1381,7 +1457,7 @@ class MarketplaceToolsApp(App[None]):
         elif tile_key == "credentials":
             self.push_screen(CredentialsModal())
         elif tile_key == "session":
-            self.push_screen(SessionRefreshConfirmScreen(), callback=self._handle_session_refresh_confirmation)
+            self.push_screen(SessionModal())
         elif tile_key == "polling":
             self.push_screen(PollingModal())
         elif tile_key == "buy-delay":
@@ -1390,7 +1466,14 @@ class MarketplaceToolsApp(App[None]):
 
     def _handle_session_refresh_confirmation(self, confirmed: bool) -> None:
         if confirmed:
+            self.close_dashboard_modals()
             self.run_worker(self.login_refresh(), name="login-refresh", group="actions", exclusive=True)
+
+    def session_refresh_requires_pa_credentials(self) -> bool:
+        if self.task_manager.uses_steam_browser_session():
+            return False
+        _state, _detail, _level, email, password = self.pa_credential_state()
+        return not bool(email and password)
 
     def on_polling_preset_tile_pressed(self, event: PollingPresetTile.Pressed) -> None:
         event.stop()
@@ -1918,10 +2001,15 @@ class MarketplaceToolsApp(App[None]):
 
         self.api_handler.email = None
         self.api_handler.password = None
-        self.query_visible_one("#email-input", Input).value = ""
-        self.query_visible_one("#password-input", Input).value = ""
+        for input_id in ("email-input", "password-input"):
+            try:
+                self.query_visible_one(f"#{input_id}", Input).value = ""
+            except Exception:
+                pass
         self.set_status("Saved credentials cleared.", "info")
         self.refresh_credentials_summary()
+        self.refresh_settings_summary()
+        self.refresh_live_widgets()
 
     async def clear_saved_session(self) -> None:
         cleared_now = await self.task_manager.reset_authentication_context("Manual session reset")
@@ -1955,6 +2043,11 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_live_widgets()
 
     async def login_refresh(self) -> None:
+        if self.session_refresh_requires_pa_credentials():
+            self.set_status("Add Pearl Abyss credentials before refreshing the marketplace session.")
+            self.refresh_live_widgets()
+            return
+
         self.task_manager.add_event("Fetching session status...", "info")
         self.set_status("Fetching session status...")
         await self.task_manager.login()

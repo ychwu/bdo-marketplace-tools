@@ -154,6 +154,7 @@ cython_debug/
 *.pkl
 *.json
 data/
+.changesets/
 agent/
 agents.md
 AGENTS.md
