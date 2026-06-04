@@ -6,7 +6,7 @@ from textual.widget import Widget
 from textual.widgets import Static
 from textual.widgets._header import HeaderClock
 
-from bdo_marketplace_tools.ui.display import APP_DISPLAY_VERSION, APP_TITLE
+from bdo_marketplace_tools.ui.display import APP_TITLE
 
 class AppHeader(Widget):
     DEFAULT_CSS = """
@@ -27,7 +27,7 @@ class AppHeader(Widget):
     """
 
     def compose(self) -> ComposeResult:
-        yield Static(f"{APP_TITLE} {APP_DISPLAY_VERSION}", id="app-header-title")
+        yield Static(APP_TITLE, id="app-header-title")
         yield HeaderClock()
 
     def on_click(self, event: Click) -> None:

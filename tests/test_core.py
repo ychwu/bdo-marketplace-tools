@@ -2192,6 +2192,15 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(list(app.query("AppHeader"))), 1)
                 self.assertEqual(len(list(app.query("HeaderIcon"))), 0)
                 self.assertEqual(len(list(app.query("HeaderClock"))), 1)
+                self.assertEqual(app.query_one("#app-header-title", Static).content, "Marketplace Tools")
+                self.assertEqual(app.query_one("#brand", Static).content, "Marketplace Tools")
+                self.assertEqual(app.query_one("#build-info", Static).content, f"v{APP_VERSION}")
+                self.assertLessEqual(
+                    len(str(app.query_one("#build-info", Static).content)),
+                    int(len(f"build v{APP_VERSION}") * 0.7),
+                )
+                self.assertNotIn("BETA", str(app.query_one("#app-header-title", Static).content))
+                self.assertNotIn("BETA", str(app.query_one("#brand", Static).content))
                 await pilot.click("#app-header")
                 self.assertFalse(app.query_one("#app-header").has_class("-tall"))
                 self.assertEqual(app.query_one("#banner").render(), BANNER_ART)
@@ -2228,7 +2237,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.query_one("#content").styles.overflow_y, "auto")
                 self.assertGreaterEqual(app.query_one("#event-log").size.height, 6)
                 self.assertLessEqual(app.query_one("#sidebar").region.width, 23)
-                self.assertEqual(app.query_one("#event-log").styles.border_title_color, Color(255, 145, 60))
+                self.assertEqual(app.query_one("#event-log").styles.border_title_color, Color(216, 211, 200))
 
     async def test_credentials_validation_and_password_masking(self):
         app = self.make_app()

@@ -19,7 +19,6 @@ from bdo_marketplace_tools.storage.credentials import CredentialStoreError, clea
 from bdo_marketplace_tools.version import SETTINGS_SCHEMA_VERSION
 from bdo_marketplace_tools.ui.display import (
     APP_CHANNEL,
-    APP_DISPLAY_VERSION,
     APP_TITLE,
     APP_VERSION,
     COLOR_BRAND,
@@ -58,7 +57,7 @@ from bdo_marketplace_tools.ui.widgets import (
 
 
 class MarketplaceToolsApp(App[None]):
-    TITLE = f"{APP_TITLE} {APP_DISPLAY_VERSION}"
+    TITLE = APP_TITLE
     CSS = """
     Screen {
         background: #101010;
@@ -73,7 +72,7 @@ class MarketplaceToolsApp(App[None]):
         min-width: 20;
         background: #171717;
         border-right: solid __COLOR_BRAND__;
-        padding: 1;
+        padding: 1 1 0 1;
     }
 
     #brand {
@@ -93,6 +92,16 @@ class MarketplaceToolsApp(App[None]):
     #nav {
         height: auto;
         margin-bottom: 1;
+    }
+
+    #sidebar-spacer {
+        height: 1fr;
+    }
+
+    #build-info {
+        height: 1;
+        color: __COLOR_TEXT_MUTED__;
+        text-style: dim;
     }
 
     #test-controls {
@@ -203,7 +212,7 @@ class MarketplaceToolsApp(App[None]):
         height: 1fr;
         min-height: 6;
         border: round #3a3a3a;
-        border-title-color: __COLOR_BRAND__;
+        border-title-color: #d8d3c8;
         border-title-style: bold;
     }
 
@@ -353,7 +362,7 @@ class MarketplaceToolsApp(App[None]):
         yield AppHeader(id="app-header")
         with Horizontal(id="shell"):
             with Vertical(id="sidebar"):
-                yield Static(f"{APP_TITLE}\n{APP_DISPLAY_VERSION}", id="brand")
+                yield Static(APP_TITLE, id="brand")
                 yield ListView(
                     *[
                         ListItem(Label(label), id=f"nav-{key}")
@@ -374,6 +383,9 @@ class MarketplaceToolsApp(App[None]):
                         yield Button("Stop Test Scan", id="stop-test-monitor", compact=True)
                         yield Button("Fake Detection", id="fake-detection", compact=True)
                         yield Button("Fake Buy Success", id="fake-buy-success", compact=True)
+                else:
+                    yield Static("", id="sidebar-spacer")
+                yield Static(f"v{APP_VERSION}", id="build-info")
             with Vertical(id="main"):
                 yield Static(BANNER_ART, id="banner")
                 yield Static("", id="screen-title", classes="screen-heading")
