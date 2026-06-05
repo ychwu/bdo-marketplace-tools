@@ -53,9 +53,9 @@ Python CLI app for monitoring the *Black Desert Online* marketplace through auth
 - Textual-based terminal dashboard with live runtime metrics, modal control flows, wallet/status views, test-mode-only simulation controls, and headless UI workflow tests.
 - Focused unit coverage for listing parsing, pricing conversion, spend caps, session refresh behavior, purchase accounting, runtime file initialization, and dashboard workflows.
 
-## Project Status
+## App Status
 
-This project is currently undergoing a codebase rewrite and Textual UI migration. Features may be incomplete, unstable, or temporarily broken while the modernization work is in progress.
+This app is currently undergoing a codebase rewrite. Features may be incomplete, unstable, or temporarily broken. Message me on discord if you encounter any errors.
 
 ## Supported Versions
 
