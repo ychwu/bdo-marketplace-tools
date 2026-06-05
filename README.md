@@ -88,7 +88,7 @@ py -3 main.py
 
 ## Disclaimer
 
-This repository is provided as a proof of concept for authenticated web sessions, HTTP requests, and marketplace-style API integration. Use it only in environments where automation is permitted by the relevant terms of service. The project does not handle CAPTCHA challenges or other access-control interruptions.
+This repository is provided as a proof of concept and educational purposes ONLY. I am *NOT* responsible for anything that happens to your account if you choose to use this.
 
 ## Known Issues
 
