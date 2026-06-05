@@ -105,9 +105,10 @@ Unknown purchase codes are reported as `resultCode {code}` in the event log so t
 
 ## Contact
 
-For questions or bug reports, use the project issue tracker or the listed Discord contact: `._.__.__._._.__._____.__._.___.`
+For questions or bug reports, use the issue tracker or my Discord: `._.__.__._._.__._____.__._.___.`
 
 ## Planned Work
 
-- Manual QA for fresh and existing Steam browser profiles.
-- More configurable marketplace categories.
+- Marketplace Inventory viewer
+- Automated pre-orders
+- More configurable marketplace categories
