@@ -1,3 +1,4 @@
+# Requires Python 3.14.x
 requests
 colorama
 keyring
