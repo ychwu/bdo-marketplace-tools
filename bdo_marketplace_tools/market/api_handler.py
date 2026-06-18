@@ -2,6 +2,7 @@ import asyncio
 import json
 import random
 import stat
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 
@@ -273,7 +274,6 @@ class APIHandler:
         new_session = requests.Session()
         headers_pastate = {
             "User-Agent": MARKET_USER_AGENT,
-            "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": MARKET_ACCEPT_LANGUAGE,
         }
@@ -287,19 +287,24 @@ class APIHandler:
                 headers=headers_pastate,
             )
             self.session = new_session
+            if self._login_page_requires_browser_verification(response_login_page):
+                raise MarketplaceResponseError(
+                    "Pearl Abyss login page requires browser verification before password login"
+                )
             login_page_cookies = self._extract_cookie_dict(response_login_page)
-            pastate = login_page_cookies.get("PA-STATE")
-            if not pastate:
-                raise MarketplaceResponseError("login page did not provide PA-STATE")
+            login_return_url = self._login_return_url(response_login_page, login_page_cookies)
+            login_page_url = getattr(response_login_page, "url", None) or self.login_url
 
             login_payload = {
                 "hdAccountUrl": ACCOUNT_URL,
-                "_isLinkingLogin": "false",
-                "_returnUrl": f"{ACCOUNT_URL}/en-US/Member/Login/AuthorizeOauth?response_type=code&scope=profile&state={pastate}&client_id=client_id&redirect_uri={self._trade_url()}/Pearlabyss/Oauth2CallBack",
-                "_joinType": 1,
+                "_linkingHash": "",
+                "_isLinkingLogin": "False",
+                "_returnUrl": login_return_url,
+                "_joinType": "1",
                 "_email": self.email,
                 "_password": self.password,
                 "_isIpCheck": "false",
+                "h-captcha-response": "",
             }
 
             headers_login = {
@@ -308,6 +313,7 @@ class APIHandler:
                 "Accept": headers_pastate["Accept"],
                 "Accept-Language": headers_pastate["Accept-Language"],
                 "Origin": ACCOUNT_URL,
+                "Referer": login_page_url,
             }
 
             response_login = await self._request(
@@ -319,13 +325,97 @@ class APIHandler:
                 headers=headers_login,
             )
             login_cookies = self._extract_cookie_dict(response_login)
+            reached_market_callback = self._response_visited_market_callback(response_login)
 
-        if "TradeAuth_Session" in login_cookies and "__RequestVerificationToken" in login_cookies:
-            self.login_status = True
-            return 1
+        if login_cookies and (reached_market_callback or "TradeAuth_Session" in login_cookies):
+            status = await self.is_session_expired()
+            if status == 0:
+                self.login_status = True
+                return 1
 
         self.login_status = False
+        if not reached_market_callback:
+            raise MarketplaceResponseError(
+                "login request did not reach Central Market callback; manual browser verification may be required"
+            )
         return 0
+
+    def _login_return_url(self, response, cookies):
+        response_url = getattr(response, "url", "") or ""
+        return_url = self._query_value(response_url, "_returnUrl")
+        if return_url:
+            return return_url
+        if self._is_login_authorize_url(response_url):
+            return response_url
+
+        for previous_response in getattr(response, "history", []) or []:
+            location = previous_response.headers.get("Location") if hasattr(previous_response, "headers") else None
+            if not location:
+                continue
+            location_url = urljoin(getattr(previous_response, "url", ""), location)
+            return_url = self._query_value(location_url, "_returnUrl")
+            if return_url:
+                return return_url
+            if self._is_login_authorize_url(location_url):
+                return location_url
+
+        pastate = cookies.get("PA-STATE")
+        if pastate:
+            return (
+                f"{ACCOUNT_URL}/en-US/Member/Login/AuthorizeOauth?"
+                f"response_type=code&scope=profile&state={pastate}&client_id=client_id&"
+                f"redirect_uri={self._trade_url()}/Pearlabyss/Oauth2CallBack"
+            )
+
+        raise MarketplaceResponseError("login page did not provide an OAuth return URL")
+
+    def _query_value(self, url, key):
+        parsed = urlparse(url or "")
+        values = parse_qs(parsed.query, keep_blank_values=True).get(key)
+        if not values:
+            return None
+        return values[0]
+
+    def _login_page_requires_browser_verification(self, response):
+        text = getattr(response, "text", None)
+        if not text:
+            return False
+        normalized = text.lower()
+        return (
+            "incapsula" in normalized
+            or "_incapsula_resource" in normalized
+            or "request unsuccessful" in normalized
+        )
+
+    def _is_login_authorize_url(self, url):
+        parsed = urlparse(url or "")
+        if parsed.hostname != urlparse(ACCOUNT_URL).hostname:
+            return False
+        if parsed.path != "/en-US/Member/Login/AuthorizeOauth":
+            return False
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        return all(query.get(key) for key in ("response_type", "scope", "state", "client_id", "redirect_uri"))
+
+    def _response_visited_market_callback(self, response):
+        for url in self._response_url_chain(response):
+            parsed = urlparse(url or "")
+            if parsed.hostname == urlparse(self._trade_url()).hostname and parsed.path == "/Pearlabyss/Oauth2CallBack":
+                return True
+        return False
+
+    def _response_url_chain(self, response):
+        urls = []
+        for previous_response in getattr(response, "history", []) or []:
+            response_url = getattr(previous_response, "url", "")
+            if response_url:
+                urls.append(response_url)
+            location = previous_response.headers.get("Location") if hasattr(previous_response, "headers") else None
+            if location:
+                urls.append(urljoin(response_url, location))
+        response_url = getattr(response, "url", "")
+        if response_url:
+            urls.append(response_url)
+        return urls
 
     async def ensure_session_valid(self):
         status = await self.is_session_expired()

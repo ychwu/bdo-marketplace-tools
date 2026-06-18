@@ -93,6 +93,7 @@ async def acquire_steam_market_cookies(
     profile_path=STEAM_MARKET_PROFILE_PATH,
     start_url=AUTH_START_URL,
     auto_steam_login=False,
+    account_label="Steam Account",
 ):
     try:
         from patchright.async_api import async_playwright
@@ -103,10 +104,10 @@ async def acquire_steam_market_cookies(
 
     profile_path = Path(profile_path)
     profile_path.mkdir(parents=True, exist_ok=True)
-    opening_message = "Opening Steam Account browser session in Chrome. Complete Steam/PA login in the browser."
+    opening_message = f"Opening {account_label} browser session in Chrome. Complete login in the browser."
     if auto_steam_login:
         opening_message = (
-            "Opening Steam Account browser session in Chrome. Automatic Steam re-auth will continue when possible."
+            f"Opening {account_label} browser session in Chrome. Automatic Steam re-auth will continue when possible."
         )
     await _emit_status(status_callback, opening_message, "info")
 
@@ -118,13 +119,14 @@ async def acquire_steam_market_cookies(
             try:
                 await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
             except Exception:
-                await _emit_status(status_callback, "Waiting for Steam/PA login in the browser.", "info")
+                await _emit_status(status_callback, f"Waiting for {account_label} login in the browser.", "info")
 
             return await _wait_for_market_cookies(
                 context,
                 status_callback,
                 timeout_seconds,
                 auto_steam_login=auto_steam_login,
+                account_label=account_label,
             )
     except BrowserAuthError:
         raise
@@ -271,7 +273,14 @@ async def clear_steam_browser_profile_cookies(
                 pass
 
 
-async def _wait_for_market_cookies(context, status_callback, timeout_seconds, *, auto_steam_login=False):
+async def _wait_for_market_cookies(
+    context,
+    status_callback,
+    timeout_seconds,
+    *,
+    auto_steam_login=False,
+    account_label="Steam Account",
+):
     deadline = asyncio.get_running_loop().time() + float(timeout_seconds)
     callback_seen = False
     auth_flow_seen = False
@@ -316,7 +325,7 @@ async def _wait_for_market_cookies(context, status_callback, timeout_seconds, *,
 
         await asyncio.sleep(BROWSER_AUTH_POLL_SECONDS)
 
-    raise BrowserAuthError("Steam Account browser session timed out before Central Market cookies were captured.")
+    raise BrowserAuthError(f"{account_label} browser session timed out before Central Market cookies were captured.")
 
 
 async def _launch_persistent_chrome_context(playwright, profile_path):

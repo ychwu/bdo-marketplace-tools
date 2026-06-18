@@ -4,6 +4,7 @@ import requests
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import quote
 from unittest.mock import AsyncMock, Mock, patch
 
 import main as app_main
@@ -48,6 +49,7 @@ from bdo_marketplace_tools.market.browser_auth import (
     _should_attempt_steam_auto_login,
     _status_for_state,
     _steam_store_logged_in_dom_ready,
+    _wait_for_market_cookies,
     _wait_for_steam_profile_login,
 )
 from bdo_marketplace_tools.market.pricing import (
@@ -62,6 +64,7 @@ from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET, chec
 from bdo_marketplace_tools.storage import app_settings as account_mode_module
 from bdo_marketplace_tools.storage import credentials as credentials_module
 from bdo_marketplace_tools.services import task_manager as task_manager_module
+from bdo_marketplace_tools.storage.paths import PA_MARKET_PROFILE_PATH
 from bdo_marketplace_tools.storage.app_settings import PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE
 from bdo_marketplace_tools.services.task_manager import BackgroundTasks
 from bdo_marketplace_tools.ui.app import BANNER_ART, DEFAULT_THEME, STATUS_STYLES, DashboardTile, MarketplaceToolsApp, ModalAction
@@ -470,6 +473,23 @@ class APIResultTests(unittest.TestCase):
         self.assertTrue(fake_context.new_page_called)
         self.assertTrue(fake_context.cleared)
         self.assertTrue(fake_context.closed)
+
+    def test_market_cookie_wait_timeout_uses_account_label(self):
+        class FakeContext:
+            pages = []
+
+            async def cookies(self, *_args):
+                return []
+
+        with self.assertRaisesRegex(BrowserAuthError, "Pearl Abyss Account browser session timed out"):
+            asyncio.run(
+                _wait_for_market_cookies(
+                    FakeContext(),
+                    status_callback=None,
+                    timeout_seconds=0,
+                    account_label="Pearl Abyss Account",
+                )
+            )
 
     def test_steam_auto_login_disabled_does_not_click_buttons(self):
         clicked_selectors = []
@@ -1096,6 +1116,8 @@ class LocalRuntimeFileTests(unittest.TestCase):
     def test_browser_profile_paths_use_data_directory(self):
         self.assertIn("data", STEAM_MARKET_PROFILE_PATH.parts)
         self.assertEqual(STEAM_MARKET_PROFILE_PATH.name, "steam-market")
+        self.assertIn("data", PA_MARKET_PROFILE_PATH.parts)
+        self.assertEqual(PA_MARKET_PROFILE_PATH.name, "pa-market")
         self.assertIn("data", STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH.parts)
         self.assertEqual(STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH.name, "steam-market-diagnostic")
 
@@ -1256,6 +1278,166 @@ class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["attempted"], 0)
         self.assertEqual(summary["purchased"], 0)
         self.assertEqual(summary["events"][0]["level"], "error")
+
+    async def test_pa_login_uses_redirect_return_url_and_current_form_fields(self):
+        handler = object.__new__(APIHandler)
+        handler.trade_url = "https://na-trade.naeu.playblackdesert.com"
+        handler.login_url = "https://account.pearlabyss.com/en-US/Member/Login/LoginProcess"
+        handler.email = "user@example.com"
+        handler.password = "secret"
+        handler.session = requests.Session()
+        handler.login_status = False
+        handler._session_lock = asyncio.Lock()
+        handler.is_session_expired = AsyncMock(return_value=0)
+        return_url = (
+            "https://account.pearlabyss.com/en-US/Member/Login/AuthorizeOauth?"
+            "response_type=code&scope=profile&state=oauth-state&client_id=client_id&"
+            "redirect_uri=https%3A%2F%2Fna-trade.naeu.playblackdesert.com%2FPearlabyss%2FOauth2CallBack"
+        )
+        login_page_url = f"https://account.pearlabyss.com/en-US/Member/Login?_returnUrl={quote(return_url, safe='')}"
+        captured_requests = []
+
+        class FakeRequest:
+            _cookies = requests.cookies.RequestsCookieJar()
+
+        class FakeResponse:
+            def __init__(self, url, headers=None, history=None):
+                self.url = url
+                self.headers = headers or {}
+                self.history = history or []
+                self.cookies = requests.cookies.RequestsCookieJar()
+                self.request = FakeRequest()
+
+        async def fake_request(client, method, url, context, **kwargs):
+            captured_requests.append({"method": method, "url": url, "context": context, **kwargs})
+            if method == "GET":
+                return FakeResponse(login_page_url)
+
+            client.cookies.set(
+                "RenamedMarketSession",
+                "market-session",
+                domain="na-trade.naeu.playblackdesert.com",
+                path="/",
+            )
+            callback = (
+                "https://na-trade.naeu.playblackdesert.com/Pearlabyss/Oauth2CallBack?"
+                "code=code&state=oauth-state"
+            )
+            return FakeResponse(
+                "https://na-trade.naeu.playblackdesert.com/",
+                history=[
+                    FakeResponse(
+                        handler.login_url,
+                        headers={"Location": callback},
+                    )
+                ],
+            )
+
+        handler._request = fake_request
+
+        self.assertEqual(await APIHandler.login(handler), 1)
+
+        post_request = captured_requests[1]
+        payload = post_request["data"]
+        self.assertEqual(payload["_returnUrl"], return_url)
+        self.assertEqual(payload["_linkingHash"], "")
+        self.assertEqual(payload["_isLinkingLogin"], "False")
+        self.assertEqual(payload["h-captcha-response"], "")
+        self.assertEqual(post_request["headers"]["Referer"], login_page_url)
+        self.assertTrue(handler.login_status)
+        handler.is_session_expired.assert_awaited_once()
+
+    async def test_pa_login_reports_manual_verification_when_callback_is_not_reached(self):
+        handler = object.__new__(APIHandler)
+        handler.trade_url = "https://na-trade.naeu.playblackdesert.com"
+        handler.login_url = "https://account.pearlabyss.com/en-US/Member/Login/LoginProcess"
+        handler.email = "user@example.com"
+        handler.password = "secret"
+        handler.session = requests.Session()
+        handler.login_status = False
+        handler._session_lock = asyncio.Lock()
+        handler.is_session_expired = AsyncMock(return_value=0)
+        return_url = (
+            "https://account.pearlabyss.com/en-US/Member/Login/AuthorizeOauth?"
+            "response_type=code&scope=profile&state=oauth-state&client_id=client_id&"
+            "redirect_uri=https%3A%2F%2Fna-trade.naeu.playblackdesert.com%2FPearlabyss%2FOauth2CallBack"
+        )
+        login_page_url = f"https://account.pearlabyss.com/en-US/Member/Login?_returnUrl={quote(return_url, safe='')}"
+
+        class FakeRequest:
+            _cookies = requests.cookies.RequestsCookieJar()
+
+        class FakeResponse:
+            def __init__(self, url):
+                self.url = url
+                self.headers = {}
+                self.history = []
+                self.cookies = requests.cookies.RequestsCookieJar()
+                self.request = FakeRequest()
+
+        async def fake_request(_client, method, _url, _context, **_kwargs):
+            if method == "GET":
+                return FakeResponse(login_page_url)
+            return FakeResponse("https://account.pearlabyss.com/en-US/Member/Login")
+
+        handler._request = fake_request
+
+        with self.assertRaisesRegex(MarketplaceResponseError, "manual browser verification"):
+            await APIHandler.login(handler)
+
+        self.assertFalse(handler.login_status)
+        handler.is_session_expired.assert_not_called()
+
+    def test_pa_login_return_url_accepts_direct_authorize_oauth_page(self):
+        handler = object.__new__(APIHandler)
+        handler.trade_url = "https://na-trade.naeu.playblackdesert.com"
+        authorize_url = (
+            "https://account.pearlabyss.com/en-US/Member/Login/AuthorizeOauth?"
+            "response_type=code&scope=profile&state=oauth-state&client_id=client_id&"
+            "redirect_uri=https%3A%2F%2Fna-trade.naeu.playblackdesert.com%2FPearlabyss%2FOauth2CallBack"
+        )
+
+        class FakeResponse:
+            url = authorize_url
+            history = []
+
+        self.assertEqual(APIHandler._login_return_url(handler, FakeResponse(), {"PA-STATE": "fallback"}), authorize_url)
+
+    async def test_pa_login_does_not_post_credentials_to_browser_verification_page(self):
+        handler = object.__new__(APIHandler)
+        handler.trade_url = "https://na-trade.naeu.playblackdesert.com"
+        handler.login_url = "https://account.pearlabyss.com/en-US/Member/Login/LoginProcess"
+        handler.email = "user@example.com"
+        handler.password = "secret"
+        handler.session = requests.Session()
+        handler.login_status = False
+        handler._session_lock = asyncio.Lock()
+        calls = []
+
+        class FakeRequest:
+            _cookies = requests.cookies.RequestsCookieJar()
+
+        class FakeResponse:
+            url = "https://account.pearlabyss.com/en-US/Member/Login/AuthorizeOauth?response_type=code&scope=profile&state=oauth-state&client_id=client_id&redirect_uri=https%3A%2F%2Fna-trade.naeu.playblackdesert.com%2FPearlabyss%2FOauth2CallBack"
+            history = []
+            headers = {}
+            cookies = requests.cookies.RequestsCookieJar()
+            request = FakeRequest()
+            text = "Request unsuccessful. Incapsula incident ID. _Incapsula_Resource"
+
+        async def fake_request(_client, method, *_args, **_kwargs):
+            calls.append(method)
+            if method != "GET":
+                raise AssertionError("credentials should not be posted to a browser verification page")
+            return FakeResponse()
+
+        handler._request = fake_request
+
+        with self.assertRaisesRegex(MarketplaceResponseError, "requires browser verification"):
+            await APIHandler.login(handler)
+
+        self.assertEqual(calls, ["GET"])
+        self.assertFalse(handler.login_status)
 
     async def test_check_stock_uses_persistent_public_category_clients(self):
         handler = object.__new__(APIHandler)
@@ -1937,6 +2119,44 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Session check failed: network down", event_text)
         self.assertIn("Login failed.", event_text)
 
+    async def test_pa_login_browser_verification_falls_back_to_manual_browser_refresh(self):
+        manager = self.make_task_manager()
+        manager.api_handler.email = "user@example.com"
+        manager.api_handler.password = "secret"
+        manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
+        manager.api_handler.login = AsyncMock(
+            side_effect=MarketplaceResponseError("Pearl Abyss login page requires browser verification before password login")
+        )
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_steam_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ) as browser_auth:
+            await manager.login()
+
+        browser_auth.assert_awaited_once()
+        self.assertEqual(browser_auth.await_args.kwargs["profile_path"], PA_MARKET_PROFILE_PATH)
+        self.assertEqual(browser_auth.await_args.kwargs["account_label"], "Pearl Abyss Account")
+        self.assertFalse(browser_auth.await_args.kwargs["auto_steam_login"])
+        manager.api_handler.validate_and_save_imported_session.assert_awaited_once()
+        self.assertTrue(manager.api_handler.login_status)
+        self.assertTrue(manager.saved_session_last_known_valid)
+        self.assertFalse(manager.steam_auto_reauth_enabled)
+        self.assertTrue(any("Pearl Abyss Account browser session validated and saved" in event for event in manager.events))
+        await manager.stop_login_status_checker()
+
+    async def test_pa_login_without_saved_credentials_uses_manual_browser_refresh(self):
+        manager = self.make_task_manager()
+        manager.api_handler.email = None
+        manager.api_handler.password = None
+        manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
+        manager.refresh_pa_browser_session = AsyncMock(return_value=True)
+
+        await manager.login()
+
+        manager.refresh_pa_browser_session.assert_awaited_once_with(session_check_error=None)
+
     async def test_steam_mode_login_uses_browser_refresh_instead_of_credentials(self):
         manager = self.make_task_manager()
         manager.account_mode = STEAM_BROWSER_MODE
@@ -2223,6 +2443,19 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manager.purchase_submission_enabled)
         self.assertTrue(any("Re-authentication succeeded. Retrying purchase request" in event for event in manager.events))
 
+    async def test_pa_purchase_reauth_uses_browser_fallback_when_verification_is_required(self):
+        manager = self.make_task_manager()
+        manager.api_handler.ensure_session_valid = AsyncMock(
+            side_effect=MarketplaceResponseError("Pearl Abyss login page requires browser verification before password login")
+        )
+        manager.refresh_pa_browser_session = AsyncMock(return_value=True)
+
+        recovered = await manager._recover_purchase_session_for_retry()
+
+        self.assertTrue(recovered)
+        manager.refresh_pa_browser_session.assert_awaited_once()
+        self.assertTrue(any("Re-authentication succeeded. Retrying purchase request" in event for event in manager.events))
+
     async def test_debug_blank_browser_diagnostic_opens_without_session_import(self):
         manager = self.make_task_manager(test_mode_enabled=True)
 
@@ -2347,6 +2580,105 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("Purchase succeeded after auto re-auth" in event for event in manager.events))
         await manager.stop_login_status_checker()
 
+    async def test_pa_buy_preflight_browser_verification_uses_manual_browser_fallback(self):
+        manager = self.make_task_manager()
+        manager.purchase_submission_enabled = True
+        manager.refresh_pa_browser_session = AsyncMock(return_value=True)
+        blocked_summary = {
+            "purchase_records": [],
+            "results": [],
+            "events": [
+                {
+                    "level": "error",
+                    "message": "Purchase aborted: Pearl Abyss login page requires browser verification before password login.",
+                }
+            ],
+        }
+        success_summary = {
+            "purchase_records": [{"item_id": "10007", "price": 82500, "count": 1, "result_code": 0}],
+            "results": [{"item_id": "10007", "result_code": 0}],
+            "events": [{"level": "success", "message": "Purchase succeeded after PA browser refresh."}],
+        }
+        manager.api_handler.buy_item = AsyncMock(side_effect=[blocked_summary, success_summary])
+
+        with patch.object(manager, "save_local_data") as save_mock:
+            await manager.buy_item([["10007", "1", "82500"]], adjust_pricing=False)
+
+        self.assertEqual(manager.api_handler.buy_item.await_count, 2)
+        manager.refresh_pa_browser_session.assert_awaited_once()
+        self.assertEqual(manager.session_successful_purchases, 1)
+        self.assertTrue(any("Purchase succeeded after PA browser refresh" in event for event in manager.events))
+        save_mock.assert_called_once()
+
+    async def test_pa_buy_preflight_auth_failure_pauses_buy_mode(self):
+        manager = self.make_task_manager()
+        manager.purchase_submission_enabled = True
+        auth_failure_summary = {
+            "purchase_records": [],
+            "results": [],
+            "events": [
+                {
+                    "level": "error",
+                    "message": "Purchase aborted: login session is invalid and re-authentication failed.",
+                }
+            ],
+        }
+        manager.api_handler.buy_item = AsyncMock(return_value=auth_failure_summary)
+
+        await manager.buy_item([["10007", "1", "82500"]], adjust_pricing=False)
+
+        manager.api_handler.buy_item.assert_awaited_once()
+        self.assertFalse(manager.purchase_submission_enabled)
+        self.assertTrue(any("Buy mode paused until Refresh Session succeeds" in event for event in manager.events))
+
+    async def test_pa_buy_preflight_browser_refresh_failure_pauses_buy_mode(self):
+        manager = self.make_task_manager()
+        manager.purchase_submission_enabled = True
+        manager.refresh_pa_browser_session = AsyncMock(return_value=False)
+        blocked_summary = {
+            "purchase_records": [],
+            "results": [],
+            "events": [
+                {
+                    "level": "error",
+                    "message": "Purchase aborted: Pearl Abyss login page requires browser verification before password login.",
+                }
+            ],
+        }
+        manager.api_handler.buy_item = AsyncMock(return_value=blocked_summary)
+
+        await manager.buy_item([["10007", "1", "82500"]], adjust_pricing=False)
+
+        manager.api_handler.buy_item.assert_awaited_once()
+        manager.refresh_pa_browser_session.assert_awaited_once()
+        self.assertFalse(manager.purchase_submission_enabled)
+        self.assertTrue(any("Buy mode paused until Refresh Session succeeds" in event for event in manager.events))
+
+    async def test_pa_buy_browser_verification_summary_with_prior_purchase_does_not_retry_batch(self):
+        manager = self.make_task_manager()
+        manager.purchase_submission_enabled = True
+        manager.refresh_pa_browser_session = AsyncMock(return_value=True)
+        partial_summary = {
+            "purchase_records": [{"item_id": "10007", "price": 82500, "count": 1, "result_code": 0}],
+            "results": [{"item_id": "10007", "result_code": 0}],
+            "events": [
+                {"level": "success", "message": "Purchase request succeeded for 10007 at 82500 silver."},
+                {
+                    "level": "error",
+                    "message": "Re-authentication failed: Pearl Abyss login page requires browser verification before password login.",
+                },
+            ],
+        }
+        manager.api_handler.buy_item = AsyncMock(return_value=partial_summary)
+
+        with patch.object(manager, "save_local_data"):
+            await manager.buy_item([["10007", "2", "82500"]], adjust_pricing=False)
+
+        manager.api_handler.buy_item.assert_awaited_once()
+        manager.refresh_pa_browser_session.assert_not_called()
+        self.assertEqual(manager.session_successful_purchases, 1)
+        self.assertFalse(manager.purchase_submission_enabled)
+
     async def test_login_status_checker_combines_expired_session_with_reauth_result(self):
         manager = self.make_task_manager()
         manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
@@ -2357,6 +2689,30 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(manager.events), 1)
         self.assertIn("Session expired. Re-authentication failed.", manager.events[0])
+
+    async def test_expired_pa_session_pauses_buy_mode_when_reauth_fails(self):
+        manager = self.make_task_manager()
+        manager.purchase_submission_enabled = True
+        manager.api_handler.login = AsyncMock(return_value=0)
+
+        recovered = await manager.handle_expired_session()
+
+        self.assertFalse(recovered)
+        self.assertFalse(manager.purchase_submission_enabled)
+        self.assertTrue(any("Buy mode paused until Refresh Session succeeds" in event for event in manager.events))
+
+    async def test_expired_pa_session_uses_browser_fallback_when_verification_is_required(self):
+        manager = self.make_task_manager()
+        manager.api_handler.login = AsyncMock(
+            side_effect=MarketplaceResponseError("Pearl Abyss login page requires browser verification before password login")
+        )
+        manager.refresh_pa_browser_session = AsyncMock(return_value=True)
+
+        recovered = await manager.handle_expired_session()
+
+        self.assertTrue(recovered)
+        manager.refresh_pa_browser_session.assert_awaited_once()
+        self.assertTrue(any("Session expired. Re-authentication successful" in event for event in manager.events))
 
     async def test_login_status_checker_prompts_browser_refresh_in_steam_mode(self):
         manager = self.make_task_manager()
@@ -2610,14 +2966,17 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 ][0]
                 self.assertEqual(session_tile[2], "Authenticated")
 
-    async def test_login_refresh_without_pa_credentials_does_not_log_backend_warning(self):
+    async def test_login_refresh_without_pa_credentials_runs_backend_refresh(self):
         app = self.make_app()
+        app.task_manager.login = AsyncMock()
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)):
                 await app.login_refresh()
 
-        self.assertEqual(list(app.task_manager.events), [])
-        self.assertIn("Add Pearl Abyss credentials", app.status_message)
+        app.task_manager.login.assert_awaited_once()
+        self.assertEqual(len(app.task_manager.events), 1)
+        self.assertIn("Fetching session status", app.task_manager.events[0])
+        self.assertEqual(app.status_message, "Login check complete.")
 
     async def test_app_settings_clear_saved_session_button_resets_marketplace_session(self):
         app = self.make_app()
@@ -2760,14 +3119,14 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertEqual(type(app.screen_stack[-1]).__name__, "SessionModal")
                 self.assertEqual(len(list(app.screen_stack[-1].query("#session-status-tile"))), 0)
-                self.assertTrue(app.query_visible_one("#refresh-session", Button).disabled)
+                self.assertFalse(app.query_visible_one("#refresh-session", Button).disabled)
                 self.assertFalse(app.query_visible_one("#refresh-session", Button).can_focus)
                 console = Console(width=100, color_system=None)
                 with console.capture() as capture:
                     console.print(app.query_visible_one("#session-credentials-tile", Static).content)
                 session_credentials_text = capture.get()
-                self.assertIn("Missing", session_credentials_text)
-                self.assertIn("Open Credentials first", session_credentials_text)
+                self.assertIn("Optional", session_credentials_text)
+                self.assertIn("Manual browser login available", session_credentials_text)
                 await pilot.press("escape")
                 await pilot.click("#tile-success")
                 self.assertEqual(app.current_view, "dashboard")
@@ -2789,7 +3148,9 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.click("#tile-credentials")
                 await pilot.pause()
                 mode_select = app.query_visible_one("#account-mode-select", Select)
-                self.assertIn("OS keyring password", str(app.query_visible_one("#credentials-mode-note", Static).render()))
+                note_text = str(app.query_visible_one("#credentials-mode-note", Static).render())
+                self.assertIn("saved credentials when available", note_text)
+                self.assertIn("visible browser for manual login", note_text)
                 self.assertEqual(len(list(app.query("#credentials-email-tile"))), 0)
                 self.assertEqual(len(list(app.query("#credentials-password-tile"))), 0)
                 self.assertEqual(len(list(app.query("#credentials-status-tile"))), 0)

@@ -4,7 +4,11 @@ import time
 from collections import deque
 from datetime import datetime
 
-from bdo_marketplace_tools.market.api_handler import DEFAULT_PURCHASE_DELAY_BOUNDS, MarketplaceAPIError
+from bdo_marketplace_tools.market.api_handler import (
+    DEFAULT_PURCHASE_DELAY_BOUNDS,
+    MarketplaceAPIError,
+    MarketplaceResponseError,
+)
 from bdo_marketplace_tools.market.browser_auth import (
     BrowserAuthError,
     acquire_steam_market_cookies,
@@ -34,7 +38,7 @@ from bdo_marketplace_tools.storage.app_settings import (
     save_steam_browser_profile_prepared,
 )
 from bdo_marketplace_tools.storage.local_stats import DEFAULT_LOCAL_STATS, load_local_stats, save_local_stats
-from bdo_marketplace_tools.storage.paths import LOCAL_STATS_PATH
+from bdo_marketplace_tools.storage.paths import LOCAL_STATS_PATH, PA_MARKET_PROFILE_PATH
 from bdo_marketplace_tools.ui.display import EVENT_LEVEL_COLORS, format_duration
 
 LOCAL_DATA_PATH = LOCAL_STATS_PATH
@@ -43,6 +47,11 @@ DEBUG_OUTFIT_LISTING = [["debug-premium-outfit", "1", "2020000000"]]
 MAX_ERROR_BACKOFF_MULTIPLIER = 6
 EVENT_LOG_LIMIT = 20
 SIMULATED_SESSION_EMAIL = "test-session@example.local"
+BROWSER_VERIFICATION_MARKERS = (
+    "browser verification",
+    "manual browser verification",
+    "requires browser",
+)
 
 
 def _load_local_data():
@@ -226,6 +235,13 @@ class BackgroundTasks:
         if self.persist_ui_settings:
             save_buy_mode(self.purchase_submission_enabled)
         return self.purchase_submission_enabled
+
+    def pause_buy_mode_for_session_refresh(self, reason):
+        if not self.purchase_submission_enabled:
+            return False
+        self.set_purchase_submission_enabled(False)
+        self.add_event(f"{reason} Buy mode paused until Refresh Session succeeds.", "warning")
+        return True
 
     def _persist_polling_settings(self):
         if self.persist_ui_settings:
@@ -666,7 +682,13 @@ class BackgroundTasks:
             else:
                 reauthenticated = await self.api_handler.ensure_session_valid()
         except MarketplaceAPIError as exc:
+            if self._requires_browser_verification(exc):
+                if await self.refresh_pa_browser_session(login_error=exc):
+                    self.add_event("Re-authentication succeeded. Retrying purchase request.", "success")
+                    return True
+
             self._set_saved_session_last_known_valid(False)
+            self.pause_buy_mode_for_session_refresh("Re-authentication failed.")
             self.add_event(f"Re-authentication failed: {exc}", "error")
             return False
 
@@ -676,6 +698,7 @@ class BackgroundTasks:
             return True
 
         self._set_saved_session_last_known_valid(False)
+        self.pause_buy_mode_for_session_refresh("Re-authentication failed.")
         self.add_event("Re-authentication failed.", "error")
         return False
 
@@ -739,8 +762,32 @@ class BackgroundTasks:
                     purchase_delay_bounds=self.purchase_delay_bounds,
                 )
             except MarketplaceAPIError as exc:
+                if not self.uses_steam_browser_session() and self._requires_browser_verification(exc):
+                    self.pause_buy_mode_for_session_refresh("Purchase authentication failed.")
                 self.add_event(f"Purchase request failed: {exc}", "error")
                 return
+
+            if (
+                not self.uses_steam_browser_session()
+                and self._purchase_summary_requires_browser_verification(summary)
+                and not summary.get("purchase_records")
+            ):
+                if await self.refresh_pa_browser_session(
+                    login_error=MarketplaceResponseError("purchase preflight requires browser verification")
+                ):
+                    try:
+                        summary = await self.api_handler.buy_item(
+                            capped_buy_list,
+                            purchase_delay_bounds=self.purchase_delay_bounds,
+                        )
+                    except MarketplaceAPIError as exc:
+                        if self._requires_browser_verification(exc):
+                            self.pause_buy_mode_for_session_refresh("Purchase authentication failed.")
+                        self.add_event(f"Purchase retry failed: {exc}", "error")
+                        return
+
+            if not self.uses_steam_browser_session() and self._purchase_summary_has_auth_failure(summary):
+                self.pause_buy_mode_for_session_refresh("Purchase authentication failed.")
 
             if self.uses_steam_browser_session() and self._purchase_summary_has_expired_session(summary):
                 if await self._recover_purchase_session_for_retry():
@@ -761,6 +808,36 @@ class BackgroundTasks:
     def _purchase_summary_has_expired_session(self, summary):
         for result in summary.get("results", []):
             if isinstance(result, dict) and result.get("result_code") == 2000:
+                return True
+        return False
+
+    def _purchase_summary_requires_browser_verification(self, summary):
+        for event in summary.get("events", []):
+            if isinstance(event, dict):
+                message = event.get("message", "")
+            else:
+                message = event
+            if self._requires_browser_verification(message):
+                return True
+        return False
+
+    def _purchase_summary_has_auth_failure(self, summary):
+        for event in summary.get("events", []):
+            if isinstance(event, dict):
+                message = event.get("message", "")
+            else:
+                message = event
+            normalized = str(message).lower()
+            if any(
+                marker in normalized
+                for marker in (
+                    "re-authentication failed",
+                    "login session is invalid",
+                    "refresh session before buying",
+                    "browser verification",
+                    "requires browser",
+                )
+            ):
                 return True
         return False
 
@@ -840,21 +917,21 @@ class BackgroundTasks:
             return
 
         if not self.api_handler.email or not self.api_handler.password:
-            self._set_saved_session_last_known_valid(False)
-            if session_check_error:
-                self.add_event(
-                    f"Session check failed: {session_check_error}. Configure credentials before logging in.",
-                    "warning",
-                )
-            else:
-                self.add_event("Please configure credentials before logging in.", "warning")
+            if not await self.refresh_pa_browser_session(session_check_error=session_check_error):
+                self.pause_buy_mode_for_session_refresh("Pearl Abyss Account refresh failed.")
             return
 
         try:
             status = await self.api_handler.login()
         except MarketplaceAPIError as exc:
+            if self._requires_browser_verification(exc):
+                if not await self.refresh_pa_browser_session(session_check_error=session_check_error, login_error=exc):
+                    self.pause_buy_mode_for_session_refresh("Pearl Abyss Account refresh failed.")
+                return
+
             self.api_handler.login_status = False
             self._set_saved_session_last_known_valid(False)
+            self.pause_buy_mode_for_session_refresh("Pearl Abyss Account refresh failed.")
             if session_check_error:
                 self.add_event(f"Session check failed: {session_check_error}. Login failed: {exc}", "error")
             else:
@@ -875,10 +952,60 @@ class BackgroundTasks:
             self.start_login_status_checker()
         else:
             self._set_saved_session_last_known_valid(False)
+            self.pause_buy_mode_for_session_refresh("Pearl Abyss Account refresh failed.")
             if session_check_error:
                 self.add_event(f"Session check failed: {session_check_error}. Login failed.", "error")
             else:
                 self.add_event("Login failed.", "error")
+
+    def _requires_browser_verification(self, exc):
+        message = str(exc).lower()
+        return any(marker in message for marker in BROWSER_VERIFICATION_MARKERS)
+
+    async def refresh_pa_browser_session(self, session_check_error=None, login_error=None):
+        details = []
+        if session_check_error:
+            details.append(f"Session check failed: {session_check_error}.")
+        if login_error:
+            details.append(f"Password login needs browser verification: {login_error}.")
+        details.append("Opening Pearl Abyss Account browser session for manual login.")
+        self.add_event(" ".join(details), "warning")
+
+        try:
+            cookies = await acquire_steam_market_cookies(
+                status_callback=self._browser_auth_status,
+                auto_steam_login=False,
+                profile_path=PA_MARKET_PROFILE_PATH,
+                account_label="Pearl Abyss Account",
+            )
+        except BrowserAuthError as exc:
+            self.api_handler.login_status = False
+            self._set_saved_session_last_known_valid(False)
+            self.add_event(f"Pearl Abyss Account browser refresh failed: {exc}", "error")
+            return False
+
+        try:
+            session_valid = await self.api_handler.validate_and_save_imported_session(cookies)
+        except MarketplaceAPIError as exc:
+            self.api_handler.login_status = False
+            self._set_saved_session_last_known_valid(False)
+            self.add_event(f"Pearl Abyss Account browser session validation failed: {exc}", "error")
+            return False
+
+        if session_valid:
+            self.api_handler.login_status = True
+            self._set_saved_session_last_known_valid(True)
+            self.start_login_status_checker()
+            self.add_event("Pearl Abyss Account browser session validated and saved.", "success")
+            return True
+
+        self.api_handler.login_status = False
+        self._set_saved_session_last_known_valid(False)
+        self.add_event(
+            "Pearl Abyss Account browser session validation failed. Complete login in the browser and retry.",
+            "error",
+        )
+        return False
 
     async def refresh_browser_session(self, session_check_error=None, *, auto_steam_login=None):
         if self.steam_browser_profile_needs_setup():
@@ -1033,7 +1160,13 @@ class BackgroundTasks:
         try:
             login_status = await self.api_handler.login()
         except MarketplaceAPIError as exc:
+            if self._requires_browser_verification(exc):
+                if await self.refresh_pa_browser_session(login_error=exc):
+                    self.add_event("Session expired. Re-authentication successful.", "success")
+                    return True
+
             self._set_saved_session_last_known_valid(False)
+            self.pause_buy_mode_for_session_refresh("Session expired. Pearl Abyss Account refresh required.")
             self.add_event(f"Session expired. Re-authentication failed: {exc}", "error")
             return False
 
@@ -1045,5 +1178,6 @@ class BackgroundTasks:
             return True
 
         self._set_saved_session_last_known_valid(False)
+        self.pause_buy_mode_for_session_refresh("Session expired. Pearl Abyss Account refresh required.")
         self.add_event("Session expired. Re-authentication failed.", "error")
         return False
