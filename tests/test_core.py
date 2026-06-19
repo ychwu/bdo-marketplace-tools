@@ -20,6 +20,7 @@ from bdo_marketplace_tools.market.api_handler import (
     purchase_result_message,
 )
 from bdo_marketplace_tools.market.browser_auth import (
+    BDO_SITE_BOOTSTRAP_URL,
     BrowserAuthError,
     COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS,
     COOKIEBOT_DIALOG_DETECTION_TIMEOUT_MS,
@@ -42,7 +43,9 @@ from bdo_marketplace_tools.market.browser_auth import (
     _accept_required_cookie_consent_if_available,
     _browser_launch_error_message,
     _classify_url,
+    acquire_market_cookies,
     clear_steam_browser_profile_cookies,
+    _close_browser_context,
     _has_steam_login_cookie,
     _market_cookie_capture_ready,
     _maybe_run_steam_auto_login,
@@ -477,6 +480,143 @@ class APIResultTests(unittest.TestCase):
         self.assertTrue(fake_context.cleared)
         self.assertTrue(fake_context.closed)
 
+    def test_market_cookie_acquisition_bootstraps_profile_before_auth_start(self):
+        class FakePlaywrightManager:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class FakePage:
+            def __init__(self):
+                self.goto_calls = []
+                self.closed = False
+
+            async def goto(self, url, wait_until=None, timeout=None):
+                self.goto_calls.append((url, wait_until, timeout))
+
+            def is_closed(self):
+                return self.closed
+
+            async def close(self, run_before_unload=None):
+                self.closed = True
+
+        class FakeContext:
+            def __init__(self, page):
+                self.pages = [page]
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+
+        fake_page = FakePage()
+        fake_context = FakeContext(fake_page)
+        captured_cookies = [{"name": "TradeAuth_Session", "value": "ok"}]
+        auth_start_url = "https://na-trade.naeu.playblackdesert.com/"
+
+        async def wait_for_cookies(*_args, **_kwargs):
+            for _attempt in range(10):
+                if len(fake_page.goto_calls) >= 2:
+                    break
+                await asyncio.sleep(0)
+            return captured_cookies
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "patchright.async_api.async_playwright",
+            return_value=FakePlaywrightManager(),
+        ), patch(
+            "bdo_marketplace_tools.market.browser_auth._launch_persistent_chrome_context",
+            new=AsyncMock(return_value=fake_context),
+        ), patch(
+            "bdo_marketplace_tools.market.browser_auth._accept_required_cookie_consent_if_available",
+            new=AsyncMock(return_value=COOKIE_CONSENT_NOT_FOUND),
+        ) as cookie_consent, patch(
+            "bdo_marketplace_tools.market.browser_auth._wait_for_market_cookies",
+            new=AsyncMock(side_effect=wait_for_cookies),
+        ) as wait_for_cookies:
+            cookies = asyncio.run(
+                acquire_market_cookies(
+                    profile_path=Path(temp_dir),
+                    start_url=auth_start_url,
+                    bootstrap_url=BDO_SITE_BOOTSTRAP_URL,
+                    account_label="Pearl Abyss Account",
+                )
+            )
+
+        self.assertEqual(cookies, captured_cookies)
+        self.assertEqual(
+            fake_page.goto_calls,
+            [
+                (BDO_SITE_BOOTSTRAP_URL, "domcontentloaded", 60000),
+                (auth_start_url, "domcontentloaded", 60000),
+            ],
+        )
+        cookie_consent.assert_awaited_once_with(
+            fake_page,
+            None,
+            profile_label="Pearl Abyss Account browser profile",
+        )
+        wait_for_cookies.assert_awaited_once()
+        self.assertTrue(fake_page.closed)
+        self.assertTrue(fake_context.closed)
+
+    def test_browser_context_close_closes_pages_before_context(self):
+        async def run_close():
+            close_order = []
+
+            class FakePage:
+                def __init__(self):
+                    self.closed = False
+
+                def is_closed(self):
+                    return self.closed
+
+                async def close(self, run_before_unload=None):
+                    self.closed = True
+                    close_order.append(("page", run_before_unload))
+
+            class FakeContext:
+                def __init__(self):
+                    self.page = FakePage()
+                    self.pages = [self.page]
+
+                async def close(self):
+                    close_order.append(("context", None))
+
+            fake_context = FakeContext()
+            await _close_browser_context(fake_context)
+            return fake_context, close_order
+
+        fake_context, close_order = asyncio.run(run_close())
+
+        self.assertTrue(fake_context.page.closed)
+        self.assertEqual(close_order, [("page", False), ("context", None)])
+
+    def test_browser_context_close_warns_when_context_close_hangs(self):
+        async def run_close():
+            statuses = []
+
+            class FakeContext:
+                pages = []
+
+                async def close(self):
+                    await asyncio.Event().wait()
+
+            async def status_callback(message, level):
+                statuses.append((message, level))
+
+            with patch("bdo_marketplace_tools.market.browser_auth.BROWSER_CONTEXT_CLOSE_TIMEOUT_SECONDS", 0.01):
+                await _close_browser_context(FakeContext(), status_callback=status_callback)
+            return statuses
+
+        statuses = asyncio.run(run_close())
+
+        self.assertEqual(
+            statuses,
+            [("Browser cookies were captured, but Chrome did not close cleanly. Close it manually if it remains open.", "warning")],
+        )
+
     def test_market_cookie_wait_timeout_uses_account_label(self):
         class FakeContext:
             pages = []
@@ -871,13 +1011,29 @@ class APIResultTests(unittest.TestCase):
         self.assertFalse(_should_attempt_steam_auto_login("market", False, True))
         self.assertTrue(_should_attempt_steam_auto_login("pa", True, False))
 
-    def test_market_cookie_capture_allows_fast_auto_redirect_after_auth_flow(self):
-        cookies = [{"name": "anonymous-looking-cookie", "value": "ok"}]
+    def test_market_cookie_capture_requires_fresh_session_after_auth_flow(self):
+        baseline = {"old"}
+        stale = [{"name": "TradeAuth_Session", "value": "old"}]
+        fresh = [{"name": "TradeAuth_Session", "value": "new"}]
+        token_only = [{"name": "__RequestVerificationToken", "value": "t"}]
 
-        self.assertFalse(_market_cookie_capture_ready(cookies, False, True, False))
-        self.assertTrue(_market_cookie_capture_ready(cookies, False, True, True))
-        self.assertTrue(_market_cookie_capture_ready(cookies, True, False, False))
-        self.assertFalse(_market_cookie_capture_ready(cookies, False, False, True))
+        # No marketplace session cookie at all -> never ready.
+        self.assertFalse(_market_cookie_capture_ready(token_only, baseline, False, True, True))
+        self.assertFalse(_market_cookie_capture_ready([], baseline, True, True, True))
+
+        # A fresh session cookie issued after an auth flow -> ready immediately (no market wait).
+        self.assertTrue(_market_cookie_capture_ready(fresh, baseline, False, False, True))
+        # Fresh cookie with only the OAuth callback observed -> ready.
+        self.assertTrue(_market_cookie_capture_ready(fresh, baseline, True, False, False))
+
+        # A stale pre-login cookie during an auth flow must NOT trigger capture (finding A).
+        self.assertFalse(_market_cookie_capture_ready(stale, baseline, False, False, True))
+        self.assertFalse(_market_cookie_capture_ready(stale, baseline, False, True, True))
+
+        # Saved browser session still valid: reached market with no auth detour -> ready.
+        self.assertTrue(_market_cookie_capture_ready(stale, baseline, False, True, False))
+        # First-ever login where the profile had no prior session cookie -> fresh, ready.
+        self.assertTrue(_market_cookie_capture_ready(fresh, set(), False, False, True))
 
     def test_browser_auth_launch_error_names_missing_google_chrome(self):
         message = _browser_launch_error_message(
@@ -950,10 +1106,13 @@ class LocalRuntimeFileTests(unittest.TestCase):
             with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
                 self.assertEqual(account_mode_module.load_account_mode(), PA_CREDENTIALS_MODE)
                 self.assertFalse(account_mode_module.load_steam_browser_profile_prepared())
+                self.assertFalse(account_mode_module.load_pa_browser_profile_prepared())
                 self.assertEqual(account_mode_module.save_account_mode(STEAM_BROWSER_MODE), STEAM_BROWSER_MODE)
                 self.assertTrue(account_mode_module.save_steam_browser_profile_prepared(True))
+                self.assertTrue(account_mode_module.save_pa_browser_profile_prepared(True))
                 self.assertEqual(account_mode_module.load_account_mode(), STEAM_BROWSER_MODE)
                 self.assertTrue(account_mode_module.load_steam_browser_profile_prepared())
+                self.assertTrue(account_mode_module.load_pa_browser_profile_prepared())
                 self.assertEqual(account_mode_module.account_mode_label(STEAM_BROWSER_MODE), "Steam Account")
                 self.assertEqual(account_mode_module.account_mode_label(PA_CREDENTIALS_MODE), "Pearl Abyss Account")
                 self.assertEqual(account_mode_module.normalize_account_mode("Steam Account"), STEAM_BROWSER_MODE)
@@ -968,6 +1127,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertEqual(saved_settings["account"]["mode"], STEAM_BROWSER_MODE)
             self.assertIsNone(saved_settings["account"]["email"])
             self.assertTrue(saved_settings["steam_browser"]["profile_prepared"])
+            self.assertTrue(saved_settings["pa_browser"]["profile_prepared"])
             self.assertFalse(saved_settings["session"]["saved_session_last_known_valid"])
             self.assertEqual(saved_settings["ui"]["polling"]["selected"], "3")
             self.assertEqual(saved_settings["ui"]["polling"]["custom_range"], [15, 30])
@@ -1067,6 +1227,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertEqual(settings["account"]["mode"], PA_CREDENTIALS_MODE)
             self.assertIsNone(settings["account"]["email"])
             self.assertFalse(settings["steam_browser"]["profile_prepared"])
+            self.assertFalse(settings["pa_browser"]["profile_prepared"])
             saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
             self.assertEqual(saved_settings, settings)
 
@@ -1092,6 +1253,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertEqual(settings["version"], EXPECTED_APP_SETTINGS_VERSION)
             self.assertEqual(settings["account"]["mode"], STEAM_BROWSER_MODE)
             self.assertEqual(settings["account"]["email"], "user@example.com")
+            self.assertFalse(settings["pa_browser"]["profile_prepared"])
             saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
             self.assertEqual(saved_settings["version"], EXPECTED_APP_SETTINGS_VERSION)
 
@@ -1764,7 +1926,10 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()), patch(
             "bdo_marketplace_tools.services.task_manager.load_account_mode",
             return_value=PA_CREDENTIALS_MODE,
-        ), patch("bdo_marketplace_tools.services.task_manager.load_steam_browser_profile_prepared", return_value=True):
+        ), patch(
+            "bdo_marketplace_tools.services.task_manager.load_steam_browser_profile_prepared",
+            return_value=True,
+        ), patch("bdo_marketplace_tools.services.task_manager.load_pa_browser_profile_prepared", return_value=True):
             return BackgroundTasks(FakeAPI(), test_mode_enabled=test_mode_enabled, persist_ui_settings=False)
 
     async def test_event_logs_split_core_and_ui_streams_while_preserving_combined_events(self):
@@ -2132,6 +2297,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
 
         browser_auth.assert_awaited_once()
         self.assertEqual(browser_auth.await_args.kwargs["profile_path"], PA_MARKET_PROFILE_PATH)
+        self.assertIsNone(browser_auth.await_args.kwargs["bootstrap_url"])
         self.assertEqual(browser_auth.await_args.kwargs["account_label"], "Pearl Abyss Account")
         self.assertFalse(browser_auth.await_args.kwargs["auto_steam_login"])
         self.assertTrue(browser_auth.await_args.kwargs["auto_pa_login"])
@@ -2143,6 +2309,53 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manager.saved_session_last_known_valid)
         self.assertFalse(manager.steam_auto_reauth_enabled)
         self.assertTrue(any("Pearl Abyss Account browser session validated and saved" in event for event in manager.events))
+        await manager.stop_login_status_checker()
+
+    async def test_pa_browser_refresh_bootstraps_fresh_profile_once_then_marks_prepared(self):
+        manager = self.make_task_manager()
+        manager.persist_ui_settings = True
+        manager.pa_browser_profile_prepared = False
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.load_credentials",
+            return_value=("user@example.com", "secret"),
+        ), patch(
+            "bdo_marketplace_tools.services.task_manager.save_pa_browser_profile_prepared",
+            return_value=True,
+        ) as save_prepared, patch(
+            "bdo_marketplace_tools.services.task_manager.save_saved_session_last_known_valid",
+            return_value=True,
+        ), patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ) as browser_auth:
+            refreshed = await manager.refresh_pa_browser_session()
+
+        self.assertTrue(refreshed)
+        browser_auth.assert_awaited_once()
+        self.assertEqual(browser_auth.await_args.kwargs["bootstrap_url"], BDO_SITE_BOOTSTRAP_URL)
+        save_prepared.assert_called_once_with(True)
+        self.assertTrue(manager.pa_browser_profile_prepared)
+        await manager.stop_login_status_checker()
+
+    async def test_pa_browser_refresh_skips_bootstrap_after_profile_is_prepared(self):
+        manager = self.make_task_manager()
+        manager.pa_browser_profile_prepared = True
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.load_credentials",
+            return_value=("user@example.com", "secret"),
+        ), patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ) as browser_auth:
+            refreshed = await manager.refresh_pa_browser_session()
+
+        self.assertTrue(refreshed)
+        browser_auth.assert_awaited_once()
+        self.assertIsNone(browser_auth.await_args.kwargs["bootstrap_url"])
         await manager.stop_login_status_checker()
 
     async def test_pa_login_in_memory_credentials_without_saved_password_do_not_auto_submit(self):
@@ -2509,12 +2722,40 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(recovered)
         manager.api_handler.login.assert_not_called()
-        manager.refresh_pa_browser_session.assert_awaited_once()
+        manager.refresh_pa_browser_session.assert_awaited_once_with(force_refresh=True)
         self.assertTrue(manager.api_handler.login_status)
         self.assertTrue(manager.purchase_submission_enabled)
         self.assertFalse(manager.debug_force_purchase_session_expired)
         self.assertTrue(any("Simulated purchase response: login session expired" in event for event in manager.events))
         self.assertTrue(any("Re-authentication succeeded. Retrying purchase request" in event for event in manager.events))
+
+    async def test_debug_reauthentication_check_forces_pa_browser_refresh_when_session_looks_valid(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+        manager.api_handler.login_status = True
+        manager.purchase_submission_enabled = True
+        manager.pa_browser_profile_prepared = True
+        manager.api_handler.is_session_expired = AsyncMock(return_value=0)
+        manager.api_handler.login = AsyncMock(return_value=1)
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
+        manager.debug_invalidate_marketplace_session()
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.load_credentials",
+            return_value=("user@example.com", "secret"),
+        ), patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ) as browser_auth:
+            recovered = await manager.debug_run_reauthentication_check()
+
+        self.assertTrue(recovered)
+        manager.api_handler.login.assert_not_called()
+        manager.api_handler.is_session_expired.assert_not_awaited()
+        browser_auth.assert_awaited_once()
+        self.assertFalse(browser_auth.await_args.kwargs["auto_steam_login"])
+        self.assertTrue(browser_auth.await_args.kwargs["auto_pa_login"])
+        self.assertIsNone(browser_auth.await_args.kwargs["bootstrap_url"])
+        self.assertFalse(manager.debug_force_purchase_session_expired)
 
     async def test_debug_reauthentication_check_uses_browser_refresh_in_steam_mode(self):
         manager = self.make_task_manager(test_mode_enabled=True)
@@ -2528,9 +2769,34 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(recovered)
         manager.api_handler.login.assert_not_called()
-        manager.refresh_browser_session.assert_awaited_once()
+        manager.refresh_browser_session.assert_awaited_once_with(force_refresh=True)
         self.assertTrue(manager.purchase_submission_enabled)
         self.assertTrue(any("Re-authentication succeeded. Retrying purchase request" in event for event in manager.events))
+
+    async def test_debug_reauthentication_check_forces_steam_browser_refresh_when_session_looks_valid(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.login_status = True
+        manager.purchase_submission_enabled = True
+        manager.steam_browser_profile_prepared = True
+        manager.api_handler.is_session_expired = AsyncMock(return_value=0)
+        manager.api_handler.login = AsyncMock(return_value=1)
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
+        manager.debug_invalidate_marketplace_session()
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ) as browser_auth:
+            recovered = await manager.debug_run_reauthentication_check()
+
+        self.assertTrue(recovered)
+        manager.api_handler.login.assert_not_called()
+        manager.api_handler.is_session_expired.assert_not_awaited()
+        browser_auth.assert_awaited_once()
+        self.assertTrue(browser_auth.await_args.kwargs["auto_steam_login"])
+        self.assertFalse(manager.debug_force_purchase_session_expired)
 
     async def test_pa_purchase_reauth_uses_browser_refresh(self):
         manager = self.make_task_manager()

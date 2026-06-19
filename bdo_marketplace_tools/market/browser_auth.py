@@ -11,7 +11,8 @@ from bdo_marketplace_tools.storage.paths import (
 
 
 AUTH_START_URL = f"{TRADE_URL}/"
-STEAM_PROFILE_PREP_START_URL = "https://www.naeu.playblackdesert.com/en-US"
+BDO_SITE_BOOTSTRAP_URL = "https://www.naeu.playblackdesert.com/en-US"
+STEAM_PROFILE_PREP_START_URL = BDO_SITE_BOOTSTRAP_URL
 STEAM_PROFILE_PREP_LOGIN_URL = "https://store.steampowered.com/login"
 STEAM_STORE_URL = "https://store.steampowered.com/"
 STEAM_COMMUNITY_URL = "https://steamcommunity.com/"
@@ -31,9 +32,8 @@ OTP_ROUTE_MARKERS = (
     "/en-us/Member/SignIn/OTPAuthenticate",
 )
 OAUTH_CALLBACK_PATH = "/Pearlabyss/Oauth2CallBack"
-LIKELY_MARKET_AUTH_COOKIE_NAMES = {
+MARKET_SESSION_COOKIE_NAMES = {
     "TradeAuth_Session",
-    "__RequestVerificationToken",
 }
 DEFAULT_BROWSER_AUTH_TIMEOUT_SECONDS = 900
 DEFAULT_STEAM_PROFILE_SETUP_TIMEOUT_SECONDS = 900
@@ -82,6 +82,8 @@ PA_AUTO_LOGIN_FILL_TIMEOUT_MS = 1000
 PA_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
 PA_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
 BROWSER_AUTH_POLL_SECONDS = 0.25
+BROWSER_PAGE_CLOSE_TIMEOUT_SECONDS = 0.5
+BROWSER_CONTEXT_CLOSE_TIMEOUT_SECONDS = 2
 STEAM_PROFILE_SETUP_POLL_SECONDS = 0.5
 STEAM_AUTO_LOGIN_DISABLED = "disabled"
 STEAM_AUTO_LOGIN_CLICKED = "clicked"
@@ -116,6 +118,7 @@ async def acquire_market_cookies(
     timeout_seconds=DEFAULT_BROWSER_AUTH_TIMEOUT_SECONDS,
     profile_path=STEAM_MARKET_PROFILE_PATH,
     start_url=AUTH_START_URL,
+    bootstrap_url=None,
     auto_steam_login=False,
     auto_pa_login=False,
     pa_email=None,
@@ -146,32 +149,34 @@ async def acquire_market_cookies(
     try:
         async with async_playwright() as playwright:
             context = await _launch_persistent_chrome_context(playwright, profile_path)
-            page = context.pages[0] if context.pages else await context.new_page()
             try:
-                await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
-            except Exception:
-                await _emit_status(status_callback, f"Waiting for {account_label} login in the browser.", "info")
-
-            return await _wait_for_market_cookies(
-                context,
-                status_callback,
-                timeout_seconds,
-                auto_steam_login=auto_steam_login,
-                auto_pa_login=auto_pa_login,
-                pa_email=pa_email,
-                pa_password=pa_password,
-                account_label=account_label,
-            )
+                page = context.pages[0] if context.pages else await context.new_page()
+                if bootstrap_url:
+                    await _bootstrap_browser_profile(page, status_callback, bootstrap_url, account_label)
+                try:
+                    await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
+                except Exception:
+                    await _emit_status(status_callback, f"Waiting for {account_label} login in the browser.", "info")
+                return await _wait_for_market_cookies(
+                    context,
+                    status_callback,
+                    timeout_seconds,
+                    auto_steam_login=auto_steam_login,
+                    auto_pa_login=auto_pa_login,
+                    pa_email=pa_email,
+                    pa_password=pa_password,
+                    account_label=account_label,
+                )
+            finally:
+                await _close_browser_context(context, status_callback)
+                context = None
     except BrowserAuthError:
         raise
     except Exception as exc:
         raise BrowserAuthError(_browser_launch_error_message(exc)) from exc
     finally:
         if context is not None:
-            try:
-                await context.close()
-            except Exception:
-                pass
+            await _close_browser_context(context, status_callback)
 
 
 async def prepare_steam_browser_profile(
@@ -325,6 +330,14 @@ async def _wait_for_market_cookies(
     auto_login_state = _new_steam_auto_login_state()
     pa_auto_login_state = _new_pa_auto_login_state()
 
+    # Snapshot any marketplace session cookie value already in the persistent profile so a
+    # fresh login is recognized by a *changed* TradeAuth_Session value, not its mere presence.
+    # This is what lets capture close as soon as login completes without waiting for the market
+    # page, while never closing on a stale pre-login cookie left over in the profile.
+    baseline_session_values = _market_session_cookie_values(
+        filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
+    )
+
     while asyncio.get_running_loop().time() < deadline:
         now = asyncio.get_running_loop().time()
         pages = [page for page in context.pages if not _page_is_closed(page)]
@@ -369,13 +382,67 @@ async def _wait_for_market_cookies(
             if pa_login_result in {PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_MANUAL_NEEDED}:
                 auth_flow_seen = True
         cookies = filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
-        if _market_cookie_capture_ready(cookies, callback_seen, market_active, auth_flow_seen):
-            await _emit_status(status_callback, "Marketplace cookies captured. Validating session.", "info")
+        if _market_cookie_capture_ready(cookies, baseline_session_values, callback_seen, market_active, auth_flow_seen):
+            await _emit_status(status_callback, "Marketplace cookies captured. Closing browser before validation.", "info")
             return cookies
 
         await asyncio.sleep(BROWSER_AUTH_POLL_SECONDS)
 
     raise BrowserAuthError(f"{account_label} browser session timed out before Central Market cookies were captured.")
+
+
+async def _close_browser_context(context, status_callback=None):
+    pages = [page for page in getattr(context, "pages", []) or [] if not _page_is_closed(page)]
+    if pages:
+        await asyncio.gather(*[_close_page_quickly(page) for page in pages], return_exceptions=True)
+
+    try:
+        await asyncio.wait_for(context.close(), timeout=BROWSER_CONTEXT_CLOSE_TIMEOUT_SECONDS)
+    except Exception:
+        await _emit_status(
+            status_callback,
+            "Browser cookies were captured, but Chrome did not close cleanly. Close it manually if it remains open.",
+            "warning",
+        )
+
+
+async def _close_page_quickly(page):
+    close_page = getattr(page, "close", None)
+    if close_page is None:
+        return
+    try:
+        close_result = close_page(run_before_unload=False)
+    except TypeError:
+        close_result = close_page()
+    except Exception:
+        return
+
+    if inspect.isawaitable(close_result):
+        try:
+            await asyncio.wait_for(close_result, timeout=BROWSER_PAGE_CLOSE_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+
+
+async def _bootstrap_browser_profile(page, status_callback, bootstrap_url, account_label):
+    try:
+        await _emit_status(
+            status_callback,
+            f"Preparing {account_label} browser profile from the Black Desert site.",
+            "info",
+        )
+        await page.goto(bootstrap_url, wait_until="domcontentloaded", timeout=60000)
+        await _accept_required_cookie_consent_if_available(
+            page,
+            status_callback,
+            profile_label=f"{account_label} browser profile",
+        )
+    except Exception:
+        await _emit_status(
+            status_callback,
+            f"{account_label} browser profile preparation was skipped; continuing to marketplace login.",
+            "warning",
+        )
 
 
 async def _launch_persistent_chrome_context(playwright, profile_path):
@@ -446,7 +513,7 @@ async def _steam_store_logged_in_dom_ready(page):
     return False
 
 
-async def _accept_required_cookie_consent_if_available(page, status_callback=None):
+async def _accept_required_cookie_consent_if_available(page, status_callback=None, *, profile_label="Steam browser profile"):
     if not await _cookiebot_dialog_visible(page):
         return COOKIE_CONSENT_NOT_FOUND
 
@@ -457,7 +524,7 @@ async def _accept_required_cookie_consent_if_available(page, status_callback=Non
             continue
 
         if await _cookiebot_dialog_hidden(page):
-            await _emit_status(status_callback, "Required cookie consent saved in the Steam browser profile.", "info")
+            await _emit_status(status_callback, f"Required cookie consent saved in the {profile_label}.", "info")
             return COOKIE_CONSENT_SAVED
         else:
             await _emit_status(
@@ -800,18 +867,47 @@ def _domain_applies_to_market(domain):
     return False
 
 
-def _has_likely_market_auth_cookie(cookies):
-    return any(cookie.get("name") in LIKELY_MARKET_AUTH_COOKIE_NAMES for cookie in cookies)
+def _has_market_session_cookie(cookies):
+    return any(cookie.get("name") in MARKET_SESSION_COOKIE_NAMES for cookie in cookies or [])
 
 
-def _market_cookie_capture_ready(cookies, callback_seen, market_active, auth_flow_seen):
-    if not cookies:
+def _market_session_cookie_values(cookies):
+    values = set()
+    for cookie in cookies or []:
+        if cookie.get("name") in MARKET_SESSION_COOKIE_NAMES:
+            value = cookie.get("value")
+            if value:
+                values.add(value)
+    return values
+
+
+def _has_fresh_market_session_cookie(cookies, baseline_session_values):
+    for cookie in cookies or []:
+        if cookie.get("name") in MARKET_SESSION_COOKIE_NAMES:
+            value = cookie.get("value")
+            if value and value not in baseline_session_values:
+                return True
+    return False
+
+
+def _market_cookie_capture_ready(cookies, baseline_session_values, callback_seen, market_active, auth_flow_seen):
+    if not _has_market_session_cookie(cookies):
         return False
-    if callback_seen:
+
+    # Fast path: an auth flow happened and a *new* marketplace session cookie was issued. This
+    # fires the moment login completes (the cookie is set on the OAuth callback) instead of
+    # waiting for the heavy market page to load, and it can never trip on a stale pre-login
+    # cookie because the value must differ from the pre-login baseline.
+    if (auth_flow_seen or callback_seen) and _has_fresh_market_session_cookie(cookies, baseline_session_values):
         return True
-    if not market_active:
-        return False
-    return bool(auth_flow_seen or _has_likely_market_auth_cookie(cookies))
+
+    # Saved browser session was still valid: the market loaded with no auth detour, so the
+    # existing session cookie is the live one. An expired profile would have redirected to the
+    # login page first (auth_flow_seen), so this never captures a stale session.
+    if market_active and not auth_flow_seen:
+        return True
+
+    return False
 
 
 def _classify_url(url):

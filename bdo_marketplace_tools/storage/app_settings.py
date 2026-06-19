@@ -8,6 +8,7 @@ PA_CREDENTIALS_MODE = "pa_credentials"
 STEAM_BROWSER_MODE = "steam_browser"
 DEFAULT_ACCOUNT_MODE = PA_CREDENTIALS_MODE
 STEAM_BROWSER_PROFILE_PREPARED_KEY = "steam_browser_profile_prepared"
+PA_BROWSER_PROFILE_PREPARED_KEY = "pa_browser_profile_prepared"
 SETTINGS_VERSION = SETTINGS_SCHEMA_VERSION
 DEFAULT_POLLING_DELAY_KEY = "3"
 DEFAULT_CUSTOM_POLLING_RANGE = [15, 30]
@@ -55,6 +56,9 @@ def default_app_settings():
             "email": None,
         },
         "steam_browser": {
+            "profile_prepared": False,
+        },
+        "pa_browser": {
             "profile_prepared": False,
         },
         "session": {
@@ -154,6 +158,7 @@ def _normalize_settings(data):
     settings = default_app_settings()
     account = data.get("account") if isinstance(data.get("account"), dict) else {}
     steam_browser = data.get("steam_browser") if isinstance(data.get("steam_browser"), dict) else {}
+    pa_browser = data.get("pa_browser") if isinstance(data.get("pa_browser"), dict) else {}
     session = data.get("session") if isinstance(data.get("session"), dict) else {}
     ui = data.get("ui") if isinstance(data.get("ui"), dict) else {}
     polling = ui.get("polling") if isinstance(ui.get("polling"), dict) else {}
@@ -170,6 +175,8 @@ def _normalize_settings(data):
 
     prepared = steam_browser.get("profile_prepared", data.get(STEAM_BROWSER_PROFILE_PREPARED_KEY, False))
     settings["steam_browser"]["profile_prepared"] = _coerce_bool(prepared)
+    pa_prepared = pa_browser.get("profile_prepared", data.get(PA_BROWSER_PROFILE_PREPARED_KEY, False))
+    settings["pa_browser"]["profile_prepared"] = _coerce_bool(pa_prepared)
 
     settings["session"]["saved_session_last_known_valid"] = _coerce_bool(
         session.get("saved_session_last_known_valid", data.get("saved_session_last_known_valid", False))
@@ -233,6 +240,16 @@ def save_steam_browser_profile_prepared(prepared=True):
     settings = read_app_settings()
     settings["steam_browser"]["profile_prepared"] = bool(prepared)
     return save_app_settings(settings)["steam_browser"]["profile_prepared"]
+
+
+def load_pa_browser_profile_prepared():
+    return read_app_settings()["pa_browser"]["profile_prepared"]
+
+
+def save_pa_browser_profile_prepared(prepared=True):
+    settings = read_app_settings()
+    settings["pa_browser"]["profile_prepared"] = bool(prepared)
+    return save_app_settings(settings)["pa_browser"]["profile_prepared"]
 
 
 def load_saved_email():

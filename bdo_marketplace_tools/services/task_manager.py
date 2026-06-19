@@ -9,6 +9,7 @@ from bdo_marketplace_tools.market.api_handler import (
     MarketplaceAPIError,
 )
 from bdo_marketplace_tools.market.browser_auth import (
+    BDO_SITE_BOOTSTRAP_URL,
     BrowserAuthError,
     acquire_market_cookies,
     clear_steam_browser_profile_cookies,
@@ -23,6 +24,7 @@ from bdo_marketplace_tools.storage.app_settings import (
     account_mode_label,
     default_app_settings,
     load_account_mode,
+    load_pa_browser_profile_prepared,
     load_saved_session_last_known_valid,
     load_steam_browser_profile_prepared,
     load_ui_settings,
@@ -30,6 +32,7 @@ from bdo_marketplace_tools.storage.app_settings import (
     save_account_mode,
     save_buy_mode,
     save_event_log_view,
+    save_pa_browser_profile_prepared,
     save_polling_settings,
     save_purchase_delay_bounds,
     save_saved_session_last_known_valid,
@@ -75,6 +78,7 @@ class BackgroundTasks:
         self.account_mode = load_account_mode()
         self.api_handler.account_mode = self.account_mode
         self.steam_browser_profile_prepared = load_steam_browser_profile_prepared()
+        self.pa_browser_profile_prepared = load_pa_browser_profile_prepared()
         self.saved_session_last_known_valid = (
             load_saved_session_last_known_valid() if self.persist_ui_settings else False
         )
@@ -310,6 +314,12 @@ class BackgroundTasks:
 
     def steam_browser_profile_needs_setup(self):
         return self.uses_steam_browser_session() and not self.steam_browser_profile_prepared
+
+    def _set_pa_browser_profile_prepared(self, prepared):
+        self.pa_browser_profile_prepared = bool(prepared)
+        if self.persist_ui_settings:
+            self.pa_browser_profile_prepared = save_pa_browser_profile_prepared(prepared)
+        return self.pa_browser_profile_prepared
 
     def set_account_mode(self, mode):
         normalized = normalize_account_mode(mode)
@@ -621,7 +631,7 @@ class BackgroundTasks:
             return False
 
         self.add_event("Simulated purchase response: login session expired.", "warning")
-        recovered = await self._recover_purchase_session_for_retry(force_pa_relogin=True)
+        recovered = await self._recover_purchase_session_for_retry(force_browser_refresh=True)
         if recovered:
             self.debug_force_purchase_session_expired = False
         return recovered
@@ -680,11 +690,11 @@ class BackgroundTasks:
         self.add_event("Initial Steam browser setup saved. Refresh Session can now open the market login.", "success")
         return True
 
-    async def _recover_purchase_session_for_retry(self, *, force_pa_relogin=False):
+    async def _recover_purchase_session_for_retry(self, *, force_browser_refresh=False):
         self.add_event("Login session expired. Attempting to re-authenticate.", "warning")
 
         if self.uses_steam_browser_session():
-            refreshed = await self.refresh_browser_session()
+            refreshed = await self.refresh_browser_session(force_refresh=force_browser_refresh)
             if refreshed:
                 self.add_event("Re-authentication succeeded. Retrying purchase request.", "success")
                 return True
@@ -692,7 +702,7 @@ class BackgroundTasks:
             self.add_event("Re-authentication failed. Purchase retry skipped.", "error")
             return False
 
-        if await self.refresh_pa_browser_session():
+        if await self.refresh_pa_browser_session(force_refresh=force_browser_refresh):
             self._set_saved_session_last_known_valid(True)
             self.add_event("Re-authentication succeeded. Retrying purchase request.", "success")
             return True
@@ -937,9 +947,16 @@ class BackgroundTasks:
             self.api_handler.password = saved_password
         return saved_email, saved_password, None
 
-    async def refresh_pa_browser_session(self, session_check_error=None, login_error=None, *, auto_pa_login=None):
+    async def refresh_pa_browser_session(
+        self,
+        session_check_error=None,
+        login_error=None,
+        *,
+        auto_pa_login=None,
+        force_refresh=False,
+    ):
         async with self.browser_auth_lock:
-            if await self._saved_session_is_valid():
+            if not force_refresh and await self._saved_session_is_valid():
                 return True
 
             details = []
@@ -962,6 +979,10 @@ class BackgroundTasks:
             self.add_event(" ".join(details), "warning")
 
             try:
+                bootstrap_url = None
+                if not self.pa_browser_profile_prepared:
+                    bootstrap_url = BDO_SITE_BOOTSTRAP_URL
+
                 cookies = await acquire_market_cookies(
                     status_callback=self._browser_auth_status,
                     auto_steam_login=False,
@@ -969,6 +990,7 @@ class BackgroundTasks:
                     pa_email=email if auto_submit_credentials else None,
                     pa_password=password if auto_submit_credentials else None,
                     profile_path=PA_MARKET_PROFILE_PATH,
+                    bootstrap_url=bootstrap_url,
                     account_label="Pearl Abyss Account",
                 )
             except BrowserAuthError as exc:
@@ -987,6 +1009,7 @@ class BackgroundTasks:
 
             if session_valid:
                 self.api_handler.login_status = True
+                self._set_pa_browser_profile_prepared(True)
                 self._set_saved_session_last_known_valid(True)
                 self.start_login_status_checker()
                 self.add_event("Pearl Abyss Account browser session validated and saved.", "success")
@@ -1000,9 +1023,9 @@ class BackgroundTasks:
             )
             return False
 
-    async def refresh_browser_session(self, session_check_error=None, *, auto_steam_login=None):
+    async def refresh_browser_session(self, session_check_error=None, *, auto_steam_login=None, force_refresh=False):
         async with self.browser_auth_lock:
-            if await self._saved_session_is_valid():
+            if not force_refresh and await self._saved_session_is_valid():
                 return True
 
             if self.steam_browser_profile_needs_setup():
