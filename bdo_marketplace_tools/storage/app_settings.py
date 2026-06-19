@@ -22,7 +22,7 @@ ACCOUNT_MODE_LABELS = {
 }
 
 ACCOUNT_MODE_DETAILS = {
-    PA_CREDENTIALS_MODE: "Email/password refresh",
+    PA_CREDENTIALS_MODE: "Browser login",
     STEAM_BROWSER_MODE: "Browser refresh",
 }
 

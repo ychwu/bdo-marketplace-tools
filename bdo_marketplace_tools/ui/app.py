@@ -1018,7 +1018,7 @@ class MarketplaceToolsApp(App[None]):
                 )
         else:
             note.update(
-                "Pearl Abyss Account uses saved credentials when available. Refresh Session can also open a visible browser for manual login."
+                "Pearl Abyss Account uses a visible browser login. Saved credentials are entered automatically when available."
             )
 
         try:
@@ -1221,7 +1221,7 @@ class MarketplaceToolsApp(App[None]):
             "session-credentials-tile",
             "Credentials",
             "Set" if credentials_ready else "Optional",
-            "Saved credential login" if credentials_ready else "Manual browser login available",
+            "Automatic browser login" if credentials_ready else "Manual browser login available",
             "success" if credentials_ready else "info",
             True,
         )

@@ -55,6 +55,22 @@ PA_STEAM_LOGIN_SELECTORS = (
     "button[data-type='steam']",
     "button:has-text('Log in with Steam')",
 )
+PA_EMAIL_SELECTORS = (
+    "#_email",
+    "input[name='_email']",
+    "input[inputmode='email']",
+)
+PA_PASSWORD_SELECTORS = (
+    "#_password",
+    "input[name='_password']",
+    "input[type='password']",
+)
+PA_LOGIN_BUTTON_SELECTORS = (
+    "#btnLogin",
+    "button.js-btnLastLoginCheck",
+    "button[data-type='original']",
+    "button:has-text('Log in')",
+)
 STEAM_CONFIRM_LOGIN_SELECTORS = (
     "#imageLogin",
     "input[type='submit'][value='Sign In']",
@@ -62,6 +78,9 @@ STEAM_CONFIRM_LOGIN_SELECTORS = (
 )
 STEAM_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
 STEAM_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
+PA_AUTO_LOGIN_FILL_TIMEOUT_MS = 1000
+PA_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
+PA_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
 BROWSER_AUTH_POLL_SECONDS = 0.25
 STEAM_PROFILE_SETUP_POLL_SECONDS = 0.5
 STEAM_AUTO_LOGIN_DISABLED = "disabled"
@@ -69,6 +88,11 @@ STEAM_AUTO_LOGIN_CLICKED = "clicked"
 STEAM_AUTO_LOGIN_WAITING = "waiting"
 STEAM_AUTO_LOGIN_MANUAL_NEEDED = "manual_needed"
 STEAM_AUTO_LOGIN_SKIPPED = "skipped"
+PA_AUTO_LOGIN_DISABLED = "disabled"
+PA_AUTO_LOGIN_SUBMITTED = "submitted"
+PA_AUTO_LOGIN_WAITING = "waiting"
+PA_AUTO_LOGIN_MANUAL_NEEDED = "manual_needed"
+PA_AUTO_LOGIN_SKIPPED = "skipped"
 STEAM_LOGIN_COOKIE_NAMES = {
     "steamLoginSecure",
 }
@@ -86,13 +110,16 @@ class BrowserAuthUnavailable(BrowserAuthError):
     pass
 
 
-async def acquire_steam_market_cookies(
+async def acquire_market_cookies(
     status_callback=None,
     *,
     timeout_seconds=DEFAULT_BROWSER_AUTH_TIMEOUT_SECONDS,
     profile_path=STEAM_MARKET_PROFILE_PATH,
     start_url=AUTH_START_URL,
     auto_steam_login=False,
+    auto_pa_login=False,
+    pa_email=None,
+    pa_password=None,
     account_label="Steam Account",
 ):
     try:
@@ -108,6 +135,10 @@ async def acquire_steam_market_cookies(
     if auto_steam_login:
         opening_message = (
             f"Opening {account_label} browser session in Chrome. Automatic Steam re-auth will continue when possible."
+        )
+    elif auto_pa_login:
+        opening_message = (
+            f"Opening {account_label} browser session in Chrome. Saved Pearl Abyss credentials will be submitted when possible."
         )
     await _emit_status(status_callback, opening_message, "info")
 
@@ -126,6 +157,9 @@ async def acquire_steam_market_cookies(
                 status_callback,
                 timeout_seconds,
                 auto_steam_login=auto_steam_login,
+                auto_pa_login=auto_pa_login,
+                pa_email=pa_email,
+                pa_password=pa_password,
                 account_label=account_label,
             )
     except BrowserAuthError:
@@ -279,6 +313,9 @@ async def _wait_for_market_cookies(
     timeout_seconds,
     *,
     auto_steam_login=False,
+    auto_pa_login=False,
+    pa_email=None,
+    pa_password=None,
     account_label="Steam Account",
 ):
     deadline = asyncio.get_running_loop().time() + float(timeout_seconds)
@@ -286,6 +323,7 @@ async def _wait_for_market_cookies(
     auth_flow_seen = False
     emitted_states = set()
     auto_login_state = _new_steam_auto_login_state()
+    pa_auto_login_state = _new_pa_auto_login_state()
 
     while asyncio.get_running_loop().time() < deadline:
         now = asyncio.get_running_loop().time()
@@ -317,6 +355,18 @@ async def _wait_for_market_cookies(
                     now=now,
                 )
             if auto_login_result in {STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_MANUAL_NEEDED}:
+                auth_flow_seen = True
+            pa_login_result = await _maybe_run_pa_credentials_login(
+                page,
+                state,
+                enabled=auto_pa_login,
+                email=pa_email,
+                password=pa_password,
+                tracking=pa_auto_login_state,
+                status_callback=status_callback,
+                now=now,
+            )
+            if pa_login_result in {PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_MANUAL_NEEDED}:
                 auth_flow_seen = True
         cookies = filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
         if _market_cookie_capture_ready(cookies, callback_seen, market_active, auth_flow_seen):
@@ -438,6 +488,14 @@ def _new_steam_auto_login_state():
     }
 
 
+def _new_pa_auto_login_state():
+    return {
+        "submitted": set(),
+        "missing_started_at": {},
+        "missing_reported": set(),
+    }
+
+
 def _should_attempt_steam_auto_login(state, auth_flow_seen, callback_seen):
     if state == "market" and (auth_flow_seen or callback_seen):
         return False
@@ -513,6 +571,129 @@ async def _maybe_run_steam_auto_login_target(
     return STEAM_AUTO_LOGIN_WAITING
 
 
+async def _maybe_run_pa_credentials_login(
+    page,
+    state,
+    *,
+    enabled,
+    email,
+    password,
+    tracking,
+    status_callback=None,
+    now=None,
+    missing_notice_seconds=PA_AUTO_LOGIN_MISSING_NOTICE_SECONDS,
+):
+    if not enabled or not email or not password:
+        return PA_AUTO_LOGIN_DISABLED
+
+    targets = _pa_credentials_login_targets(page, state)
+    if not targets:
+        return PA_AUTO_LOGIN_SKIPPED
+
+    now = asyncio.get_running_loop().time() if now is None else now
+    result = PA_AUTO_LOGIN_SKIPPED
+    for scope in targets:
+        scope_result = await _maybe_run_pa_credentials_login_target(
+            scope,
+            email,
+            password,
+            tracking=tracking,
+            status_callback=status_callback,
+            now=now,
+            missing_notice_seconds=missing_notice_seconds,
+        )
+        if scope_result in {PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_MANUAL_NEEDED}:
+            return scope_result
+        if scope_result == PA_AUTO_LOGIN_WAITING:
+            result = PA_AUTO_LOGIN_WAITING
+
+    return result
+
+
+async def _maybe_run_pa_credentials_login_target(
+    scope,
+    email,
+    password,
+    *,
+    tracking,
+    status_callback,
+    now,
+    missing_notice_seconds,
+):
+    key = (id(scope), "pa_credentials_login", getattr(scope, "url", ""))
+    if key in tracking["submitted"]:
+        return PA_AUTO_LOGIN_SKIPPED
+
+    credentials_filled = await _fill_pa_credentials(scope, email, password)
+    if credentials_filled and await _click_first_available_selector(
+        scope,
+        PA_LOGIN_BUTTON_SELECTORS,
+        timeout=PA_AUTO_LOGIN_CLICK_TIMEOUT_MS,
+    ):
+        tracking["submitted"].add(key)
+        tracking["missing_started_at"].pop(key, None)
+        await _emit_status(status_callback, "Automatic Pearl Abyss login submitted saved credentials.", "info")
+        return PA_AUTO_LOGIN_SUBMITTED
+
+    started_at = tracking["missing_started_at"].setdefault(key, now)
+    if now - started_at >= missing_notice_seconds and key not in tracking["missing_reported"]:
+        tracking["missing_reported"].add(key)
+        await _emit_status(
+            status_callback,
+            "Automatic Pearl Abyss login is waiting for manual input on the Pearl Abyss page.",
+            "warning",
+        )
+        return PA_AUTO_LOGIN_MANUAL_NEEDED
+
+    return PA_AUTO_LOGIN_WAITING
+
+
+async def _fill_pa_credentials(scope, email, password):
+    email_filled = await _fill_first_available_selector(
+        scope,
+        PA_EMAIL_SELECTORS,
+        str(email),
+        timeout=PA_AUTO_LOGIN_FILL_TIMEOUT_MS,
+    )
+    if not email_filled:
+        return False
+    return await _fill_first_available_selector(
+        scope,
+        PA_PASSWORD_SELECTORS,
+        str(password),
+        timeout=PA_AUTO_LOGIN_FILL_TIMEOUT_MS,
+    )
+
+
+def _pa_credentials_login_targets(page, state):
+    targets = []
+    seen = set()
+
+    def add_target(scope, target_state):
+        if target_state != "pa":
+            return
+        key = id(scope)
+        if key in seen:
+            return
+        seen.add(key)
+        targets.append(scope)
+
+    add_target(page, _pa_credentials_login_target_state(state))
+    for frame in getattr(page, "frames", []) or []:
+        frame_state, _is_callback = _classify_url(getattr(frame, "url", ""))
+        add_target(frame, _pa_credentials_login_target_state(frame_state))
+
+    return targets
+
+
+def _pa_credentials_login_target_state(state):
+    if state == "pa":
+        return "pa"
+    if state is None:
+        return "pa"
+    return None
+
+
 def _steam_auto_login_targets(page, state):
     targets = []
     seen = set()
@@ -564,6 +745,16 @@ async def _click_first_available_selector(page, selectors, timeout):
     for selector in selectors:
         try:
             await page.locator(selector).first.click(timeout=timeout)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def _fill_first_available_selector(page, selectors, value, timeout):
+    for selector in selectors:
+        try:
+            await page.locator(selector).first.fill(value, timeout=timeout)
             return True
         except Exception:
             continue
