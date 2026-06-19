@@ -348,12 +348,13 @@ class APIResultTests(unittest.TestCase):
             def __init__(self, selector):
                 self.selector = selector
 
-            async def click(self, trial=None, timeout=None):
-                # Steam button is occluded by the banner, so its trial click fails; only the
-                # decline button is actionable.
+            async def click(self, timeout=None):
                 if self.selector != "#CybotCookiebotDialogBodyButtonDecline":
                     raise RuntimeError("not found")
                 clicked_selectors.append((self.selector, timeout))
+
+            async def is_visible(self, timeout=None):
+                return self.selector == "#btnSteam"
 
         class FakeLocator:
             def __init__(self, selector):
@@ -393,19 +394,19 @@ class APIResultTests(unittest.TestCase):
         self.assertEqual(statuses, [("Required cookie consent saved in the Pearl Abyss login page.", "info")])
 
     def test_pa_cookie_consent_probe_marks_done_when_banner_is_absent(self):
-        trial_clicks = []
+        checked_selectors = []
         tracking = _new_pa_cookie_consent_state()
 
         class FakeFirstLocator:
             def __init__(self, selector):
                 self.selector = selector
 
-            async def click(self, trial=None, timeout=None):
-                # No banner is overlaying the button, so the trial click succeeds.
-                if self.selector == "#btnSteam" and trial:
-                    trial_clicks.append((self.selector, timeout))
-                    return None
+            async def click(self, timeout=None):
                 raise RuntimeError("not found")
+
+            async def is_visible(self, timeout=None):
+                checked_selectors.append((self.selector, timeout))
+                return self.selector == "#btnSteam"
 
         class FakeLocator:
             def __init__(self, selector):
@@ -427,14 +428,17 @@ class APIResultTests(unittest.TestCase):
 
         self.assertEqual(result, COOKIE_CONSENT_NOT_FOUND)
         self.assertEqual(second_result, COOKIE_CONSENT_SKIPPED)
-        self.assertEqual(trial_clicks, [("#btnSteam", 250)])
+        self.assertEqual(checked_selectors, [("#btnSteam", 250)])
 
     def test_pa_cookie_consent_probe_waits_until_login_page_is_ready(self):
         tracking = _new_pa_cookie_consent_state()
 
         class FakeFirstLocator:
-            async def click(self, trial=None, timeout=None):
+            async def click(self, timeout=None):
                 raise RuntimeError("not found")
+
+            async def is_visible(self, timeout=None):
+                return False
 
         class FakeLocator:
             first = FakeFirstLocator()
@@ -3233,7 +3237,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.buy_item.assert_awaited_once()
         manager.refresh_pa_browser_session.assert_awaited_once()
         self.assertFalse(manager.purchase_submission_enabled)
-        self.assertTrue(any("Re-enable buy mode after refreshing the session" in event for event in manager.events))
+        self.assertTrue(any("will resume automatically once the session is refreshed" in event for event in manager.events))
 
     async def test_pa_buy_structured_auth_failure_pauses_when_message_has_no_marker(self):
         manager = self.make_task_manager()
@@ -3257,7 +3261,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.buy_item.assert_awaited_once()
         manager.refresh_pa_browser_session.assert_awaited_once()
         self.assertFalse(manager.purchase_submission_enabled)
-        self.assertTrue(any("Re-enable buy mode after refreshing the session" in event for event in manager.events))
+        self.assertTrue(any("will resume automatically once the session is refreshed" in event for event in manager.events))
 
     async def test_pa_buy_preflight_browser_refresh_failure_pauses_buy_mode(self):
         manager = self.make_task_manager()
@@ -3280,7 +3284,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.buy_item.assert_awaited_once()
         manager.refresh_pa_browser_session.assert_awaited_once()
         self.assertFalse(manager.purchase_submission_enabled)
-        self.assertTrue(any("Re-enable buy mode after refreshing the session" in event for event in manager.events))
+        self.assertTrue(any("will resume automatically once the session is refreshed" in event for event in manager.events))
 
     async def test_pa_buy_browser_verification_summary_with_prior_purchase_does_not_retry_batch(self):
         manager = self.make_task_manager()
@@ -3334,7 +3338,30 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.login.assert_not_called()
         manager.refresh_pa_browser_session.assert_awaited_once()
         self.assertFalse(manager.purchase_submission_enabled)
-        self.assertTrue(any("Re-enable buy mode after refreshing the session" in event for event in manager.events))
+        self.assertTrue(manager.buy_mode_resume_pending)
+        self.assertTrue(any("will resume automatically once the session is refreshed" in event for event in manager.events))
+
+    async def test_paused_buy_mode_auto_resumes_after_refresh(self):
+        manager = self.make_task_manager()
+        manager.purchase_submission_enabled = True
+        # App-driven pause (e.g. session expired mid-run) marks buy mode for auto-resume.
+        self.assertTrue(manager.pause_buy_mode_for_session_refresh("Session expired."))
+        self.assertFalse(manager.purchase_submission_enabled)
+        self.assertTrue(manager.buy_mode_resume_pending)
+
+        # A subsequent successful refresh resumes buy mode automatically (continuity).
+        self.assertTrue(manager.resume_buy_mode_after_refresh())
+        self.assertTrue(manager.purchase_submission_enabled)
+        self.assertFalse(manager.buy_mode_resume_pending)
+        self.assertTrue(any("buy mode resumed" in event.lower() for event in manager.events))
+
+    async def test_resume_does_not_re_enable_user_disabled_buy_mode(self):
+        manager = self.make_task_manager()
+        # Buy mode off with nothing pending (e.g. the user turned it off, or watch-only).
+        manager.purchase_submission_enabled = False
+        manager.buy_mode_resume_pending = False
+        self.assertFalse(manager.resume_buy_mode_after_refresh())
+        self.assertFalse(manager.purchase_submission_enabled)
 
     async def test_expired_pa_session_uses_browser_refresh(self):
         manager = self.make_task_manager()

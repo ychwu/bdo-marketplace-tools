@@ -50,32 +50,61 @@ def normalize_account_mode(mode):
 
 
 def default_app_settings():
+    # This is the source-of-truth schema for data/app_settings.json. JSON cannot hold comments,
+    # so each persisted setting is documented here. Values written to disk mirror this shape.
     return {
+        # App/settings metadata (schema version, app version, channel, project). Refreshed on
+        # every read/save; not user-editable and not a behavioral setting.
         "version": _current_version_info(),
         "account": {
+            # Active login method: "pa_credentials" (Pearl Abyss) or "steam_browser" (Steam).
             "mode": DEFAULT_ACCOUNT_MODE,
+            # Saved Pearl Abyss account email. The password is stored in the OS keyring, never here.
             "email": None,
         },
         "steam_browser": {
+            # True once the one-time Steam Initial Setup is complete (Steam logged into the
+            # app-owned browser profile). Until True, Refresh Session must run setup first.
             "profile_prepared": False,
+            # >>> Controls the Pearl Abyss login-page cookie-box (Cookiebot) check. <<<
+            # While False, the next automatic Steam refresh probes for the consent banner and
+            # dismisses it ("Only Accept Required") before clicking "Log in with Steam"; once the
+            # banner is handled (or confirmed absent) this flips True and the probe is skipped on
+            # later refreshes. Reset to False by clearing the Steam browser cookies or resetting
+            # Steam setup (also self-reset if a Steam refresh fails while this was skipping it).
             "pa_cookie_consent_prepared": False,
         },
         "pa_browser": {
+            # True once a Pearl Abyss browser profile has been seeded from the Black Desert
+            # homepage before its first successful marketplace auth (skips the warmup afterward).
             "profile_prepared": False,
         },
         "session": {
+            # True only when the saved marketplace cookies (data/session.json) were last confirmed
+            # valid. Startup auto-checks a saved session only when this is True; otherwise it asks
+            # the user to Refresh Session.
             "saved_session_last_known_valid": False,
         },
         "ui": {
             "polling": {
+                # Marketplace scan-interval preset: "1" Fast (3-5s), "2" Balanced (5-10s),
+                # "3" Slow (15-30s), or "custom".
                 "selected": DEFAULT_POLLING_DELAY_KEY,
+                # Custom [min, max] seconds between scans, used when "selected" == "custom".
                 "custom_range": DEFAULT_CUSTOM_POLLING_RANGE[:],
             },
             "buy_delay": {
+                # [min, max] seconds randomly waited between individual buy requests within one
+                # batch (spacing only; does not affect scan frequency).
                 "range": DEFAULT_PURCHASE_DELAY_RANGE[:],
             },
+            # Max silver to spend in the current app session before purchases stop; None = no cap.
             "spend_cap": None,
+            # Whether buy mode is enabled (vs watch-only). Persisted. Auto-paused on session expiry
+            # and auto-resumed on the next successful session refresh.
             "buy_mode": False,
+            # Which dashboard event-log stream is shown: "core" (monitor/session/API/purchase) or
+            # "ui" (interface confirmations).
             "event_log_view": DEFAULT_EVENT_LOG_VIEW,
         },
     }

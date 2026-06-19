@@ -114,6 +114,7 @@ class BackgroundTasks:
         self.ui_events = deque(maxlen=EVENT_LOG_LIMIT)
         self.event_log_view = ui_settings.get("event_log_view", "core")
         self.purchase_submission_enabled = bool(ui_settings["buy_mode"])
+        self.buy_mode_resume_pending = False
         self.max_spend = ui_settings["spend_cap"]
         self.checker_started_at = None
         self.single_item_test_checker_started_at = None
@@ -242,6 +243,10 @@ class BackgroundTasks:
 
     def set_purchase_submission_enabled(self, enabled):
         self.purchase_submission_enabled = bool(enabled)
+        # Any time buy mode is on, there is nothing pending to auto-resume. This also means a
+        # user explicitly enabling buy mode clears a stale auto-resume flag.
+        if self.purchase_submission_enabled:
+            self.buy_mode_resume_pending = False
         if self.persist_ui_settings:
             save_buy_mode(self.purchase_submission_enabled)
         return self.purchase_submission_enabled
@@ -250,7 +255,21 @@ class BackgroundTasks:
         if not self.purchase_submission_enabled:
             return False
         self.set_purchase_submission_enabled(False)
-        self.add_event(f"{reason} Buy mode paused. Re-enable buy mode after refreshing the session.", "warning")
+        # Remember that the *app* paused buy mode (not the user) so it can auto-resume once the
+        # session is refreshed, keeping the monitor continuous across transient session expiry.
+        self.buy_mode_resume_pending = True
+        self.add_event(
+            f"{reason} Buy mode paused; it will resume automatically once the session is refreshed.",
+            "warning",
+        )
+        return True
+
+    def resume_buy_mode_after_refresh(self):
+        if not self.buy_mode_resume_pending:
+            return False
+        # set_purchase_submission_enabled(True) clears buy_mode_resume_pending.
+        self.set_purchase_submission_enabled(True)
+        self.add_event("Marketplace session refreshed; buy mode resumed.", "success")
         return True
 
     def _persist_polling_settings(self):
@@ -283,6 +302,7 @@ class BackgroundTasks:
             if self.uses_steam_browser_session():
                 self.steam_auto_reauth_enabled = True
             self.start_login_status_checker()
+            self.resume_buy_mode_after_refresh()
             return True
 
         self.api_handler.login_status = False
@@ -943,6 +963,7 @@ class BackgroundTasks:
                 self.steam_auto_reauth_enabled = True
             self.add_event("Existing marketplace session is valid.", "success")
             self.start_login_status_checker()
+            self.resume_buy_mode_after_refresh()
             return
 
         if self.uses_steam_browser_session():
@@ -1034,6 +1055,7 @@ class BackgroundTasks:
                 self._set_saved_session_last_known_valid(True)
                 self.start_login_status_checker()
                 self.add_event("Pearl Abyss Account browser session validated and saved.", "success")
+                self.resume_buy_mode_after_refresh()
                 return True
 
             self.api_handler.login_status = False
@@ -1081,6 +1103,12 @@ class BackgroundTasks:
             except BrowserAuthError as exc:
                 self.api_handler.login_status = False
                 self._set_saved_session_last_known_valid(False)
+                # Self-heal: if an auto-login refresh failed while the one-time PA cookie-consent
+                # probe was being skipped (prepared flag set), re-arm it. A "prepared" flag set
+                # without actually dismissing the Cookiebot banner would otherwise let the banner
+                # block the Steam login button on every future refresh.
+                if auto_steam_login and self.steam_pa_cookie_consent_prepared:
+                    self._set_steam_pa_cookie_consent_prepared(False)
                 self.add_event(f"Steam Account refresh failed: {exc}", "error")
                 return False
 
@@ -1098,6 +1126,7 @@ class BackgroundTasks:
                 self.steam_auto_reauth_enabled = True
                 self.add_event("Steam Account session validated and saved.", "success")
                 self.start_login_status_checker()
+                self.resume_buy_mode_after_refresh()
                 return True
 
             self.api_handler.login_status = False
