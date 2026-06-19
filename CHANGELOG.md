@@ -2,13 +2,9 @@
 
 All notable released changes for `bdo-marketplace-tools` are documented here.
 
-This file is updated by the dedicated release/versioning pass. Ordinary implementation
-threads should add an ignored pending changeset under `.changesets/` instead of bumping
-`APP_VERSION` or editing released sections directly.
-
 ## Unreleased
 
-Pending changes are collected from ignored `.changesets/` files during a release pass.
+No released changes yet.
 
 ## 1.1.0-beta - 2026-06-19
 
