@@ -11,7 +11,8 @@ from bdo_marketplace_tools.storage.paths import (
 
 
 AUTH_START_URL = f"{TRADE_URL}/"
-STEAM_PROFILE_PREP_START_URL = "https://www.naeu.playblackdesert.com/en-US"
+BDO_SITE_BOOTSTRAP_URL = "https://www.naeu.playblackdesert.com/en-US"
+STEAM_PROFILE_PREP_START_URL = BDO_SITE_BOOTSTRAP_URL
 STEAM_PROFILE_PREP_LOGIN_URL = "https://store.steampowered.com/login"
 STEAM_STORE_URL = "https://store.steampowered.com/"
 STEAM_COMMUNITY_URL = "https://steamcommunity.com/"
@@ -31,9 +32,8 @@ OTP_ROUTE_MARKERS = (
     "/en-us/Member/SignIn/OTPAuthenticate",
 )
 OAUTH_CALLBACK_PATH = "/Pearlabyss/Oauth2CallBack"
-LIKELY_MARKET_AUTH_COOKIE_NAMES = {
+MARKET_SESSION_COOKIE_NAMES = {
     "TradeAuth_Session",
-    "__RequestVerificationToken",
 }
 DEFAULT_BROWSER_AUTH_TIMEOUT_SECONDS = 900
 DEFAULT_STEAM_PROFILE_SETUP_TIMEOUT_SECONDS = 900
@@ -50,10 +50,28 @@ COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS = 1500
 COOKIE_CONSENT_SAVED = "saved"
 COOKIE_CONSENT_MANUAL = "manual"
 COOKIE_CONSENT_NOT_FOUND = "not_found"
+COOKIE_CONSENT_WAITING = "waiting"
+COOKIE_CONSENT_SKIPPED = "skipped"
 PA_STEAM_LOGIN_SELECTORS = (
     "#btnSteam",
     "button[data-type='steam']",
     "button:has-text('Log in with Steam')",
+)
+PA_EMAIL_SELECTORS = (
+    "#_email",
+    "input[name='_email']",
+    "input[inputmode='email']",
+)
+PA_PASSWORD_SELECTORS = (
+    "#_password",
+    "input[name='_password']",
+    "input[type='password']",
+)
+PA_LOGIN_BUTTON_SELECTORS = (
+    "#btnLogin",
+    "button.js-btnLastLoginCheck",
+    "button[data-type='original']",
+    "button:has-text('Log in')",
 )
 STEAM_CONFIRM_LOGIN_SELECTORS = (
     "#imageLogin",
@@ -62,13 +80,27 @@ STEAM_CONFIRM_LOGIN_SELECTORS = (
 )
 STEAM_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
 STEAM_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
+# After the Cookiebot banner is dismissed, wait this long before auto-clicking the Steam login
+# button so the page settles and the button's js-btnLastLoginCheck handler rebinds.
+STEAM_POST_CONSENT_SETTLE_SECONDS = 1.0
+PA_AUTO_LOGIN_FILL_TIMEOUT_MS = 1000
+PA_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
+PA_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
+PA_CONSENT_BUTTON_READY_TIMEOUT_MS = 250
 BROWSER_AUTH_POLL_SECONDS = 0.25
+BROWSER_PAGE_CLOSE_TIMEOUT_SECONDS = 0.5
+BROWSER_CONTEXT_CLOSE_TIMEOUT_SECONDS = 2
 STEAM_PROFILE_SETUP_POLL_SECONDS = 0.5
 STEAM_AUTO_LOGIN_DISABLED = "disabled"
 STEAM_AUTO_LOGIN_CLICKED = "clicked"
 STEAM_AUTO_LOGIN_WAITING = "waiting"
 STEAM_AUTO_LOGIN_MANUAL_NEEDED = "manual_needed"
 STEAM_AUTO_LOGIN_SKIPPED = "skipped"
+PA_AUTO_LOGIN_DISABLED = "disabled"
+PA_AUTO_LOGIN_SUBMITTED = "submitted"
+PA_AUTO_LOGIN_WAITING = "waiting"
+PA_AUTO_LOGIN_MANUAL_NEEDED = "manual_needed"
+PA_AUTO_LOGIN_SKIPPED = "skipped"
 STEAM_LOGIN_COOKIE_NAMES = {
     "steamLoginSecure",
 }
@@ -86,13 +118,20 @@ class BrowserAuthUnavailable(BrowserAuthError):
     pass
 
 
-async def acquire_steam_market_cookies(
+async def acquire_market_cookies(
     status_callback=None,
     *,
     timeout_seconds=DEFAULT_BROWSER_AUTH_TIMEOUT_SECONDS,
     profile_path=STEAM_MARKET_PROFILE_PATH,
     start_url=AUTH_START_URL,
+    bootstrap_url=None,
     auto_steam_login=False,
+    auto_pa_login=False,
+    pa_email=None,
+    pa_password=None,
+    handle_pa_cookie_consent=False,
+    pa_cookie_consent_callback=None,
+    account_label="Steam Account",
 ):
     try:
         from patchright.async_api import async_playwright
@@ -103,10 +142,14 @@ async def acquire_steam_market_cookies(
 
     profile_path = Path(profile_path)
     profile_path.mkdir(parents=True, exist_ok=True)
-    opening_message = "Opening Steam Account browser session in Chrome. Complete Steam/PA login in the browser."
+    opening_message = f"Opening {account_label} browser session in Chrome. Complete login in the browser."
     if auto_steam_login:
         opening_message = (
-            "Opening Steam Account browser session in Chrome. Automatic Steam re-auth will continue when possible."
+            f"Opening {account_label} browser session in Chrome. Automatic Steam re-auth will continue when possible."
+        )
+    elif auto_pa_login:
+        opening_message = (
+            f"Opening {account_label} browser session in Chrome. Saved Pearl Abyss credentials will be submitted when possible."
         )
     await _emit_status(status_callback, opening_message, "info")
 
@@ -114,28 +157,36 @@ async def acquire_steam_market_cookies(
     try:
         async with async_playwright() as playwright:
             context = await _launch_persistent_chrome_context(playwright, profile_path)
-            page = context.pages[0] if context.pages else await context.new_page()
             try:
-                await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
-            except Exception:
-                await _emit_status(status_callback, "Waiting for Steam/PA login in the browser.", "info")
-
-            return await _wait_for_market_cookies(
-                context,
-                status_callback,
-                timeout_seconds,
-                auto_steam_login=auto_steam_login,
-            )
+                page = context.pages[0] if context.pages else await context.new_page()
+                if bootstrap_url:
+                    await _bootstrap_browser_profile(page, status_callback, bootstrap_url, account_label)
+                try:
+                    await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
+                except Exception:
+                    await _emit_status(status_callback, f"Waiting for {account_label} login in the browser.", "info")
+                return await _wait_for_market_cookies(
+                    context,
+                    status_callback,
+                    timeout_seconds,
+                    auto_steam_login=auto_steam_login,
+                    auto_pa_login=auto_pa_login,
+                    pa_email=pa_email,
+                    pa_password=pa_password,
+                    handle_pa_cookie_consent=handle_pa_cookie_consent,
+                    pa_cookie_consent_callback=pa_cookie_consent_callback,
+                    account_label=account_label,
+                )
+            finally:
+                await _close_browser_context(context, status_callback)
+                context = None
     except BrowserAuthError:
         raise
     except Exception as exc:
         raise BrowserAuthError(_browser_launch_error_message(exc)) from exc
     finally:
         if context is not None:
-            try:
-                await context.close()
-            except Exception:
-                pass
+            await _close_browser_context(context, status_callback)
 
 
 async def prepare_steam_browser_profile(
@@ -271,52 +322,238 @@ async def clear_steam_browser_profile_cookies(
                 pass
 
 
-async def _wait_for_market_cookies(context, status_callback, timeout_seconds, *, auto_steam_login=False):
+async def _wait_for_market_cookies(
+    context,
+    status_callback,
+    timeout_seconds,
+    *,
+    auto_steam_login=False,
+    auto_pa_login=False,
+    pa_email=None,
+    pa_password=None,
+    handle_pa_cookie_consent=False,
+    pa_cookie_consent_callback=None,
+    account_label="Steam Account",
+):
     deadline = asyncio.get_running_loop().time() + float(timeout_seconds)
     callback_seen = False
     auth_flow_seen = False
     emitted_states = set()
     auto_login_state = _new_steam_auto_login_state()
+    pa_auto_login_state = _new_pa_auto_login_state()
+    pa_cookie_consent_state = _new_pa_cookie_consent_state()
+    pa_cookie_consent_completed = not handle_pa_cookie_consent
+    pa_credentials_submitted = False
 
-    while asyncio.get_running_loop().time() < deadline:
-        now = asyncio.get_running_loop().time()
-        pages = [page for page in context.pages if not _page_is_closed(page)]
-        if not pages:
-            raise BrowserAuthError("Browser closed before a marketplace session could be captured.")
+    # Snapshot any marketplace session cookie value already in the persistent profile so a
+    # fresh login is recognized by a *changed* TradeAuth_Session value, not its mere presence.
+    # This is what lets capture close as soon as login completes without waiting for the market
+    # page, while never closing on a stale pre-login cookie left over in the profile.
+    baseline_session_values = _market_session_cookie_values(
+        filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
+    )
 
-        market_active = False
-        for page in pages:
-            state, is_callback = _classify_url(getattr(page, "url", ""))
-            if is_callback:
-                callback_seen = True
-            if state in {"pa", "steam", "otp"}:
-                auth_flow_seen = True
-            if state == "market":
-                market_active = True
-            if state and state not in emitted_states:
-                emitted_states.add(state)
-                message, level = _status_for_state(state)
-                await _emit_status(status_callback, message, level)
-            auto_login_result = STEAM_AUTO_LOGIN_SKIPPED
-            if _should_attempt_steam_auto_login(state, auth_flow_seen, callback_seen):
-                auto_login_result = await _maybe_run_steam_auto_login(
-                    page,
-                    state,
-                    enabled=auto_steam_login,
-                    tracking=auto_login_state,
-                    status_callback=status_callback,
-                    now=now,
-                )
-            if auto_login_result in {STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_MANUAL_NEEDED}:
-                auth_flow_seen = True
-        cookies = filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
-        if _market_cookie_capture_ready(cookies, callback_seen, market_active, auth_flow_seen):
-            await _emit_status(status_callback, "Marketplace cookies captured. Validating session.", "info")
-            return cookies
+    # The marketplace session cookie the app needs (TradeAuth_Session) is set on the
+    # /Pearlabyss/Oauth2CallBack 302. That redirect never becomes page.url, so URL polling can't
+    # observe it, and the poll loop's own context.cookies() read blocks for several seconds while
+    # the market page navigates after login. So we read cookies the instant the callback *response*
+    # arrives and race that capture against the poll loop (below), closing at login success instead
+    # of after the market page loads. (__RequestVerificationToken lands later, at the market page,
+    # but the app's authenticated calls do not require it.)
+    captured_at_callback = []
+    callback_done = asyncio.Event()
 
-        await asyncio.sleep(BROWSER_AUTH_POLL_SECONDS)
+    async def _read_market_cookies_after_callback():
+        try:
+            cookies = filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
+            if _has_fresh_market_session_cookie(cookies, baseline_session_values):
+                captured_at_callback.append(cookies)
+                callback_done.set()
+        except Exception:
+            pass
 
-    raise BrowserAuthError("Steam Account browser session timed out before Central Market cookies were captured.")
+    def _on_response(response):
+        _state, is_callback = _classify_url(getattr(response, "url", ""))
+        if is_callback:
+            asyncio.ensure_future(_read_market_cookies_after_callback())
+
+    context_on = getattr(context, "on", None)
+    if callable(context_on):
+        context_on("response", _on_response)
+
+    async def _poll_loop():
+        nonlocal callback_seen, auth_flow_seen, pa_credentials_submitted
+        nonlocal pa_cookie_consent_completed
+        while asyncio.get_running_loop().time() < deadline:
+            now = asyncio.get_running_loop().time()
+            pages = [page for page in context.pages if not _page_is_closed(page)]
+            if not pages:
+                raise BrowserAuthError("Browser closed before a marketplace session could be captured.")
+
+            market_active = False
+            for page in pages:
+                state, is_callback = _classify_url(getattr(page, "url", ""))
+                if is_callback:
+                    callback_seen = True
+                if state in {"pa", "steam", "otp"}:
+                    auth_flow_seen = True
+                if state == "market":
+                    market_active = True
+                if state and state not in emitted_states:
+                    emitted_states.add(state)
+                    message, level = _status_for_state(state)
+                    await _emit_status(status_callback, message, level)
+                pa_cookie_consent_result = COOKIE_CONSENT_SKIPPED
+                if not pa_cookie_consent_completed:
+                    pa_cookie_consent_result = await _maybe_prepare_pa_cookie_consent(
+                        page,
+                        state,
+                        tracking=pa_cookie_consent_state,
+                        status_callback=status_callback,
+                    )
+                    if pa_cookie_consent_result in {COOKIE_CONSENT_SAVED, COOKIE_CONSENT_NOT_FOUND}:
+                        pa_cookie_consent_completed = True
+                        await _emit_callback(pa_cookie_consent_callback, pa_cookie_consent_result)
+                    if pa_cookie_consent_result == COOKIE_CONSENT_SAVED:
+                        # The Cookiebot overlay was just removed. Let the page settle and the Steam
+                        # button's js-btnLastLoginCheck handler rebind before auto-clicking it.
+                        # Clicking immediately registers on the button without triggering the login
+                        # navigation, and because the click does not raise it would be marked done
+                        # and never retried (it works on a later, already-consented page load).
+                        await asyncio.sleep(STEAM_POST_CONSENT_SETTLE_SECONDS)
+
+                auto_login_result = STEAM_AUTO_LOGIN_SKIPPED
+                if _should_attempt_steam_auto_login(state, auth_flow_seen, callback_seen):
+                    # Defer the Steam auto-click on the same iteration the banner was dismissed
+                    # (SAVED) so it happens on the next, settled poll rather than mid-teardown.
+                    if pa_cookie_consent_result in {
+                        COOKIE_CONSENT_WAITING,
+                        COOKIE_CONSENT_MANUAL,
+                        COOKIE_CONSENT_SAVED,
+                    }:
+                        auto_login_result = STEAM_AUTO_LOGIN_WAITING
+                    else:
+                        auto_login_result = await _maybe_run_steam_auto_login(
+                            page,
+                            state,
+                            enabled=auto_steam_login,
+                            tracking=auto_login_state,
+                            status_callback=status_callback,
+                            now=now,
+                        )
+                if auto_login_result in {STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_MANUAL_NEEDED}:
+                    auth_flow_seen = True
+                pa_login_result = PA_AUTO_LOGIN_SKIPPED
+                if not pa_credentials_submitted:
+                    pa_login_result = await _maybe_run_pa_credentials_login(
+                        page,
+                        state,
+                        enabled=auto_pa_login,
+                        email=pa_email,
+                        password=pa_password,
+                        tracking=pa_auto_login_state,
+                        status_callback=status_callback,
+                        now=now,
+                    )
+                # Once credentials are submitted, stop re-attempting the fill. The post-submit
+                # redirect pages (LoginProcess/AuthorizeOauth) still classify as "pa" but have no
+                # login form, so retrying would block each poll on the fill timeout.
+                if pa_login_result == PA_AUTO_LOGIN_SUBMITTED:
+                    pa_credentials_submitted = True
+                if pa_login_result in {PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_MANUAL_NEEDED}:
+                    auth_flow_seen = True
+
+            cookies = filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
+            if _market_cookie_capture_ready(cookies, baseline_session_values, callback_seen, market_active, auth_flow_seen):
+                return cookies
+
+            await asyncio.sleep(BROWSER_AUTH_POLL_SECONDS)
+
+        raise BrowserAuthError(f"{account_label} browser session timed out before Central Market cookies were captured.")
+
+    # Run the polling loop and the OAuth-callback capture concurrently and finish on whichever
+    # lands first. The callback capture can complete while the poll loop is parked in a slow,
+    # navigation-blocked context.cookies() read, so it is watched independently here rather than
+    # from inside the loop.
+    poll_task = asyncio.ensure_future(_poll_loop())
+    callback_task = asyncio.ensure_future(callback_done.wait())
+    await asyncio.wait({poll_task, callback_task}, return_when=asyncio.FIRST_COMPLETED)
+
+    if captured_at_callback:
+        poll_task.cancel()
+        callback_task.cancel()
+        for task in (poll_task, callback_task):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await _emit_status(
+            status_callback,
+            "Marketplace cookies captured at login callback. Closing browser before validation.",
+            "info",
+        )
+        return captured_at_callback[0]
+
+    callback_task.cancel()
+    try:
+        await callback_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    return poll_task.result()
+
+
+async def _close_browser_context(context, status_callback=None):
+    pages = [page for page in getattr(context, "pages", []) or [] if not _page_is_closed(page)]
+    if pages:
+        await asyncio.gather(*[_close_page_quickly(page) for page in pages], return_exceptions=True)
+
+    try:
+        await asyncio.wait_for(context.close(), timeout=BROWSER_CONTEXT_CLOSE_TIMEOUT_SECONDS)
+    except Exception:
+        await _emit_status(
+            status_callback,
+            "Browser cookies were captured, but Chrome did not close cleanly. Close it manually if it remains open.",
+            "warning",
+        )
+
+
+async def _close_page_quickly(page):
+    close_page = getattr(page, "close", None)
+    if close_page is None:
+        return
+    try:
+        close_result = close_page(run_before_unload=False)
+    except TypeError:
+        close_result = close_page()
+    except Exception:
+        return
+
+    if inspect.isawaitable(close_result):
+        try:
+            await asyncio.wait_for(close_result, timeout=BROWSER_PAGE_CLOSE_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+
+
+async def _bootstrap_browser_profile(page, status_callback, bootstrap_url, account_label):
+    try:
+        await _emit_status(
+            status_callback,
+            f"Preparing {account_label} browser profile from the Black Desert site.",
+            "info",
+        )
+        await page.goto(bootstrap_url, wait_until="domcontentloaded", timeout=60000)
+        await _accept_required_cookie_consent_if_available(
+            page,
+            status_callback,
+            profile_label=f"{account_label} browser profile",
+        )
+    except Exception:
+        await _emit_status(
+            status_callback,
+            f"{account_label} browser profile preparation was skipped; continuing to marketplace login.",
+            "warning",
+        )
 
 
 async def _launch_persistent_chrome_context(playwright, profile_path):
@@ -387,7 +624,7 @@ async def _steam_store_logged_in_dom_ready(page):
     return False
 
 
-async def _accept_required_cookie_consent_if_available(page, status_callback=None):
+async def _accept_required_cookie_consent_if_available(page, status_callback=None, *, profile_label="Steam browser profile"):
     if not await _cookiebot_dialog_visible(page):
         return COOKIE_CONSENT_NOT_FOUND
 
@@ -398,7 +635,7 @@ async def _accept_required_cookie_consent_if_available(page, status_callback=Non
             continue
 
         if await _cookiebot_dialog_hidden(page):
-            await _emit_status(status_callback, "Required cookie consent saved in the Steam browser profile.", "info")
+            await _emit_status(status_callback, f"Required cookie consent saved in the {profile_label}.", "info")
             return COOKIE_CONSENT_SAVED
         else:
             await _emit_status(
@@ -429,10 +666,81 @@ def _new_steam_auto_login_state():
     }
 
 
+def _new_pa_auto_login_state():
+    return {
+        "submitted": set(),
+        "missing_started_at": {},
+        "missing_reported": set(),
+    }
+
+
+def _new_pa_cookie_consent_state():
+    return {
+        "checked": set(),
+    }
+
+
 def _should_attempt_steam_auto_login(state, auth_flow_seen, callback_seen):
     if state == "market" and (auth_flow_seen or callback_seen):
         return False
     return True
+
+
+async def _maybe_prepare_pa_cookie_consent(
+    page,
+    state,
+    *,
+    tracking,
+    status_callback=None,
+):
+    targets = _pa_cookie_consent_targets(page, state)
+    if not targets:
+        return COOKIE_CONSENT_SKIPPED
+
+    result = COOKIE_CONSENT_SKIPPED
+    for scope in targets:
+        scope_result = await _maybe_prepare_pa_cookie_consent_target(
+            scope,
+            tracking=tracking,
+            status_callback=status_callback,
+        )
+        if scope_result in {COOKIE_CONSENT_SAVED, COOKIE_CONSENT_NOT_FOUND, COOKIE_CONSENT_MANUAL}:
+            return scope_result
+        if scope_result == COOKIE_CONSENT_WAITING:
+            result = COOKIE_CONSENT_WAITING
+
+    return result
+
+
+async def _maybe_prepare_pa_cookie_consent_target(scope, *, tracking, status_callback=None):
+    key = (id(scope), "pa_cookie_consent", getattr(scope, "url", ""))
+    if key in tracking["checked"]:
+        return COOKIE_CONSENT_SKIPPED
+
+    # Probe for the Cookiebot banner FIRST, then confirm the Steam button. Do NOT reorder this to
+    # "check the button first" as a speed optimization: the Cookiebot banner is injected by an
+    # async third-party script and routinely appears *after* the Steam button is already in the
+    # DOM. Checking the button first races that injection — in the gap before the banner loads the
+    # button looks ready, so consent is marked done and the dismissal is skipped, then the banner
+    # appears and blocks the real Steam login click. `_cookiebot_dialog_visible` waits up to
+    # COOKIEBOT_DIALOG_DETECTION_TIMEOUT_MS for the banner so a slightly-late banner is still
+    # caught and dismissed.
+    consent_result = await _accept_required_cookie_consent_if_available(
+        scope,
+        status_callback,
+        profile_label="Pearl Abyss login page",
+    )
+    if consent_result == COOKIE_CONSENT_SAVED:
+        tracking["checked"].add(key)
+        return COOKIE_CONSENT_SAVED
+    if consent_result == COOKIE_CONSENT_MANUAL:
+        return COOKIE_CONSENT_MANUAL
+
+    if await _selector_visible(scope, PA_STEAM_LOGIN_SELECTORS, timeout=PA_CONSENT_BUTTON_READY_TIMEOUT_MS):
+        tracking["checked"].add(key)
+        return COOKIE_CONSENT_NOT_FOUND
+
+    return COOKIE_CONSENT_WAITING
 
 
 async def _maybe_run_steam_auto_login(
@@ -504,6 +812,129 @@ async def _maybe_run_steam_auto_login_target(
     return STEAM_AUTO_LOGIN_WAITING
 
 
+async def _maybe_run_pa_credentials_login(
+    page,
+    state,
+    *,
+    enabled,
+    email,
+    password,
+    tracking,
+    status_callback=None,
+    now=None,
+    missing_notice_seconds=PA_AUTO_LOGIN_MISSING_NOTICE_SECONDS,
+):
+    if not enabled or not email or not password:
+        return PA_AUTO_LOGIN_DISABLED
+
+    targets = _pa_credentials_login_targets(page, state)
+    if not targets:
+        return PA_AUTO_LOGIN_SKIPPED
+
+    now = asyncio.get_running_loop().time() if now is None else now
+    result = PA_AUTO_LOGIN_SKIPPED
+    for scope in targets:
+        scope_result = await _maybe_run_pa_credentials_login_target(
+            scope,
+            email,
+            password,
+            tracking=tracking,
+            status_callback=status_callback,
+            now=now,
+            missing_notice_seconds=missing_notice_seconds,
+        )
+        if scope_result in {PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_MANUAL_NEEDED}:
+            return scope_result
+        if scope_result == PA_AUTO_LOGIN_WAITING:
+            result = PA_AUTO_LOGIN_WAITING
+
+    return result
+
+
+async def _maybe_run_pa_credentials_login_target(
+    scope,
+    email,
+    password,
+    *,
+    tracking,
+    status_callback,
+    now,
+    missing_notice_seconds,
+):
+    key = (id(scope), "pa_credentials_login", getattr(scope, "url", ""))
+    if key in tracking["submitted"]:
+        return PA_AUTO_LOGIN_SKIPPED
+
+    credentials_filled = await _fill_pa_credentials(scope, email, password)
+    if credentials_filled and await _click_first_available_selector(
+        scope,
+        PA_LOGIN_BUTTON_SELECTORS,
+        timeout=PA_AUTO_LOGIN_CLICK_TIMEOUT_MS,
+    ):
+        tracking["submitted"].add(key)
+        tracking["missing_started_at"].pop(key, None)
+        await _emit_status(status_callback, "Automatic Pearl Abyss login submitted saved credentials.", "info")
+        return PA_AUTO_LOGIN_SUBMITTED
+
+    started_at = tracking["missing_started_at"].setdefault(key, now)
+    if now - started_at >= missing_notice_seconds and key not in tracking["missing_reported"]:
+        tracking["missing_reported"].add(key)
+        await _emit_status(
+            status_callback,
+            "Automatic Pearl Abyss login is waiting for manual input on the Pearl Abyss page.",
+            "warning",
+        )
+        return PA_AUTO_LOGIN_MANUAL_NEEDED
+
+    return PA_AUTO_LOGIN_WAITING
+
+
+async def _fill_pa_credentials(scope, email, password):
+    email_filled = await _fill_first_available_selector(
+        scope,
+        PA_EMAIL_SELECTORS,
+        str(email),
+        timeout=PA_AUTO_LOGIN_FILL_TIMEOUT_MS,
+    )
+    if not email_filled:
+        return False
+    return await _fill_first_available_selector(
+        scope,
+        PA_PASSWORD_SELECTORS,
+        str(password),
+        timeout=PA_AUTO_LOGIN_FILL_TIMEOUT_MS,
+    )
+
+
+def _pa_credentials_login_targets(page, state):
+    targets = []
+    seen = set()
+
+    def add_target(scope, target_state):
+        if target_state != "pa":
+            return
+        key = id(scope)
+        if key in seen:
+            return
+        seen.add(key)
+        targets.append(scope)
+
+    add_target(page, _pa_credentials_login_target_state(state))
+    for frame in getattr(page, "frames", []) or []:
+        frame_state, _is_callback = _classify_url(getattr(frame, "url", ""))
+        add_target(frame, _pa_credentials_login_target_state(frame_state))
+
+    return targets
+
+
+def _pa_credentials_login_target_state(state):
+    if state == "pa":
+        return "pa"
+    if state is None:
+        return "pa"
+    return None
+
+
 def _steam_auto_login_targets(page, state):
     targets = []
     seen = set()
@@ -523,6 +954,33 @@ def _steam_auto_login_targets(page, state):
         add_target(frame, _steam_auto_login_target_state(frame_state))
 
     return targets
+
+
+def _pa_cookie_consent_targets(page, state):
+    targets = []
+    seen = set()
+
+    def add_target(scope, target_state):
+        if target_state != "pa":
+            return
+        key = id(scope)
+        if key in seen:
+            return
+        seen.add(key)
+        targets.append(scope)
+
+    add_target(page, _pa_cookie_consent_target_state(state))
+    for frame in getattr(page, "frames", []) or []:
+        frame_state, _is_callback = _classify_url(getattr(frame, "url", ""))
+        add_target(frame, _pa_cookie_consent_target_state(frame_state))
+
+    return targets
+
+
+def _pa_cookie_consent_target_state(state):
+    if state == "pa":
+        return "pa"
+    return None
 
 
 def _steam_auto_login_target_state(state):
@@ -555,6 +1013,26 @@ async def _click_first_available_selector(page, selectors, timeout):
     for selector in selectors:
         try:
             await page.locator(selector).first.click(timeout=timeout)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def _selector_visible(page, selectors, timeout):
+    for selector in selectors:
+        try:
+            if await page.locator(selector).first.is_visible(timeout=timeout):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _fill_first_available_selector(page, selectors, value, timeout):
+    for selector in selectors:
+        try:
+            await page.locator(selector).first.fill(value, timeout=timeout)
             return True
         except Exception:
             continue
@@ -600,18 +1078,47 @@ def _domain_applies_to_market(domain):
     return False
 
 
-def _has_likely_market_auth_cookie(cookies):
-    return any(cookie.get("name") in LIKELY_MARKET_AUTH_COOKIE_NAMES for cookie in cookies)
+def _has_market_session_cookie(cookies):
+    return any(cookie.get("name") in MARKET_SESSION_COOKIE_NAMES for cookie in cookies or [])
 
 
-def _market_cookie_capture_ready(cookies, callback_seen, market_active, auth_flow_seen):
-    if not cookies:
+def _market_session_cookie_values(cookies):
+    values = set()
+    for cookie in cookies or []:
+        if cookie.get("name") in MARKET_SESSION_COOKIE_NAMES:
+            value = cookie.get("value")
+            if value:
+                values.add(value)
+    return values
+
+
+def _has_fresh_market_session_cookie(cookies, baseline_session_values):
+    for cookie in cookies or []:
+        if cookie.get("name") in MARKET_SESSION_COOKIE_NAMES:
+            value = cookie.get("value")
+            if value and value not in baseline_session_values:
+                return True
+    return False
+
+
+def _market_cookie_capture_ready(cookies, baseline_session_values, callback_seen, market_active, auth_flow_seen):
+    if not _has_market_session_cookie(cookies):
         return False
-    if callback_seen:
+
+    # Fast path: an auth flow happened and a *new* marketplace session cookie was issued. This
+    # fires the moment login completes (the cookie is set on the OAuth callback) instead of
+    # waiting for the heavy market page to load, and it can never trip on a stale pre-login
+    # cookie because the value must differ from the pre-login baseline.
+    if (auth_flow_seen or callback_seen) and _has_fresh_market_session_cookie(cookies, baseline_session_values):
         return True
-    if not market_active:
-        return False
-    return bool(auth_flow_seen or _has_likely_market_auth_cookie(cookies))
+
+    # Saved browser session was still valid: the market loaded with no auth detour, so the
+    # existing session cookie is the live one. An expired profile would have redirected to the
+    # login page first (auth_flow_seen), so this never captures a stale session.
+    if market_active and not auth_flow_seen:
+        return True
+
+    return False
 
 
 def _classify_url(url):
@@ -678,5 +1185,13 @@ async def _emit_status(callback, message, level="info"):
     if callback is None:
         return
     result = callback(message, level)
+    if inspect.isawaitable(result):
+        await result
+
+
+async def _emit_callback(callback, *args):
+    if callback is None:
+        return
+    result = callback(*args)
     if inspect.isawaitable(result):
         await result

@@ -2,6 +2,7 @@ import asyncio
 import json
 import random
 import stat
+from urllib.parse import urlparse
 
 import requests
 
@@ -18,8 +19,6 @@ from bdo_marketplace_tools.storage.paths import SESSION_COOKIE_PATH
 REQUEST_TIMEOUT = (5, 20)
 TRADE_URL = "https://na-trade.naeu.playblackdesert.com"
 GAME_TRADE_URL = "https://na-game-trade.naeu.playblackdesert.com"
-ACCOUNT_URL = "https://account.pearlabyss.com"
-LOGIN_URL = f"{ACCOUNT_URL}/en-US/Member/Login/LoginProcess"
 MARKET_COOKIE_HOSTS = (
     "na-trade.naeu.playblackdesert.com",
     "na-game-trade.naeu.playblackdesert.com",
@@ -109,7 +108,6 @@ class APIHandler:
     def __init__(self):
         self.trade_url = TRADE_URL
         self.game_trade_url = GAME_TRADE_URL
-        self.login_url = LOGIN_URL
         self.session = requests.Session()
         self.public_market_sessions = {
             "male": requests.Session(),
@@ -270,79 +268,15 @@ class APIHandler:
         return buy_list
 
     async def login(self):
-        new_session = requests.Session()
-        headers_pastate = {
-            "User-Agent": MARKET_USER_AGENT,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": MARKET_ACCEPT_LANGUAGE,
-        }
-
-        async with self._session_lock:
-            response_login_page = await self._request(
-                new_session,
-                "GET",
-                self.trade_url,
-                "login page request",
-                headers=headers_pastate,
-            )
-            self.session = new_session
-            login_page_cookies = self._extract_cookie_dict(response_login_page)
-            pastate = login_page_cookies.get("PA-STATE")
-            if not pastate:
-                raise MarketplaceResponseError("login page did not provide PA-STATE")
-
-            login_payload = {
-                "hdAccountUrl": ACCOUNT_URL,
-                "_isLinkingLogin": "false",
-                "_returnUrl": f"{ACCOUNT_URL}/en-US/Member/Login/AuthorizeOauth?response_type=code&scope=profile&state={pastate}&client_id=client_id&redirect_uri={self._trade_url()}/Pearlabyss/Oauth2CallBack",
-                "_joinType": 1,
-                "_email": self.email,
-                "_password": self.password,
-                "_isIpCheck": "false",
-            }
-
-            headers_login = {
-                "User-Agent": headers_pastate["User-Agent"],
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": headers_pastate["Accept"],
-                "Accept-Language": headers_pastate["Accept-Language"],
-                "Origin": ACCOUNT_URL,
-            }
-
-            response_login = await self._request(
-                self.session,
-                "POST",
-                self.login_url,
-                "login request",
-                data=login_payload,
-                headers=headers_login,
-            )
-            login_cookies = self._extract_cookie_dict(response_login)
-
-        if "TradeAuth_Session" in login_cookies and "__RequestVerificationToken" in login_cookies:
-            self.login_status = True
-            return 1
-
         self.login_status = False
-        return 0
+        raise MarketplaceResponseError(
+            "Pearl Abyss password login is no longer supported. Use browser session refresh."
+        )
 
     async def ensure_session_valid(self):
         status = await self.is_session_expired()
         if status == 0:
             self.login_status = True
-            return True
-
-        self.login_status = False
-        if self.uses_browser_session():
-            return False
-
-        if not self.email or not self.password:
-            return False
-
-        if await self.login() == 1:
-            self.login_status = True
-            self.save_session(last_known_valid=True)
             return True
 
         self.login_status = False
@@ -365,17 +299,21 @@ class APIHandler:
             "purchase_records": [],
             "results": [],
             "purchase_delay_bounds": purchase_delay_bounds,
+            "auth_failed": False,
         }
 
         if not getattr(self, "login_status", False) or not self._has_session_cookies():
             try:
                 session_valid = await self.ensure_session_valid()
             except MarketplaceAPIError as exc:
+                if not isinstance(exc, MarketplaceNetworkError):
+                    summary["auth_failed"] = True
                 summary["events"].append({"level": "error", "message": f"Purchase aborted: {exc}"})
                 return summary
 
             if not session_valid:
-                message = "Purchase aborted: login session is invalid and re-authentication failed."
+                summary["auth_failed"] = True
+                message = "Purchase aborted: Pearl Abyss Account session is invalid. Refresh Session before buying."
                 if self.uses_browser_session():
                     message = "Purchase aborted: Steam Account session is invalid. Refresh Session before buying."
                 summary["events"].append(
@@ -473,6 +411,7 @@ class APIHandler:
             if result_code == 2000:
                 if self.uses_browser_session():
                     self.login_status = False
+                    summary["auth_failed"] = True
                     summary["events"].append(
                         {
                             "level": "error",
@@ -485,6 +424,7 @@ class APIHandler:
                     {"level": "warning", "message": "Login session expired. Attempting to re-authenticate."}
                 )
                 if retried_after_session_refresh:
+                    summary["auth_failed"] = True
                     summary["events"].append(
                         {"level": "error", "message": "Purchase aborted: session still expired after re-authentication."}
                     )
@@ -493,6 +433,8 @@ class APIHandler:
                 try:
                     reauthenticated = await self.ensure_session_valid()
                 except MarketplaceAPIError as exc:
+                    if not isinstance(exc, MarketplaceNetworkError):
+                        summary["auth_failed"] = True
                     summary["events"].append({"level": "error", "message": f"Re-authentication failed: {exc}"})
                     return summary
 
@@ -501,6 +443,7 @@ class APIHandler:
                     retried_after_session_refresh = True
                     continue
 
+                summary["auth_failed"] = True
                 summary["events"].append({"level": "error", "message": "Re-authentication failed."})
                 return summary
 

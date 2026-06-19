@@ -1018,7 +1018,7 @@ class MarketplaceToolsApp(App[None]):
                 )
         else:
             note.update(
-                "Pearl Abyss Account uses a saved email and OS keyring password. Click the account tile to add or update credentials."
+                "Pearl Abyss Account uses a visible browser login. Saved credentials are entered automatically when available."
             )
 
         try:
@@ -1215,17 +1215,17 @@ class MarketplaceToolsApp(App[None]):
             refresh_button.disabled = False
             return
 
-        _state, detail, _level, email, password = self.pa_credential_state()
+        _state, _detail, _level, email, password = self.pa_credential_state()
         credentials_ready = bool(email and password)
         self.refresh_modal_tile(
             "session-credentials-tile",
             "Credentials",
-            "Set" if credentials_ready else "Missing",
-            "" if credentials_ready else "Open Credentials first",
-            "success" if credentials_ready else "error",
+            "Set" if credentials_ready else "Optional",
+            "Automatic browser login" if credentials_ready else "Manual browser login available",
+            "success" if credentials_ready else "info",
             True,
         )
-        refresh_button.disabled = not credentials_ready
+        refresh_button.disabled = False
 
     def refresh_modal_summaries(self) -> None:
         self.refresh_credentials_summary()
@@ -1400,10 +1400,6 @@ class MarketplaceToolsApp(App[None]):
         elif button_id == "modal-stop-monitor":
             await self.stop_monitor(close_modal=True)
         elif button_id == "refresh-session":
-            if self.session_refresh_requires_pa_credentials():
-                self.set_status("Add Pearl Abyss credentials before refreshing the marketplace session.")
-                self.refresh_modal_summaries()
-                return
             self.push_screen(SessionRefreshConfirmScreen(), callback=self._handle_session_refresh_confirmation)
         elif button_id == "refresh-wallet":
             self.run_worker(self.refresh_wallet(), name="wallet-refresh", group="actions", exclusive=True)
@@ -1480,12 +1476,6 @@ class MarketplaceToolsApp(App[None]):
         if confirmed:
             self.close_dashboard_modals()
             self.run_worker(self.login_refresh(), name="login-refresh", group="actions", exclusive=True)
-
-    def session_refresh_requires_pa_credentials(self) -> bool:
-        if self.task_manager.uses_steam_browser_session():
-            return False
-        _state, _detail, _level, email, password = self.pa_credential_state()
-        return not bool(email and password)
 
     def on_polling_preset_tile_pressed(self, event: PollingPresetTile.Pressed) -> None:
         event.stop()
@@ -1797,9 +1787,9 @@ class MarketplaceToolsApp(App[None]):
         if enabled is None:
             self.set_status("Select Steam Account before toggling automatic re-authentication.", "warning")
         elif enabled:
-            self.set_status("Steam automatic re-authentication enabled for this test run.", "success")
+            self.set_status("Steam automatic re-authentication debug override enabled.", "success")
         else:
-            self.set_status("Steam automatic re-authentication disabled for this test run.", "warning")
+            self.set_status("Steam automatic re-authentication debug override disabled.", "warning")
         self.refresh_modal_summaries()
         await self.return_to_dashboard()
 
@@ -2077,11 +2067,6 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_live_widgets()
 
     async def login_refresh(self) -> None:
-        if self.session_refresh_requires_pa_credentials():
-            self.set_status("Add Pearl Abyss credentials before refreshing the marketplace session.")
-            self.refresh_live_widgets()
-            return
-
         self.task_manager.add_event("Fetching session status...", "info")
         self.set_status("Fetching session status...")
         await self.task_manager.login()

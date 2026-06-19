@@ -10,6 +10,22 @@ threads should add an ignored pending changeset under `.changesets/` instead of 
 
 Pending changes are collected from ignored `.changesets/` files during a release pass.
 
+## 1.1.0-beta - 2026-06-19
+
+### Changed
+
+- Replaced Pearl Abyss direct password login requests with the app-owned visible browser session flow. Saved PA credentials can now auto-fill in the browser, and validated marketplace cookies are imported after browser login completes.
+- Steam Account refreshes now use completed Steam Initial Setup as the normal auto-click gate. After setup, manual refresh, purchase reauth, and scheduled Steam session recovery can click the usual Pearl Abyss Steam and Steam OpenID continuation buttons when the prepared browser profile allows it.
+
+### Fixed
+
+- Closed the visible auth browser as soon as a fresh marketplace session cookie is captured from the OAuth callback response, avoiding slow waits for the marketplace page to finish loading and preventing stale profile cookies from being mistaken for a new login.
+- Buy mode now resumes automatically after a successful session refresh when the app paused it because of an expired session. User-disabled buy mode is still never re-enabled silently.
+- Pearl Abyss browser recovery failures now pause buy mode from structured auth-failure signals, preventing repeated monitor-triggered reauthentication attempts during an expired session.
+- Fresh Pearl Abyss browser profiles are seeded from the Black Desert homepage before first marketplace auth, then marked prepared so later refreshes skip the warmup.
+- Steam browser profiles now remember one-time Pearl Abyss login-page Cookiebot preparation, so later Steam refreshes skip that DOM probe unless setup or browser cookies are reset.
+- Test-mode purchase-expiry reauth checks now force the browser recovery path for both Pearl Abyss and Steam instead of short-circuiting when locally saved cookies still appear valid.
+
 ## 1.0.0-beta - 2026-06-04
 
 ### Added

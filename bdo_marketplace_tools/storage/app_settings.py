@@ -8,6 +8,8 @@ PA_CREDENTIALS_MODE = "pa_credentials"
 STEAM_BROWSER_MODE = "steam_browser"
 DEFAULT_ACCOUNT_MODE = PA_CREDENTIALS_MODE
 STEAM_BROWSER_PROFILE_PREPARED_KEY = "steam_browser_profile_prepared"
+STEAM_PA_COOKIE_CONSENT_PREPARED_KEY = "steam_pa_cookie_consent_prepared"
+PA_BROWSER_PROFILE_PREPARED_KEY = "pa_browser_profile_prepared"
 SETTINGS_VERSION = SETTINGS_SCHEMA_VERSION
 DEFAULT_POLLING_DELAY_KEY = "3"
 DEFAULT_CUSTOM_POLLING_RANGE = [15, 30]
@@ -22,7 +24,7 @@ ACCOUNT_MODE_LABELS = {
 }
 
 ACCOUNT_MODE_DETAILS = {
-    PA_CREDENTIALS_MODE: "Email/password refresh",
+    PA_CREDENTIALS_MODE: "Browser login",
     STEAM_BROWSER_MODE: "Browser refresh",
 }
 
@@ -48,28 +50,61 @@ def normalize_account_mode(mode):
 
 
 def default_app_settings():
+    # This is the source-of-truth schema for data/app_settings.json. JSON cannot hold comments,
+    # so each persisted setting is documented here. Values written to disk mirror this shape.
     return {
+        # App/settings metadata (schema version, app version, channel, project). Refreshed on
+        # every read/save; not user-editable and not a behavioral setting.
         "version": _current_version_info(),
         "account": {
+            # Active login method: "pa_credentials" (Pearl Abyss) or "steam_browser" (Steam).
             "mode": DEFAULT_ACCOUNT_MODE,
+            # Saved Pearl Abyss account email. The password is stored in the OS keyring, never here.
             "email": None,
         },
         "steam_browser": {
+            # True once the one-time Steam Initial Setup is complete (Steam logged into the
+            # app-owned browser profile). Until True, Refresh Session must run setup first.
+            "profile_prepared": False,
+            # >>> Controls the Pearl Abyss login-page cookie-box (Cookiebot) check. <<<
+            # While False, the next automatic Steam refresh probes for the consent banner and
+            # dismisses it ("Only Accept Required") before clicking "Log in with Steam"; once the
+            # banner is handled (or confirmed absent) this flips True and the probe is skipped on
+            # later refreshes. Reset to False by clearing the Steam browser cookies or resetting
+            # Steam setup (also self-reset if a Steam refresh fails while this was skipping it).
+            "pa_cookie_consent_prepared": False,
+        },
+        "pa_browser": {
+            # True once a Pearl Abyss browser profile has been seeded from the Black Desert
+            # homepage before its first successful marketplace auth (skips the warmup afterward).
             "profile_prepared": False,
         },
         "session": {
+            # True only when the saved marketplace cookies (data/session.json) were last confirmed
+            # valid. Startup auto-checks a saved session only when this is True; otherwise it asks
+            # the user to Refresh Session.
             "saved_session_last_known_valid": False,
         },
         "ui": {
             "polling": {
+                # Marketplace scan-interval preset: "1" Fast (3-5s), "2" Balanced (5-10s),
+                # "3" Slow (15-30s), or "custom".
                 "selected": DEFAULT_POLLING_DELAY_KEY,
+                # Custom [min, max] seconds between scans, used when "selected" == "custom".
                 "custom_range": DEFAULT_CUSTOM_POLLING_RANGE[:],
             },
             "buy_delay": {
+                # [min, max] seconds randomly waited between individual buy requests within one
+                # batch (spacing only; does not affect scan frequency).
                 "range": DEFAULT_PURCHASE_DELAY_RANGE[:],
             },
+            # Max silver to spend in the current app session before purchases stop; None = no cap.
             "spend_cap": None,
+            # Whether buy mode is enabled (vs watch-only). Persisted. Auto-paused on session expiry
+            # and auto-resumed on the next successful session refresh.
             "buy_mode": False,
+            # Which dashboard event-log stream is shown: "core" (monitor/session/API/purchase) or
+            # "ui" (interface confirmations).
             "event_log_view": DEFAULT_EVENT_LOG_VIEW,
         },
     }
@@ -154,6 +189,7 @@ def _normalize_settings(data):
     settings = default_app_settings()
     account = data.get("account") if isinstance(data.get("account"), dict) else {}
     steam_browser = data.get("steam_browser") if isinstance(data.get("steam_browser"), dict) else {}
+    pa_browser = data.get("pa_browser") if isinstance(data.get("pa_browser"), dict) else {}
     session = data.get("session") if isinstance(data.get("session"), dict) else {}
     ui = data.get("ui") if isinstance(data.get("ui"), dict) else {}
     polling = ui.get("polling") if isinstance(ui.get("polling"), dict) else {}
@@ -170,6 +206,13 @@ def _normalize_settings(data):
 
     prepared = steam_browser.get("profile_prepared", data.get(STEAM_BROWSER_PROFILE_PREPARED_KEY, False))
     settings["steam_browser"]["profile_prepared"] = _coerce_bool(prepared)
+    steam_pa_consent_prepared = steam_browser.get(
+        "pa_cookie_consent_prepared",
+        data.get(STEAM_PA_COOKIE_CONSENT_PREPARED_KEY, False),
+    )
+    settings["steam_browser"]["pa_cookie_consent_prepared"] = _coerce_bool(steam_pa_consent_prepared)
+    pa_prepared = pa_browser.get("profile_prepared", data.get(PA_BROWSER_PROFILE_PREPARED_KEY, False))
+    settings["pa_browser"]["profile_prepared"] = _coerce_bool(pa_prepared)
 
     settings["session"]["saved_session_last_known_valid"] = _coerce_bool(
         session.get("saved_session_last_known_valid", data.get("saved_session_last_known_valid", False))
@@ -232,7 +275,29 @@ def load_steam_browser_profile_prepared():
 def save_steam_browser_profile_prepared(prepared=True):
     settings = read_app_settings()
     settings["steam_browser"]["profile_prepared"] = bool(prepared)
+    if not prepared:
+        settings["steam_browser"]["pa_cookie_consent_prepared"] = False
     return save_app_settings(settings)["steam_browser"]["profile_prepared"]
+
+
+def load_steam_pa_cookie_consent_prepared():
+    return read_app_settings()["steam_browser"]["pa_cookie_consent_prepared"]
+
+
+def save_steam_pa_cookie_consent_prepared(prepared=True):
+    settings = read_app_settings()
+    settings["steam_browser"]["pa_cookie_consent_prepared"] = bool(prepared)
+    return save_app_settings(settings)["steam_browser"]["pa_cookie_consent_prepared"]
+
+
+def load_pa_browser_profile_prepared():
+    return read_app_settings()["pa_browser"]["profile_prepared"]
+
+
+def save_pa_browser_profile_prepared(prepared=True):
+    settings = read_app_settings()
+    settings["pa_browser"]["profile_prepared"] = bool(prepared)
+    return save_app_settings(settings)["pa_browser"]["profile_prepared"]
 
 
 def load_saved_email():
