@@ -50,6 +50,8 @@ COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS = 1500
 COOKIE_CONSENT_SAVED = "saved"
 COOKIE_CONSENT_MANUAL = "manual"
 COOKIE_CONSENT_NOT_FOUND = "not_found"
+COOKIE_CONSENT_WAITING = "waiting"
+COOKIE_CONSENT_SKIPPED = "skipped"
 PA_STEAM_LOGIN_SELECTORS = (
     "#btnSteam",
     "button[data-type='steam']",
@@ -81,6 +83,7 @@ STEAM_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
 PA_AUTO_LOGIN_FILL_TIMEOUT_MS = 1000
 PA_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
 PA_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
+PA_CONSENT_BUTTON_READY_TIMEOUT_MS = 250
 BROWSER_AUTH_POLL_SECONDS = 0.25
 BROWSER_PAGE_CLOSE_TIMEOUT_SECONDS = 0.5
 BROWSER_CONTEXT_CLOSE_TIMEOUT_SECONDS = 2
@@ -123,6 +126,8 @@ async def acquire_market_cookies(
     auto_pa_login=False,
     pa_email=None,
     pa_password=None,
+    handle_pa_cookie_consent=False,
+    pa_cookie_consent_callback=None,
     account_label="Steam Account",
 ):
     try:
@@ -165,6 +170,8 @@ async def acquire_market_cookies(
                     auto_pa_login=auto_pa_login,
                     pa_email=pa_email,
                     pa_password=pa_password,
+                    handle_pa_cookie_consent=handle_pa_cookie_consent,
+                    pa_cookie_consent_callback=pa_cookie_consent_callback,
                     account_label=account_label,
                 )
             finally:
@@ -321,6 +328,8 @@ async def _wait_for_market_cookies(
     auto_pa_login=False,
     pa_email=None,
     pa_password=None,
+    handle_pa_cookie_consent=False,
+    pa_cookie_consent_callback=None,
     account_label="Steam Account",
 ):
     deadline = asyncio.get_running_loop().time() + float(timeout_seconds)
@@ -329,6 +338,9 @@ async def _wait_for_market_cookies(
     emitted_states = set()
     auto_login_state = _new_steam_auto_login_state()
     pa_auto_login_state = _new_pa_auto_login_state()
+    pa_cookie_consent_state = _new_pa_cookie_consent_state()
+    pa_cookie_consent_completed = not handle_pa_cookie_consent
+    pa_credentials_submitted = False
 
     # Snapshot any marketplace session cookie value already in the persistent profile so a
     # fresh login is recognized by a *changed* TradeAuth_Session value, not its mere presence.
@@ -357,28 +369,51 @@ async def _wait_for_market_cookies(
                 emitted_states.add(state)
                 message, level = _status_for_state(state)
                 await _emit_status(status_callback, message, level)
-            auto_login_result = STEAM_AUTO_LOGIN_SKIPPED
-            if _should_attempt_steam_auto_login(state, auth_flow_seen, callback_seen):
-                auto_login_result = await _maybe_run_steam_auto_login(
+            pa_cookie_consent_result = COOKIE_CONSENT_SKIPPED
+            if not pa_cookie_consent_completed:
+                pa_cookie_consent_result = await _maybe_prepare_pa_cookie_consent(
                     page,
                     state,
-                    enabled=auto_steam_login,
-                    tracking=auto_login_state,
+                    tracking=pa_cookie_consent_state,
+                    status_callback=status_callback,
+                )
+                if pa_cookie_consent_result in {COOKIE_CONSENT_SAVED, COOKIE_CONSENT_NOT_FOUND}:
+                    pa_cookie_consent_completed = True
+                    await _emit_callback(pa_cookie_consent_callback, pa_cookie_consent_result)
+
+            auto_login_result = STEAM_AUTO_LOGIN_SKIPPED
+            if _should_attempt_steam_auto_login(state, auth_flow_seen, callback_seen):
+                if pa_cookie_consent_result in {COOKIE_CONSENT_WAITING, COOKIE_CONSENT_MANUAL}:
+                    auto_login_result = STEAM_AUTO_LOGIN_WAITING
+                else:
+                    auto_login_result = await _maybe_run_steam_auto_login(
+                        page,
+                        state,
+                        enabled=auto_steam_login,
+                        tracking=auto_login_state,
+                        status_callback=status_callback,
+                        now=now,
+                    )
+            if auto_login_result in {STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_MANUAL_NEEDED}:
+                auth_flow_seen = True
+            pa_login_result = PA_AUTO_LOGIN_SKIPPED
+            if not pa_credentials_submitted:
+                pa_login_result = await _maybe_run_pa_credentials_login(
+                    page,
+                    state,
+                    enabled=auto_pa_login,
+                    email=pa_email,
+                    password=pa_password,
+                    tracking=pa_auto_login_state,
                     status_callback=status_callback,
                     now=now,
                 )
-            if auto_login_result in {STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_MANUAL_NEEDED}:
-                auth_flow_seen = True
-            pa_login_result = await _maybe_run_pa_credentials_login(
-                page,
-                state,
-                enabled=auto_pa_login,
-                email=pa_email,
-                password=pa_password,
-                tracking=pa_auto_login_state,
-                status_callback=status_callback,
-                now=now,
-            )
+            # Once credentials are submitted, stop re-attempting the fill. The post-submit
+            # redirect pages (LoginProcess/AuthorizeOauth) still classify as "pa" but have no
+            # login form, so retrying would block each poll on the fill timeout and delay cookie
+            # capture — the gap that kept PA login from closing as fast as Steam.
+            if pa_login_result == PA_AUTO_LOGIN_SUBMITTED:
+                pa_credentials_submitted = True
             if pa_login_result in {PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_MANUAL_NEEDED}:
                 auth_flow_seen = True
         cookies = filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
@@ -563,10 +598,70 @@ def _new_pa_auto_login_state():
     }
 
 
+def _new_pa_cookie_consent_state():
+    return {
+        "checked": set(),
+    }
+
+
 def _should_attempt_steam_auto_login(state, auth_flow_seen, callback_seen):
     if state == "market" and (auth_flow_seen or callback_seen):
         return False
     return True
+
+
+async def _maybe_prepare_pa_cookie_consent(
+    page,
+    state,
+    *,
+    tracking,
+    status_callback=None,
+):
+    targets = _pa_cookie_consent_targets(page, state)
+    if not targets:
+        return COOKIE_CONSENT_SKIPPED
+
+    result = COOKIE_CONSENT_SKIPPED
+    for scope in targets:
+        scope_result = await _maybe_prepare_pa_cookie_consent_target(
+            scope,
+            tracking=tracking,
+            status_callback=status_callback,
+        )
+        if scope_result in {COOKIE_CONSENT_SAVED, COOKIE_CONSENT_NOT_FOUND, COOKIE_CONSENT_MANUAL}:
+            return scope_result
+        if scope_result == COOKIE_CONSENT_WAITING:
+            result = COOKIE_CONSENT_WAITING
+
+    return result
+
+
+async def _maybe_prepare_pa_cookie_consent_target(scope, *, tracking, status_callback=None):
+    key = (id(scope), "pa_cookie_consent", getattr(scope, "url", ""))
+    if key in tracking["checked"]:
+        return COOKIE_CONSENT_SKIPPED
+
+    # Lean on the Steam login button being actually clickable. A trial click runs Playwright's
+    # full actionability checks — including "receives pointer events", i.e. not occluded — so
+    # when no consent banner is overlaying it, this returns immediately and we skip the slower
+    # cookie-dialog probe entirely. If a banner is covering the button the trial click fails and
+    # we fall through to dismiss it, so a blocked button can never be mistaken for ready.
+    if await _selector_clickable(scope, PA_STEAM_LOGIN_SELECTORS, timeout=PA_CONSENT_BUTTON_READY_TIMEOUT_MS):
+        tracking["checked"].add(key)
+        return COOKIE_CONSENT_NOT_FOUND
+
+    consent_result = await _accept_required_cookie_consent_if_available(
+        scope,
+        status_callback,
+        profile_label="Pearl Abyss login page",
+    )
+    if consent_result == COOKIE_CONSENT_SAVED:
+        tracking["checked"].add(key)
+        return COOKIE_CONSENT_SAVED
+    if consent_result == COOKIE_CONSENT_MANUAL:
+        return COOKIE_CONSENT_MANUAL
+
+    return COOKIE_CONSENT_WAITING
 
 
 async def _maybe_run_steam_auto_login(
@@ -782,6 +877,33 @@ def _steam_auto_login_targets(page, state):
     return targets
 
 
+def _pa_cookie_consent_targets(page, state):
+    targets = []
+    seen = set()
+
+    def add_target(scope, target_state):
+        if target_state != "pa":
+            return
+        key = id(scope)
+        if key in seen:
+            return
+        seen.add(key)
+        targets.append(scope)
+
+    add_target(page, _pa_cookie_consent_target_state(state))
+    for frame in getattr(page, "frames", []) or []:
+        frame_state, _is_callback = _classify_url(getattr(frame, "url", ""))
+        add_target(frame, _pa_cookie_consent_target_state(frame_state))
+
+    return targets
+
+
+def _pa_cookie_consent_target_state(state):
+    if state == "pa":
+        return "pa"
+    return None
+
+
 def _steam_auto_login_target_state(state):
     if state in {"pa", "steam"}:
         return state
@@ -812,6 +934,18 @@ async def _click_first_available_selector(page, selectors, timeout):
     for selector in selectors:
         try:
             await page.locator(selector).first.click(timeout=timeout)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def _selector_clickable(page, selectors, timeout):
+    for selector in selectors:
+        try:
+            # trial=True runs actionability checks (visible, stable, enabled, not occluded)
+            # without performing the click, so an element under a consent overlay fails here.
+            await page.locator(selector).first.click(trial=True, timeout=timeout)
             return True
         except Exception:
             continue
@@ -974,5 +1108,13 @@ async def _emit_status(callback, message, level="info"):
     if callback is None:
         return
     result = callback(message, level)
+    if inspect.isawaitable(result):
+        await result
+
+
+async def _emit_callback(callback, *args):
+    if callback is None:
+        return
+    result = callback(*args)
     if inspect.isawaitable(result):
         await result

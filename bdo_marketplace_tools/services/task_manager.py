@@ -27,6 +27,7 @@ from bdo_marketplace_tools.storage.app_settings import (
     load_pa_browser_profile_prepared,
     load_saved_session_last_known_valid,
     load_steam_browser_profile_prepared,
+    load_steam_pa_cookie_consent_prepared,
     load_ui_settings,
     normalize_account_mode,
     save_account_mode,
@@ -38,6 +39,7 @@ from bdo_marketplace_tools.storage.app_settings import (
     save_saved_session_last_known_valid,
     save_spend_cap,
     save_steam_browser_profile_prepared,
+    save_steam_pa_cookie_consent_prepared,
 )
 from bdo_marketplace_tools.storage.credentials import CredentialStoreError, load_credentials
 from bdo_marketplace_tools.storage.local_stats import DEFAULT_LOCAL_STATS, load_local_stats, save_local_stats
@@ -81,6 +83,9 @@ class BackgroundTasks:
         self.pa_browser_profile_prepared = load_pa_browser_profile_prepared()
         self.saved_session_last_known_valid = (
             load_saved_session_last_known_valid() if self.persist_ui_settings else False
+        )
+        self.steam_pa_cookie_consent_prepared = (
+            load_steam_pa_cookie_consent_prepared() if self.persist_ui_settings else False
         )
         self.steam_auto_reauth_enabled = False
         self.checker_task = None
@@ -314,6 +319,17 @@ class BackgroundTasks:
 
     def steam_browser_profile_needs_setup(self):
         return self.uses_steam_browser_session() and not self.steam_browser_profile_prepared
+
+    def steam_auto_reauth_available(self):
+        return self.uses_steam_browser_session() and (
+            self.steam_browser_profile_prepared or self.steam_auto_reauth_enabled
+        )
+
+    def _set_steam_pa_cookie_consent_prepared(self, prepared):
+        self.steam_pa_cookie_consent_prepared = bool(prepared)
+        if self.persist_ui_settings:
+            self.steam_pa_cookie_consent_prepared = save_steam_pa_cookie_consent_prepared(prepared)
+        return self.steam_pa_cookie_consent_prepared
 
     def _set_pa_browser_profile_prepared(self, prepared):
         self.pa_browser_profile_prepared = bool(prepared)
@@ -654,6 +670,7 @@ class BackgroundTasks:
             return False
 
         self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(False)
+        self._set_steam_pa_cookie_consent_prepared(False)
         self.steam_auto_reauth_enabled = False
         self.add_event("Initial Steam setup status reset to incomplete.", "warning")
         return True
@@ -668,6 +685,9 @@ class BackgroundTasks:
             self.add_event(f"Steam browser cookie clear failed: {exc}", "error")
             return False
 
+        self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(False)
+        self._set_steam_pa_cookie_consent_prepared(False)
+        self.steam_auto_reauth_enabled = False
         self.add_event(f"Steam browser cookies cleared from the app-owned profile ({cleared_count} cookies).", "warning")
         return True
 
@@ -687,6 +707,7 @@ class BackgroundTasks:
             return False
 
         self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(True)
+        self.steam_auto_reauth_enabled = True
         self.add_event("Initial Steam browser setup saved. Refresh Session can now open the market login.", "success")
         return True
 
@@ -1037,7 +1058,7 @@ class BackgroundTasks:
                     return False
 
             if auto_steam_login is None:
-                auto_steam_login = self.steam_auto_reauth_enabled
+                auto_steam_login = self.steam_auto_reauth_available()
 
             if session_check_error:
                 self.add_event(
@@ -1050,9 +1071,12 @@ class BackgroundTasks:
                 self.add_event("Opening Steam Account browser session for manual login.", "info")
 
             try:
+                handle_pa_cookie_consent = bool(auto_steam_login and not self.steam_pa_cookie_consent_prepared)
                 cookies = await acquire_market_cookies(
                     status_callback=self._browser_auth_status,
                     auto_steam_login=auto_steam_login,
+                    handle_pa_cookie_consent=handle_pa_cookie_consent,
+                    pa_cookie_consent_callback=self._set_steam_pa_cookie_consent_prepared,
                 )
             except BrowserAuthError as exc:
                 self.api_handler.login_status = False
@@ -1071,15 +1095,8 @@ class BackgroundTasks:
             if session_valid:
                 self.api_handler.login_status = True
                 self._set_saved_session_last_known_valid(True)
-                newly_enabled = not self.steam_auto_reauth_enabled
                 self.steam_auto_reauth_enabled = True
-                if newly_enabled:
-                    self.add_event(
-                        "Steam Account session validated and saved. Automatic Steam re-auth enabled for this app run.",
-                        "success",
-                    )
-                else:
-                    self.add_event("Steam Account session validated and saved.", "success")
+                self.add_event("Steam Account session validated and saved.", "success")
                 self.start_login_status_checker()
                 return True
 
@@ -1164,7 +1181,7 @@ class BackgroundTasks:
     async def handle_expired_session(self):
         self.api_handler.login_status = False
         if self.uses_steam_browser_session():
-            if self.steam_auto_reauth_enabled:
+            if self.steam_auto_reauth_available():
                 self.add_event("Session expired. Attempting automatic Steam Account re-authentication.", "warning")
                 if await self.refresh_browser_session(auto_steam_login=True):
                     self.add_event("Session expired. Re-authentication successful.", "success")

@@ -1787,9 +1787,9 @@ class MarketplaceToolsApp(App[None]):
         if enabled is None:
             self.set_status("Select Steam Account before toggling automatic re-authentication.", "warning")
         elif enabled:
-            self.set_status("Steam automatic re-authentication enabled for this test run.", "success")
+            self.set_status("Steam automatic re-authentication debug override enabled.", "success")
         else:
-            self.set_status("Steam automatic re-authentication disabled for this test run.", "warning")
+            self.set_status("Steam automatic re-authentication debug override disabled.", "warning")
         self.refresh_modal_summaries()
         await self.return_to_dashboard()
 

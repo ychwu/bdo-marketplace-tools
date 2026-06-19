@@ -8,6 +8,7 @@ PA_CREDENTIALS_MODE = "pa_credentials"
 STEAM_BROWSER_MODE = "steam_browser"
 DEFAULT_ACCOUNT_MODE = PA_CREDENTIALS_MODE
 STEAM_BROWSER_PROFILE_PREPARED_KEY = "steam_browser_profile_prepared"
+STEAM_PA_COOKIE_CONSENT_PREPARED_KEY = "steam_pa_cookie_consent_prepared"
 PA_BROWSER_PROFILE_PREPARED_KEY = "pa_browser_profile_prepared"
 SETTINGS_VERSION = SETTINGS_SCHEMA_VERSION
 DEFAULT_POLLING_DELAY_KEY = "3"
@@ -57,6 +58,7 @@ def default_app_settings():
         },
         "steam_browser": {
             "profile_prepared": False,
+            "pa_cookie_consent_prepared": False,
         },
         "pa_browser": {
             "profile_prepared": False,
@@ -175,6 +177,11 @@ def _normalize_settings(data):
 
     prepared = steam_browser.get("profile_prepared", data.get(STEAM_BROWSER_PROFILE_PREPARED_KEY, False))
     settings["steam_browser"]["profile_prepared"] = _coerce_bool(prepared)
+    steam_pa_consent_prepared = steam_browser.get(
+        "pa_cookie_consent_prepared",
+        data.get(STEAM_PA_COOKIE_CONSENT_PREPARED_KEY, False),
+    )
+    settings["steam_browser"]["pa_cookie_consent_prepared"] = _coerce_bool(steam_pa_consent_prepared)
     pa_prepared = pa_browser.get("profile_prepared", data.get(PA_BROWSER_PROFILE_PREPARED_KEY, False))
     settings["pa_browser"]["profile_prepared"] = _coerce_bool(pa_prepared)
 
@@ -239,7 +246,19 @@ def load_steam_browser_profile_prepared():
 def save_steam_browser_profile_prepared(prepared=True):
     settings = read_app_settings()
     settings["steam_browser"]["profile_prepared"] = bool(prepared)
+    if not prepared:
+        settings["steam_browser"]["pa_cookie_consent_prepared"] = False
     return save_app_settings(settings)["steam_browser"]["profile_prepared"]
+
+
+def load_steam_pa_cookie_consent_prepared():
+    return read_app_settings()["steam_browser"]["pa_cookie_consent_prepared"]
+
+
+def save_steam_pa_cookie_consent_prepared(prepared=True):
+    settings = read_app_settings()
+    settings["steam_browser"]["pa_cookie_consent_prepared"] = bool(prepared)
+    return save_app_settings(settings)["steam_browser"]["pa_cookie_consent_prepared"]
 
 
 def load_pa_browser_profile_prepared():
