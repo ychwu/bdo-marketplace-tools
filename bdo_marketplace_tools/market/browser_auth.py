@@ -1,13 +1,31 @@
 import asyncio
 import inspect
+import os
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 from bdo_marketplace_tools.market.api_handler import GAME_TRADE_URL, TRADE_URL
 from bdo_marketplace_tools.storage.paths import (
+    DATA_DIR,
     STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH,
     STEAM_MARKET_PROFILE_PATH,
 )
+
+
+# Off by default. Set BDO_BROWSER_AUTH_TRACE=1 to write a timestamped, value-free trace of the
+# browser auth cookie capture to data/auth-trace.log for diagnosing capture timing.
+AUTH_TRACE_ENABLED = os.environ.get("BDO_BROWSER_AUTH_TRACE") == "1"
+
+
+def _auth_trace(message):
+    if not AUTH_TRACE_ENABLED:
+        return
+    try:
+        with (DATA_DIR / "auth-trace.log").open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.monotonic():.3f} {message}\n")
+    except Exception:
+        pass
 
 
 AUTH_START_URL = f"{TRADE_URL}/"
@@ -350,80 +368,163 @@ async def _wait_for_market_cookies(
         filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
     )
 
-    while asyncio.get_running_loop().time() < deadline:
-        now = asyncio.get_running_loop().time()
-        pages = [page for page in context.pages if not _page_is_closed(page)]
-        if not pages:
-            raise BrowserAuthError("Browser closed before a marketplace session could be captured.")
+    # The marketplace session cookies (TradeAuth_Session / __RequestVerificationToken) are set on
+    # the /Pearlabyss/Oauth2CallBack 302. That redirect never becomes page.url, so polling can't
+    # observe it, and context.cookies() may not surface the new cookie until the final market
+    # document commits. Reading cookies the instant the callback *response* arrives lets capture
+    # close at login success instead of after the market page loads.
+    _auth_trace(f"START label={account_label!r} baseline_session_count={len(baseline_session_values)}")
+    captured_at_callback = []
+    callback_done = asyncio.Event()
+    last_trace_sig = None
 
-        market_active = False
-        for page in pages:
-            state, is_callback = _classify_url(getattr(page, "url", ""))
-            if is_callback:
-                callback_seen = True
-            if state in {"pa", "steam", "otp"}:
-                auth_flow_seen = True
-            if state == "market":
-                market_active = True
-            if state and state not in emitted_states:
-                emitted_states.add(state)
-                message, level = _status_for_state(state)
-                await _emit_status(status_callback, message, level)
-            pa_cookie_consent_result = COOKIE_CONSENT_SKIPPED
-            if not pa_cookie_consent_completed:
-                pa_cookie_consent_result = await _maybe_prepare_pa_cookie_consent(
-                    page,
-                    state,
-                    tracking=pa_cookie_consent_state,
-                    status_callback=status_callback,
-                )
-                if pa_cookie_consent_result in {COOKIE_CONSENT_SAVED, COOKIE_CONSENT_NOT_FOUND}:
-                    pa_cookie_consent_completed = True
-                    await _emit_callback(pa_cookie_consent_callback, pa_cookie_consent_result)
+    async def _read_market_cookies_after_callback():
+        try:
+            cookies = filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
+            fresh = _has_fresh_market_session_cookie(cookies, baseline_session_values)
+            _auth_trace(
+                f"CALLBACK_READ names={sorted(c.get('name') for c in cookies)} "
+                f"session={_has_market_session_cookie(cookies)} fresh={fresh}"
+            )
+            if fresh:
+                captured_at_callback.append(cookies)
+                callback_done.set()
+        except Exception as exc:
+            _auth_trace(f"CALLBACK_READ error={exc!r}")
 
-            auto_login_result = STEAM_AUTO_LOGIN_SKIPPED
-            if _should_attempt_steam_auto_login(state, auth_flow_seen, callback_seen):
-                if pa_cookie_consent_result in {COOKIE_CONSENT_WAITING, COOKIE_CONSENT_MANUAL}:
-                    auto_login_result = STEAM_AUTO_LOGIN_WAITING
-                else:
-                    auto_login_result = await _maybe_run_steam_auto_login(
+    def _on_response(response):
+        _state, is_callback = _classify_url(getattr(response, "url", ""))
+        if AUTH_TRACE_ENABLED and (is_callback or _state in {"pa", "otp", "steam"}):
+            path = urlparse(getattr(response, "url", "") or "").path
+            _auth_trace(f"RESP {getattr(response, 'status', '?')} {path} state={_state} callback={is_callback}")
+        if is_callback:
+            asyncio.ensure_future(_read_market_cookies_after_callback())
+
+    context_on = getattr(context, "on", None)
+    if callable(context_on):
+        context_on("response", _on_response)
+
+    async def _poll_loop():
+        nonlocal callback_seen, auth_flow_seen, pa_credentials_submitted
+        nonlocal pa_cookie_consent_completed, last_trace_sig
+        while asyncio.get_running_loop().time() < deadline:
+            now = asyncio.get_running_loop().time()
+            pages = [page for page in context.pages if not _page_is_closed(page)]
+            if not pages:
+                raise BrowserAuthError("Browser closed before a marketplace session could be captured.")
+
+            market_active = False
+            for page in pages:
+                state, is_callback = _classify_url(getattr(page, "url", ""))
+                if is_callback:
+                    callback_seen = True
+                if state in {"pa", "steam", "otp"}:
+                    auth_flow_seen = True
+                if state == "market":
+                    market_active = True
+                if state and state not in emitted_states:
+                    emitted_states.add(state)
+                    message, level = _status_for_state(state)
+                    await _emit_status(status_callback, message, level)
+                pa_cookie_consent_result = COOKIE_CONSENT_SKIPPED
+                if not pa_cookie_consent_completed:
+                    pa_cookie_consent_result = await _maybe_prepare_pa_cookie_consent(
                         page,
                         state,
-                        enabled=auto_steam_login,
-                        tracking=auto_login_state,
+                        tracking=pa_cookie_consent_state,
+                        status_callback=status_callback,
+                    )
+                    if pa_cookie_consent_result in {COOKIE_CONSENT_SAVED, COOKIE_CONSENT_NOT_FOUND}:
+                        pa_cookie_consent_completed = True
+                        await _emit_callback(pa_cookie_consent_callback, pa_cookie_consent_result)
+
+                auto_login_result = STEAM_AUTO_LOGIN_SKIPPED
+                if _should_attempt_steam_auto_login(state, auth_flow_seen, callback_seen):
+                    if pa_cookie_consent_result in {COOKIE_CONSENT_WAITING, COOKIE_CONSENT_MANUAL}:
+                        auto_login_result = STEAM_AUTO_LOGIN_WAITING
+                    else:
+                        auto_login_result = await _maybe_run_steam_auto_login(
+                            page,
+                            state,
+                            enabled=auto_steam_login,
+                            tracking=auto_login_state,
+                            status_callback=status_callback,
+                            now=now,
+                        )
+                if auto_login_result in {STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_MANUAL_NEEDED}:
+                    auth_flow_seen = True
+                pa_login_result = PA_AUTO_LOGIN_SKIPPED
+                if not pa_credentials_submitted:
+                    pa_login_result = await _maybe_run_pa_credentials_login(
+                        page,
+                        state,
+                        enabled=auto_pa_login,
+                        email=pa_email,
+                        password=pa_password,
+                        tracking=pa_auto_login_state,
                         status_callback=status_callback,
                         now=now,
                     )
-            if auto_login_result in {STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_MANUAL_NEEDED}:
-                auth_flow_seen = True
-            pa_login_result = PA_AUTO_LOGIN_SKIPPED
-            if not pa_credentials_submitted:
-                pa_login_result = await _maybe_run_pa_credentials_login(
-                    page,
-                    state,
-                    enabled=auto_pa_login,
-                    email=pa_email,
-                    password=pa_password,
-                    tracking=pa_auto_login_state,
-                    status_callback=status_callback,
-                    now=now,
-                )
-            # Once credentials are submitted, stop re-attempting the fill. The post-submit
-            # redirect pages (LoginProcess/AuthorizeOauth) still classify as "pa" but have no
-            # login form, so retrying would block each poll on the fill timeout and delay cookie
-            # capture — the gap that kept PA login from closing as fast as Steam.
-            if pa_login_result == PA_AUTO_LOGIN_SUBMITTED:
-                pa_credentials_submitted = True
-            if pa_login_result in {PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_MANUAL_NEEDED}:
-                auth_flow_seen = True
-        cookies = filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
-        if _market_cookie_capture_ready(cookies, baseline_session_values, callback_seen, market_active, auth_flow_seen):
-            await _emit_status(status_callback, "Marketplace cookies captured. Closing browser before validation.", "info")
-            return cookies
+                # Once credentials are submitted, stop re-attempting the fill. The post-submit
+                # redirect pages (LoginProcess/AuthorizeOauth) still classify as "pa" but have no
+                # login form, so retrying would block each poll on the fill timeout.
+                if pa_login_result == PA_AUTO_LOGIN_SUBMITTED:
+                    pa_credentials_submitted = True
+                if pa_login_result in {PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_MANUAL_NEEDED}:
+                    auth_flow_seen = True
 
-        await asyncio.sleep(BROWSER_AUTH_POLL_SECONDS)
+            cookies = filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
+            if AUTH_TRACE_ENABLED:
+                has_session = _has_market_session_cookie(cookies)
+                fresh = _has_fresh_market_session_cookie(cookies, baseline_session_values)
+                primary_url = urlparse(getattr(pages[0], "url", "") or "").path if pages else ""
+                sig = (primary_url, market_active, auth_flow_seen, callback_seen, has_session, fresh)
+                if sig != last_trace_sig:
+                    last_trace_sig = sig
+                    _auth_trace(
+                        f"POLL url={primary_url} market={market_active} auth_flow={auth_flow_seen} "
+                        f"cb={callback_seen} session={has_session} fresh={fresh} "
+                        f"names={sorted(c.get('name') for c in cookies)}"
+                    )
+            if _market_cookie_capture_ready(cookies, baseline_session_values, callback_seen, market_active, auth_flow_seen):
+                _auth_trace("CAPTURE via=poll")
+                return cookies
 
-    raise BrowserAuthError(f"{account_label} browser session timed out before Central Market cookies were captured.")
+            await asyncio.sleep(BROWSER_AUTH_POLL_SECONDS)
+
+        _auth_trace("TIMEOUT")
+        raise BrowserAuthError(f"{account_label} browser session timed out before Central Market cookies were captured.")
+
+    # Run the polling loop and the OAuth-callback capture concurrently and finish on whichever
+    # lands first. The callback capture can complete while the poll loop is parked in a slow,
+    # navigation-blocked context.cookies() read, so it is watched independently here rather than
+    # from inside the loop.
+    poll_task = asyncio.ensure_future(_poll_loop())
+    callback_task = asyncio.ensure_future(callback_done.wait())
+    await asyncio.wait({poll_task, callback_task}, return_when=asyncio.FIRST_COMPLETED)
+
+    if captured_at_callback:
+        poll_task.cancel()
+        callback_task.cancel()
+        for task in (poll_task, callback_task):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        _auth_trace("CAPTURE via=callback")
+        await _emit_status(
+            status_callback,
+            "Marketplace cookies captured at login callback. Closing browser before validation.",
+            "info",
+        )
+        return captured_at_callback[0]
+
+    callback_task.cancel()
+    try:
+        await callback_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    return poll_task.result()
 
 
 async def _close_browser_context(context, status_callback=None):

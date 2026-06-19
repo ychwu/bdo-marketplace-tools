@@ -751,6 +751,68 @@ class APIResultTests(unittest.TestCase):
                 )
             )
 
+    def test_market_cookie_capture_reads_cookies_on_oauth_callback_response(self):
+        # The market session cookie only becomes visible to the polling path once the callback
+        # has fired; the page never reaches "market" state. Capture must still close, driven by
+        # the OAuth callback response listener rather than waiting for the market document.
+        fresh = [
+            {
+                "name": "TradeAuth_Session",
+                "value": "fresh-token",
+                "domain": "na-trade.naeu.playblackdesert.com",
+                "path": "/",
+            }
+        ]
+        callback_url = "https://na-trade.naeu.playblackdesert.com/Pearlabyss/Oauth2CallBack?code=secret"
+
+        class FakeResponse:
+            url = callback_url
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-US/Member/Login"
+
+            def is_closed(self):
+                return False
+
+        class FakeContext:
+            def __init__(self):
+                self.pages = [FakePage()]
+                self.handler = None
+                self.callback_fired = False
+
+            def on(self, event, handler):
+                if event == "response":
+                    self.handler = handler
+
+            def remove_listener(self, event, handler):
+                pass
+
+            async def cookies(self, *_args):
+                # Baseline and the polling path never see the session cookie; only the read
+                # triggered by the callback response does.
+                return list(fresh) if self.callback_fired else []
+
+        async def run():
+            context = FakeContext()
+            task = asyncio.ensure_future(
+                _wait_for_market_cookies(
+                    context,
+                    status_callback=None,
+                    timeout_seconds=5,
+                    account_label="Pearl Abyss Account",
+                )
+            )
+            for _ in range(5):
+                await asyncio.sleep(0)
+                if context.handler is not None:
+                    break
+            context.callback_fired = True
+            context.handler(FakeResponse())
+            return await asyncio.wait_for(task, timeout=2)
+
+        result = asyncio.run(run())
+        self.assertEqual([cookie["name"] for cookie in result], ["TradeAuth_Session"])
+
     def test_steam_auto_login_disabled_does_not_click_buttons(self):
         clicked_selectors = []
         statuses = []
