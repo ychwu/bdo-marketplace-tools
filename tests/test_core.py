@@ -1385,7 +1385,7 @@ class APIResultTests(unittest.TestCase):
 
         self.assertEqual(result, STEAM_AUTO_LOGIN_CLICKED)
         self.assertEqual(clicked_selectors, [("#btnSteam", 1000)])
-        self.assertEqual(statuses, [("Automatic Steam re-auth clicked Log in with Steam.", "info")])
+        self.assertEqual(statuses, [("Steam re-auth submitted the Pearl Abyss Steam login.", "info")])
 
     def test_steam_auto_login_clicks_pa_steam_button_inside_frame(self):
         clicked_selectors = []
@@ -1439,7 +1439,76 @@ class APIResultTests(unittest.TestCase):
 
         self.assertEqual(result, STEAM_AUTO_LOGIN_CLICKED)
         self.assertEqual(clicked_selectors, [("#btnSteam", 1000)])
-        self.assertEqual(statuses, [("Automatic Steam re-auth clicked Log in with Steam.", "info")])
+        self.assertEqual(statuses, [("Steam re-auth submitted the Pearl Abyss Steam login.", "info")])
+
+    def test_steam_auto_login_logs_pa_click_once_across_page_scopes(self):
+        statuses = []
+        tracking = _new_steam_auto_login_state()
+
+        class MissingFirstLocator:
+            async def click(self, timeout=None):
+                raise RuntimeError("not found")
+
+        class MissingLocator:
+            first = MissingFirstLocator()
+
+        class ClickFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                if self.selector != "#btnSteam":
+                    raise RuntimeError("not found")
+
+        class ClickLocator:
+            def __init__(self, selector):
+                self.first = ClickFirstLocator(selector)
+
+        class TopLevelLoginPage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+            frames = []
+
+            def locator(self, selector):
+                return ClickLocator(selector)
+
+        class LoginFrame:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+
+            def locator(self, selector):
+                return ClickLocator(selector)
+
+        class FramedLoginPage:
+            url = "https://na-trade.naeu.playblackdesert.com/"
+            frames = [LoginFrame()]
+
+            def locator(self, selector):
+                return MissingLocator()
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        async def run():
+            return [
+                await _maybe_run_steam_auto_login(
+                    TopLevelLoginPage(),
+                    "pa",
+                    enabled=True,
+                    tracking=tracking,
+                    status_callback=status_callback,
+                ),
+                await _maybe_run_steam_auto_login(
+                    FramedLoginPage(),
+                    "market",
+                    enabled=True,
+                    tracking=tracking,
+                    status_callback=status_callback,
+                ),
+            ]
+
+        results = asyncio.run(run())
+
+        self.assertEqual(results, [STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_CLICKED])
+        self.assertEqual(statuses, [("Steam re-auth submitted the Pearl Abyss Steam login.", "info")])
 
     def test_steam_auto_login_does_not_probe_top_level_market_page_for_pa_button(self):
         clicked_selectors = []
@@ -1512,7 +1581,7 @@ class APIResultTests(unittest.TestCase):
 
         self.assertEqual(result, STEAM_AUTO_LOGIN_CLICKED)
         self.assertEqual(clicked_selectors, [("#imageLogin", 1000)])
-        self.assertEqual(statuses, [("Automatic Steam re-auth clicked Steam Sign In.", "info")])
+        self.assertEqual(statuses, [("Steam re-auth confirmed the Steam sign-in.", "info")])
 
     def test_steam_auto_login_leaves_otp_status_only(self):
         clicked_selectors = []
@@ -1641,7 +1710,7 @@ class APIResultTests(unittest.TestCase):
         self.assertEqual(results, [STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_CLICKED])
         self.assertEqual(click_times, [1000, 1000, 1000])
         clicked_messages = [
-            message for (message, _level) in statuses if message == "Automatic Steam re-auth clicked Log in with Steam."
+            message for (message, _level) in statuses if message == "Steam re-auth submitted the Pearl Abyss Steam login."
         ]
         self.assertEqual(len(clicked_messages), 1)
 
@@ -2638,6 +2707,23 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("UI setting saved." in event for event in manager.events_for_channel("core")))
         self.assertTrue(any("UI setting saved." in event for event in manager.events_for_channel("ui")))
         self.assertFalse(any("Core monitor detail." in event for event in manager.events_for_channel("ui")))
+
+    async def test_unseen_event_channels_flag_inactive_channel_only(self):
+        manager = self.make_task_manager()  # default event log view is "core"
+        self.assertFalse(manager.has_unseen_events("core"))
+        self.assertFalse(manager.has_unseen_events("ui"))
+
+        manager.add_event("Core monitor detail.", "success")  # active channel -> already seen
+        self.assertFalse(manager.has_unseen_events("core"))
+
+        manager.add_event("UI setting saved.", "info", channel="ui")  # inactive -> unseen
+        self.assertTrue(manager.has_unseen_events("ui"))
+
+        manager.set_event_log_view("ui")  # viewing the UI stream clears its unseen flag
+        self.assertFalse(manager.has_unseen_events("ui"))
+
+        manager.add_event("Another core event.", "warning")  # core now inactive -> unseen
+        self.assertTrue(manager.has_unseen_events("core"))
 
     async def test_spend_cap_limits_items_by_price_order(self):
         manager = self.make_task_manager()
@@ -4955,11 +5041,13 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 app.set_status("UI setting saved.", "info")
                 await pilot.pause()
 
-                self.assertEqual(app.query_one("#event-log-toolbar-title", Static).content, "Event Log View:")
+                self.assertEqual(len(list(app.query("#event-log-toolbar-title"))), 0)
                 self.assertEqual(app.query_one("#event-log-toolbar").styles.height.value, 1)
                 self.assertIn("log-filter-selected", app.query_one("#log-filter-core").classes)
                 self.assertEqual(app.query_one("#log-filter-core", Static).content, "Core logs")
-                self.assertEqual(app.query_one("#log-filter-ui", Static).content, "UI logs")
+                # A UI event arrived while viewing Core, so the inactive UI tab shows an unread dot.
+                self.assertIn("●", str(app.query_one("#log-filter-ui", Static).content))
+                self.assertNotIn("●", str(app.query_one("#log-filter-core", Static).content))
                 event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
                 self.assertIn("Core monitor detail.", event_text)
                 self.assertNotIn("UI setting saved.", event_text)
@@ -4970,6 +5058,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.event_log_mode, "ui")
                 self.assertEqual(app.task_manager.event_log_view, "ui")
                 self.assertIn("log-filter-selected", app.query_one("#log-filter-ui").classes)
+                # Viewing the UI stream clears its unread dot.
+                self.assertNotIn("●", str(app.query_one("#log-filter-ui", Static).content))
                 event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
                 self.assertIn("UI setting saved.", event_text)
                 self.assertNotIn("Core monitor detail.", event_text)

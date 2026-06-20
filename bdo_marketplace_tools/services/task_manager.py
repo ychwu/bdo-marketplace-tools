@@ -120,6 +120,7 @@ class BackgroundTasks:
         self.core_events = deque(maxlen=EVENT_LOG_LIMIT)
         self.ui_events = deque(maxlen=EVENT_LOG_LIMIT)
         self.event_log_view = ui_settings.get("event_log_view", "core")
+        self.unseen_event_channels = set()
         self.purchase_submission_enabled = bool(ui_settings["buy_mode"])
         self.buy_mode_resume_pending = False
         self.max_spend = ui_settings["spend_cap"]
@@ -172,11 +173,16 @@ class BackgroundTasks:
             self.ui_events.append(event)
         else:
             self.core_events.append(event)
+        if normalized_channel != self.event_log_view:
+            self.unseen_event_channels.add(normalized_channel)
 
     def events_for_channel(self, channel):
         if str(channel or "").strip().lower() == "ui":
             return tuple(self.ui_events)
         return tuple(self.core_events)
+
+    def has_unseen_events(self, channel):
+        return str(channel or "").strip().lower() in self.unseen_event_channels
 
     def set_event_log_view(self, view):
         normalized = str(view or "core").strip().lower()
@@ -185,6 +191,7 @@ class BackgroundTasks:
         self.event_log_view = normalized
         if self.persist_ui_settings:
             self.event_log_view = save_event_log_view(normalized)
+        self.unseen_event_channels.discard(self.event_log_view)
         return self.event_log_view
 
     def set_update_check_on_startup(self, enabled):
@@ -1261,10 +1268,6 @@ class BackgroundTasks:
                     f"Session check failed: {session_check_error}. Opening Steam Account browser session.",
                     "warning",
                 )
-            elif auto_steam_login:
-                self.add_event("Opening Steam Account browser session for automatic re-authentication.", "info")
-            else:
-                self.add_event("Opening Steam Account browser session for manual login.", "info")
 
             try:
                 handle_pa_cookie_consent = bool(auto_steam_login and not self.steam_pa_cookie_consent_prepared)

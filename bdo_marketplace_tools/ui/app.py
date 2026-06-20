@@ -246,24 +246,19 @@ class MarketplaceToolsApp(App[None]):
     #event-log-toolbar {
         height: 1;
         margin-bottom: 0;
-    }
-
-    #event-log-toolbar-title {
-        width: 16;
-        color: __COLOR_TEXT_MUTED__;
-        text-style: bold;
+        align-horizontal: right;
     }
 
     #log-filter-separator {
-        width: 3;
+        width: auto;
+        margin: 0 1;
         content-align: center middle;
         color: #777777;
     }
 
     .log-filter-option {
-        width: 10;
+        width: auto;
         height: 1;
-        margin-right: 1;
         content-align: center middle;
         color: __COLOR_TEXT_MUTED__;
         background: transparent;
@@ -587,7 +582,6 @@ class MarketplaceToolsApp(App[None]):
             event_log = RichLog(id="event-log", markup=True, highlight=False, wrap=True)
             event_log.border_title = "Event Log"
             event_toolbar = Horizontal(
-                Static("Event Log View:", id="event-log-toolbar-title"),
                 LogFilterOption("core", "Core logs"),
                 Static("/", id="log-filter-separator"),
                 LogFilterOption("ui", "UI logs"),
@@ -909,12 +903,25 @@ class MarketplaceToolsApp(App[None]):
         return "UI" if self.event_log_mode == "ui" else "Core"
 
     def refresh_event_log_filter_controls(self) -> None:
-        for mode in ("core", "ui"):
+        labels = {"core": "Core logs", "ui": "UI logs"}
+        for mode, label in labels.items():
             try:
                 option = self.query_one(f"#log-filter-{mode}", LogFilterOption)
             except Exception:
                 continue
-            option.set_class(mode == self.event_log_mode, "log-filter-selected")
+            is_active = mode == self.event_log_mode
+            option.set_class(is_active, "log-filter-selected")
+            # Show an unread dot on the tab you are NOT viewing when a log lands there.
+            has_dot = (not is_active) and self.task_manager.has_unseen_events(mode)
+            if getattr(option, "_unread_dot", False) == has_dot:
+                continue
+            option._unread_dot = has_dot
+            if has_dot:
+                text = Text(label)
+                text.append(" ●", style=COLOR_BRAND)
+                option.update(text)
+            else:
+                option.update(label)
 
     async def mount_credentials(self, content: Container) -> None:
         _, _, _, email, _ = self.credential_state()

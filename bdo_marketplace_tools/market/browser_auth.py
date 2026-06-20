@@ -223,15 +223,11 @@ async def acquire_market_cookies(
 
     profile_path = Path(profile_path)
     profile_path.mkdir(parents=True, exist_ok=True)
-    opening_message = f"Opening {account_label} browser session in Chrome. Complete login in the browser."
+    opening_message = f"Opening {account_label} browser in Chrome. Complete login manually."
     if auto_steam_login:
-        opening_message = (
-            f"Opening {account_label} browser session in Chrome. Automatic Steam re-auth will continue when possible."
-        )
+        opening_message = f"Opening {account_label} browser in Chrome for automatic re-authentication."
     elif auto_pa_login:
-        opening_message = (
-            f"Opening {account_label} browser session in Chrome. Saved Pearl Abyss credentials will be submitted when possible."
-        )
+        opening_message = f"Opening {account_label} browser in Chrome. Saved credentials will be submitted."
     await _emit_status(status_callback, opening_message, "info")
 
     context = None
@@ -644,7 +640,7 @@ async def _wait_for_market_cookies(
                 pass
         await _emit_status(
             status_callback,
-            "Marketplace cookies captured at login callback. Closing browser before validation.",
+            "Marketplace session cookies captured; validating session.",
             "info",
         )
         return captured_at_callback[0]
@@ -917,8 +913,8 @@ async def _maybe_run_steam_auto_login_target(
     key = (id(scope), selector_key, getattr(scope, "url", ""))
 
     if await _click_first_available_selector(scope, selectors, timeout=STEAM_AUTO_LOGIN_CLICK_TIMEOUT_MS):
-        first_click = key not in tracking["clicked"]
-        tracking["clicked"].add(key)
+        first_click = selector_key not in tracking["clicked"]
+        tracking["clicked"].add(selector_key)
         tracking["missing_started_at"].pop(key, None)
         if first_click:
             await _emit_status(status_callback, clicked_message, "info")
@@ -1117,14 +1113,14 @@ def _steam_auto_login_config(state):
         return (
             "pa_steam_login",
             PA_STEAM_LOGIN_SELECTORS,
-            "Automatic Steam re-auth clicked Log in with Steam.",
+            "Steam re-auth submitted the Pearl Abyss Steam login.",
             "Automatic Steam re-auth is waiting for manual input on the Pearl Abyss page.",
         )
     if state == "steam":
         return (
             "steam_confirm_login",
             STEAM_CONFIRM_LOGIN_SELECTORS,
-            "Automatic Steam re-auth clicked Steam Sign In.",
+            "Steam re-auth confirmed the Steam sign-in.",
             "Automatic Steam re-auth is waiting for manual input on the Steam page.",
         )
     return None
