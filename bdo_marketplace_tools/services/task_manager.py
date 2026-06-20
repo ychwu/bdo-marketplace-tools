@@ -1296,6 +1296,8 @@ class BackgroundTasks:
 
             if session_valid:
                 self.api_handler.login_status = True
+                if handle_pa_cookie_consent and not self.steam_pa_cookie_consent_prepared:
+                    self._set_steam_pa_cookie_consent_prepared(True)
                 self._set_saved_session_last_known_valid(True)
                 self.steam_auto_reauth_enabled = True
                 self.add_event("Steam Account session validated and saved.", "success")

@@ -45,12 +45,9 @@ COOKIEBOT_REQUIRED_CONSENT_SELECTORS = (
     "button:has-text('Accept Required')",
 )
 COOKIEBOT_DIALOG_SELECTOR = "#CybotCookiebotDialog"
-COOKIEBOT_DIALOG_DETECTION_TIMEOUT_MS = 1500
-COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS = 1500
 COOKIE_CONSENT_SAVED = "saved"
 COOKIE_CONSENT_MANUAL = "manual"
 COOKIE_CONSENT_NOT_FOUND = "not_found"
-COOKIE_CONSENT_WAITING = "waiting"
 COOKIE_CONSENT_SKIPPED = "skipped"
 PA_STEAM_LOGIN_SELECTORS = (
     "#btnSteam",
@@ -80,15 +77,6 @@ STEAM_CONFIRM_LOGIN_SELECTORS = (
 )
 STEAM_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
 STEAM_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
-# A Steam login button click can "succeed" (Playwright sees the element as actionable) without
-# firing the page's js-btnLastLoginCheck handler if that handler has not bound yet -- common right
-# after the Cookiebot banner is dismissed and the page re-renders. A working click navigates away
-# within this grace (changing the URL, so the key below is never revisited); only if the page has
-# still not advanced after the grace do we treat the click as dead and re-click. The grace is kept
-# longer than a normal click's navigation latency so a slow-but-working click is never re-clicked
-# mid-navigation. Re-click up to a capped number of attempts before asking the user to finish.
-STEAM_AUTO_LOGIN_RETRY_AFTER_SECONDS = 1.5
-STEAM_AUTO_LOGIN_MAX_CLICK_ATTEMPTS = 4
 PA_AUTO_LOGIN_FILL_TIMEOUT_MS = 1000
 PA_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
 PA_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
@@ -578,22 +566,13 @@ async def _wait_for_market_cookies(
                         tracking=pa_cookie_consent_state,
                         status_callback=status_callback,
                     )
-                    if pa_cookie_consent_result in {COOKIE_CONSENT_SAVED, COOKIE_CONSENT_NOT_FOUND}:
+                    if pa_cookie_consent_result == COOKIE_CONSENT_SAVED:
                         pa_cookie_consent_completed = True
-                        await _emit_callback(pa_cookie_consent_callback, pa_cookie_consent_result)
+                        await _emit_callback(pa_cookie_consent_callback, True)
 
                 auto_login_result = STEAM_AUTO_LOGIN_SKIPPED
                 if not page_challenge and _should_attempt_steam_auto_login(state, auth_flow_seen, callback_seen):
-                    # Skip the Steam auto-click on the same iteration the banner was just handled
-                    # (the page is mid-teardown/re-render); the next poll clicks. If that first
-                    # click lands before the button's js-btnLastLoginCheck handler rebinds, the
-                    # auto-login retries it (see _maybe_run_steam_auto_login_target) rather than
-                    # marking a dead click done forever.
-                    if pa_cookie_consent_result in {
-                        COOKIE_CONSENT_WAITING,
-                        COOKIE_CONSENT_MANUAL,
-                        COOKIE_CONSENT_SAVED,
-                    }:
+                    if pa_cookie_consent_result == COOKIE_CONSENT_MANUAL:
                         auto_login_result = STEAM_AUTO_LOGIN_WAITING
                     else:
                         auto_login_result = await _maybe_run_steam_auto_login(
@@ -801,43 +780,20 @@ async def _steam_store_logged_in_dom_ready(page):
 
 
 async def _accept_required_cookie_consent_if_available(page, status_callback=None, *, profile_label="Steam browser profile"):
-    if not await _cookiebot_dialog_visible(page):
-        return COOKIE_CONSENT_NOT_FOUND
-
     for selector in COOKIEBOT_REQUIRED_CONSENT_SELECTORS:
         try:
-            await page.locator(selector).first.click(timeout=COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS)
+            await page.locator(selector).first.click(timeout=PA_CONSENT_BUTTON_READY_TIMEOUT_MS)
         except Exception:
             continue
 
-        if await _cookiebot_dialog_hidden(page):
-            await _emit_status(status_callback, f"Required cookie consent saved in the {profile_label}.", "info")
-            return COOKIE_CONSENT_SAVED
-        else:
-            await _emit_status(
-                status_callback,
-                "Required cookie consent click sent; continue manually if the banner remains.",
-                "info",
-            )
-            return COOKIE_CONSENT_MANUAL
+        await _emit_status(status_callback, f"Required cookie consent saved in the {profile_label}.", "info")
+        return COOKIE_CONSENT_SAVED
     return COOKIE_CONSENT_NOT_FOUND
-
-
-async def _cookiebot_dialog_visible(page):
-    try:
-        await page.locator(COOKIEBOT_DIALOG_SELECTOR).wait_for(
-            state="visible",
-            timeout=COOKIEBOT_DIALOG_DETECTION_TIMEOUT_MS,
-        )
-        return True
-    except Exception:
-        return False
 
 
 def _new_steam_auto_login_state():
     return {
-        "clicked_at": {},
-        "click_count": {},
+        "clicked": set(),
         "missing_started_at": {},
         "missing_reported": set(),
     }
@@ -881,10 +837,10 @@ async def _maybe_prepare_pa_cookie_consent(
             tracking=tracking,
             status_callback=status_callback,
         )
-        if scope_result in {COOKIE_CONSENT_SAVED, COOKIE_CONSENT_NOT_FOUND, COOKIE_CONSENT_MANUAL}:
+        if scope_result in {COOKIE_CONSENT_SAVED, COOKIE_CONSENT_MANUAL}:
             return scope_result
-        if scope_result == COOKIE_CONSENT_WAITING:
-            result = COOKIE_CONSENT_WAITING
+        if scope_result == COOKIE_CONSENT_NOT_FOUND:
+            result = COOKIE_CONSENT_NOT_FOUND
 
     return result
 
@@ -894,14 +850,6 @@ async def _maybe_prepare_pa_cookie_consent_target(scope, *, tracking, status_cal
     if key in tracking["checked"]:
         return COOKIE_CONSENT_SKIPPED
 
-    # Probe for the Cookiebot banner FIRST, then confirm the Steam button. Do NOT reorder this to
-    # "check the button first" as a speed optimization: the Cookiebot banner is injected by an
-    # async third-party script and routinely appears *after* the Steam button is already in the
-    # DOM. Checking the button first races that injection — in the gap before the banner loads the
-    # button looks ready, so consent is marked done and the dismissal is skipped, then the banner
-    # appears and blocks the real Steam login click. `_cookiebot_dialog_visible` waits up to
-    # COOKIEBOT_DIALOG_DETECTION_TIMEOUT_MS for the banner so a slightly-late banner is still
-    # caught and dismissed.
     consent_result = await _accept_required_cookie_consent_if_available(
         scope,
         status_callback,
@@ -913,11 +861,7 @@ async def _maybe_prepare_pa_cookie_consent_target(scope, *, tracking, status_cal
     if consent_result == COOKIE_CONSENT_MANUAL:
         return COOKIE_CONSENT_MANUAL
 
-    if await _selector_visible(scope, PA_STEAM_LOGIN_SELECTORS, timeout=PA_CONSENT_BUTTON_READY_TIMEOUT_MS):
-        tracking["checked"].add(key)
-        return COOKIE_CONSENT_NOT_FOUND
-
-    return COOKIE_CONSENT_WAITING
+    return COOKIE_CONSENT_NOT_FOUND
 
 
 async def _maybe_run_steam_auto_login(
@@ -970,28 +914,11 @@ async def _maybe_run_steam_auto_login_target(
         return STEAM_AUTO_LOGIN_SKIPPED
 
     selector_key, selectors, clicked_message, missing_message = config
-    # The url is part of the key on purpose: a click that actually works navigates away, producing
-    # a different key, so we only ever revisit this key while the page has NOT advanced.
     key = (id(scope), selector_key, getattr(scope, "url", ""))
 
-    last_click_at = tracking["clicked_at"].get(key)
-    if last_click_at is not None:
-        # Already clicked this button on this exact page. A working click navigates away within this
-        # grace (changing the URL, so this key is never revisited); only if the page has still not
-        # advanced after the grace do we treat it as a dead click and re-click, up to the cap.
-        if now - last_click_at < STEAM_AUTO_LOGIN_RETRY_AFTER_SECONDS:
-            return STEAM_AUTO_LOGIN_WAITING
-        if tracking["click_count"].get(key, 0) >= STEAM_AUTO_LOGIN_MAX_CLICK_ATTEMPTS:
-            if key not in tracking["missing_reported"]:
-                tracking["missing_reported"].add(key)
-                await _emit_status(status_callback, missing_message, "warning")
-                return STEAM_AUTO_LOGIN_MANUAL_NEEDED
-            return STEAM_AUTO_LOGIN_WAITING
-
     if await _click_first_available_selector(scope, selectors, timeout=STEAM_AUTO_LOGIN_CLICK_TIMEOUT_MS):
-        first_click = last_click_at is None
-        tracking["clicked_at"][key] = now
-        tracking["click_count"][key] = tracking["click_count"].get(key, 0) + 1
+        first_click = key not in tracking["clicked"]
+        tracking["clicked"].add(key)
         tracking["missing_started_at"].pop(key, None)
         if first_click:
             await _emit_status(status_callback, clicked_message, "info")

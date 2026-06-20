@@ -23,23 +23,18 @@ from bdo_marketplace_tools.market.api_handler import (
 from bdo_marketplace_tools.market.browser_auth import (
     BDO_SITE_BOOTSTRAP_URL,
     BrowserAuthError,
-    COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS,
-    COOKIEBOT_DIALOG_DETECTION_TIMEOUT_MS,
-    COOKIE_CONSENT_MANUAL,
     AUTH_CHALLENGE_SELECTORS,
     COOKIE_CONSENT_NOT_FOUND,
     COOKIE_CONSENT_SAVED,
     COOKIE_CONSENT_SKIPPED,
-    COOKIE_CONSENT_WAITING,
     STEAM_AUTO_LOGIN_CLICKED,
     STEAM_AUTO_LOGIN_DISABLED,
     STEAM_AUTO_LOGIN_MANUAL_NEEDED,
-    STEAM_AUTO_LOGIN_MAX_CLICK_ATTEMPTS,
-    STEAM_AUTO_LOGIN_RETRY_AFTER_SECONDS,
     STEAM_AUTO_LOGIN_SKIPPED,
     STEAM_AUTO_LOGIN_WAITING,
     PA_AUTO_LOGIN_DISABLED,
     PA_AUTO_LOGIN_SUBMITTED,
+    PA_CONSENT_BUTTON_READY_TIMEOUT_MS,
     STEAM_BROWSER_CHANNEL,
     STEAM_COMMUNITY_URL,
     STEAM_LOGIN_COOKIE_NAMES,
@@ -268,7 +263,6 @@ class APIResultTests(unittest.TestCase):
     def test_cookiebot_required_consent_click_is_best_effort(self):
         clicked_selectors = []
         statuses = []
-        wait_calls = []
 
         class FakeFirstLocator:
             def __init__(self, selector):
@@ -285,7 +279,7 @@ class APIResultTests(unittest.TestCase):
                 self.selector = selector
 
             async def wait_for(self, state=None, timeout=None):
-                wait_calls.append((self.selector, state, timeout))
+                raise AssertionError("fast consent click should not wait for dialog state")
 
         class FakePage:
             def locator(self, selector):
@@ -300,19 +294,13 @@ class APIResultTests(unittest.TestCase):
         )
         self.assertEqual(
             clicked_selectors,
-            [("#CybotCookiebotDialogBodyButtonDecline", COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS)],
-        )
-        self.assertEqual(
-            wait_calls,
-            [
-                ("#CybotCookiebotDialog", "visible", COOKIEBOT_DIALOG_DETECTION_TIMEOUT_MS),
-                ("#CybotCookiebotDialog", "hidden", 3000),
-            ],
+            [("#CybotCookiebotDialogBodyButtonDecline", PA_CONSENT_BUTTON_READY_TIMEOUT_MS)],
         )
         self.assertEqual(statuses, [("Required cookie consent saved in the Steam browser profile.", "info")])
 
-    def test_cookiebot_required_consent_reports_click_when_dialog_remains(self):
+    def test_cookiebot_required_consent_returns_saved_without_hidden_wait(self):
         statuses = []
+        wait_calls = []
 
         class FakeFirstLocator:
             async def click(self, timeout=None):
@@ -322,8 +310,7 @@ class APIResultTests(unittest.TestCase):
             first = FakeFirstLocator()
 
             async def wait_for(self, state=None, timeout=None):
-                if state == "visible":
-                    return None
+                wait_calls.append((state, timeout))
                 raise RuntimeError("dialog still visible")
 
         class FakePage:
@@ -335,31 +322,33 @@ class APIResultTests(unittest.TestCase):
 
         self.assertEqual(
             asyncio.run(_accept_required_cookie_consent_if_available(FakePage(), status_callback=status_callback)),
-            COOKIE_CONSENT_MANUAL,
+            COOKIE_CONSENT_SAVED,
         )
-        self.assertEqual(
-            statuses,
-            [("Required cookie consent click sent; continue manually if the banner remains.", "info")],
-        )
+        self.assertEqual(wait_calls, [])
+        self.assertEqual(statuses, [("Required cookie consent saved in the Steam browser profile.", "info")])
 
     def test_cookiebot_required_consent_returns_not_found_silently(self):
         clicked_selectors = []
         statuses = []
 
         class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
             async def click(self, timeout=None):
-                clicked_selectors.append(timeout)
+                clicked_selectors.append((self.selector, timeout))
                 raise RuntimeError("not found")
 
         class FakeLocator:
-            first = FakeFirstLocator()
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
 
             async def wait_for(self, state=None, timeout=None):
-                raise RuntimeError("dialog not visible")
+                raise AssertionError("fast consent click should not wait for dialog state")
 
         class FakePage:
             def locator(self, selector):
-                return FakeLocator()
+                return FakeLocator(selector)
 
         async def status_callback(message, level):
             statuses.append((message, level))
@@ -368,7 +357,15 @@ class APIResultTests(unittest.TestCase):
             asyncio.run(_accept_required_cookie_consent_if_available(FakePage(), status_callback=status_callback)),
             COOKIE_CONSENT_NOT_FOUND,
         )
-        self.assertEqual(clicked_selectors, [])
+        self.assertEqual(
+            clicked_selectors,
+            [(selector, PA_CONSENT_BUTTON_READY_TIMEOUT_MS) for selector in (
+                "#CybotCookiebotDialogBodyButtonDecline",
+                "button:has-text('Only Accept Required')",
+                "button:has-text('Accept Necessary')",
+                "button:has-text('Accept Required')",
+            )],
+        )
         self.assertEqual(statuses, [])
 
     def test_pa_cookie_consent_probe_clicks_required_cookie_button_once(self):
@@ -421,12 +418,12 @@ class APIResultTests(unittest.TestCase):
         self.assertEqual(result, COOKIE_CONSENT_SAVED)
         self.assertEqual(
             clicked_selectors,
-            [("#CybotCookiebotDialogBodyButtonDecline", COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS)],
+            [("#CybotCookiebotDialogBodyButtonDecline", PA_CONSENT_BUTTON_READY_TIMEOUT_MS)],
         )
         self.assertEqual(statuses, [("Required cookie consent saved in the Pearl Abyss login page.", "info")])
 
-    def test_pa_cookie_consent_probe_marks_done_when_banner_is_absent(self):
-        checked_selectors = []
+    def test_pa_cookie_consent_probe_does_not_mark_done_when_banner_is_absent(self):
+        clicked_selectors = []
         tracking = _new_pa_cookie_consent_state()
 
         class FakeFirstLocator:
@@ -434,11 +431,11 @@ class APIResultTests(unittest.TestCase):
                 self.selector = selector
 
             async def click(self, timeout=None):
+                clicked_selectors.append((self.selector, timeout))
                 raise RuntimeError("not found")
 
             async def is_visible(self, timeout=None):
-                checked_selectors.append((self.selector, timeout))
-                return self.selector == "#btnSteam"
+                raise AssertionError("fast consent probe should not inspect Steam button visibility")
 
         class FakeLocator:
             def __init__(self, selector):
@@ -459,10 +456,22 @@ class APIResultTests(unittest.TestCase):
         second_result = asyncio.run(_maybe_prepare_pa_cookie_consent(page, "pa", tracking=tracking))
 
         self.assertEqual(result, COOKIE_CONSENT_NOT_FOUND)
-        self.assertEqual(second_result, COOKIE_CONSENT_SKIPPED)
-        self.assertEqual(checked_selectors, [("#btnSteam", 250)])
+        self.assertEqual(second_result, COOKIE_CONSENT_NOT_FOUND)
+        self.assertEqual(
+            clicked_selectors,
+            [
+                ("#CybotCookiebotDialogBodyButtonDecline", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("button:has-text('Only Accept Required')", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("button:has-text('Accept Necessary')", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("button:has-text('Accept Required')", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("#CybotCookiebotDialogBodyButtonDecline", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("button:has-text('Only Accept Required')", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("button:has-text('Accept Necessary')", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("button:has-text('Accept Required')", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+            ],
+        )
 
-    def test_pa_cookie_consent_probe_waits_until_login_page_is_ready(self):
+    def test_pa_cookie_consent_probe_missing_button_returns_not_found_immediately(self):
         tracking = _new_pa_cookie_consent_state()
 
         class FakeFirstLocator:
@@ -470,7 +479,7 @@ class APIResultTests(unittest.TestCase):
                 raise RuntimeError("not found")
 
             async def is_visible(self, timeout=None):
-                return False
+                raise AssertionError("fast consent probe should not inspect Steam button visibility")
 
         class FakeLocator:
             first = FakeFirstLocator()
@@ -486,7 +495,89 @@ class APIResultTests(unittest.TestCase):
 
         result = asyncio.run(_maybe_prepare_pa_cookie_consent(FakePage(), "pa", tracking=tracking))
 
-        self.assertEqual(result, COOKIE_CONSENT_WAITING)
+        self.assertEqual(result, COOKIE_CONSENT_NOT_FOUND)
+
+    def test_market_cookie_wait_clicks_cookiebot_then_steam_in_same_poll(self):
+        fresh = [
+            {
+                "name": "TradeAuth_Session",
+                "value": "fresh-token",
+                "domain": "na-trade.naeu.playblackdesert.com",
+                "path": "/",
+            }
+        ]
+        consent_results = []
+
+        class FakeFirstLocator:
+            def __init__(self, page, selector):
+                self.page = page
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                if self.selector == "#CybotCookiebotDialogBodyButtonDecline":
+                    self.page.clicked.append(("cookie", self.selector, timeout))
+                    return None
+                if self.selector == "#btnSteam":
+                    self.page.clicked.append(("steam", self.selector, timeout))
+                    self.page.steam_clicked = True
+                    return None
+                raise RuntimeError("not found")
+
+            async def is_visible(self, timeout=None):
+                return False
+
+        class FakeLocator:
+            def __init__(self, page, selector):
+                self.first = FakeFirstLocator(page, selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+            frames = []
+
+            def __init__(self):
+                self.clicked = []
+                self.steam_clicked = False
+
+            def is_closed(self):
+                return False
+
+            def locator(self, selector):
+                return FakeLocator(self, selector)
+
+        class FakeContext:
+            def __init__(self):
+                self.page = FakePage()
+                self.pages = [self.page]
+
+            def on(self, event, handler):
+                pass
+
+            async def cookies(self, *_args):
+                return fresh if self.page.steam_clicked else []
+
+        async def run():
+            context = FakeContext()
+            cookies = await _wait_for_market_cookies(
+                context,
+                status_callback=None,
+                timeout_seconds=1,
+                auto_steam_login=True,
+                handle_pa_cookie_consent=True,
+                pa_cookie_consent_callback=consent_results.append,
+            )
+            return context.page.clicked, cookies
+
+        clicked, cookies = asyncio.run(run())
+
+        self.assertEqual(
+            clicked,
+            [
+                ("cookie", "#CybotCookiebotDialogBodyButtonDecline", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("steam", "#btnSteam", 1000),
+            ],
+        )
+        self.assertEqual([cookie["name"] for cookie in cookies], ["TradeAuth_Session"])
+        self.assertEqual(consent_results, [True])
 
     def test_steam_profile_login_detection_uses_auth_cookie_names_only(self):
         self.assertEqual(STEAM_LOGIN_COOKIE_NAMES, {"steamLoginSecure"})
@@ -1501,9 +1592,7 @@ class APIResultTests(unittest.TestCase):
             [("Automatic Steam re-auth is waiting for manual input on the Pearl Abyss page.", "warning")],
         )
 
-    def test_steam_auto_login_retries_dead_click_until_navigation(self):
-        # A click that "succeeds" on the element but does not navigate (handler not yet bound) must
-        # be retried, not marked done forever. This is the cookie-box -> Steam-button regression.
+    def test_steam_auto_login_retries_click_every_poll_until_navigation(self):
         click_times = []
         statuses = []
         tracking = _new_steam_auto_login_state()
@@ -1534,48 +1623,29 @@ class APIResultTests(unittest.TestCase):
 
         async def run():
             results = []
-            # Poll 1: first (dead) click. Poll 2: still on the page within the grace -> wait. Poll 3:
-            # grace elapsed, page never advanced -> re-click.
-            results.append(
-                await _maybe_run_steam_auto_login(
-                    page, "pa", enabled=True, tracking=tracking, status_callback=status_callback, now=0.0
+            for now in (0.0, 0.25, 0.5):
+                results.append(
+                    await _maybe_run_steam_auto_login(
+                        page,
+                        "pa",
+                        enabled=True,
+                        tracking=tracking,
+                        status_callback=status_callback,
+                        now=now,
+                    )
                 )
-            )
-            results.append(
-                await _maybe_run_steam_auto_login(
-                    page,
-                    "pa",
-                    enabled=True,
-                    tracking=tracking,
-                    status_callback=status_callback,
-                    now=STEAM_AUTO_LOGIN_RETRY_AFTER_SECONDS / 2,
-                )
-            )
-            results.append(
-                await _maybe_run_steam_auto_login(
-                    page,
-                    "pa",
-                    enabled=True,
-                    tracking=tracking,
-                    status_callback=status_callback,
-                    now=STEAM_AUTO_LOGIN_RETRY_AFTER_SECONDS + 0.1,
-                )
-            )
             return results
 
         results = asyncio.run(run())
 
-        self.assertEqual(results, [STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_WAITING, STEAM_AUTO_LOGIN_CLICKED])
-        # Clicked twice (initial + one retry), never re-announced the click on the retry.
-        self.assertEqual(click_times, [1000, 1000])
+        self.assertEqual(results, [STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_CLICKED])
+        self.assertEqual(click_times, [1000, 1000, 1000])
         clicked_messages = [
             message for (message, _level) in statuses if message == "Automatic Steam re-auth clicked Log in with Steam."
         ]
         self.assertEqual(len(clicked_messages), 1)
 
-    def test_steam_auto_login_dead_click_eventually_reports_manual(self):
-        # A button that always clicks but never navigates exhausts the retry budget and then asks
-        # for manual completion once, instead of silently retrying forever.
+    def test_steam_auto_login_clickable_button_does_not_exhaust_manual_cap(self):
         statuses = []
         tracking = _new_steam_auto_login_state()
 
@@ -1604,27 +1674,23 @@ class APIResultTests(unittest.TestCase):
 
         async def run():
             results = []
-            now = 0.0
-            for _ in range(60):
+            for now in range(12):
                 results.append(
                     await _maybe_run_steam_auto_login(
                         page, "pa", enabled=True, tracking=tracking, status_callback=status_callback, now=now
                     )
                 )
-                # Advance by the grace so every call clears the retry delay and re-clicks.
-                now += STEAM_AUTO_LOGIN_RETRY_AFTER_SECONDS
             return results
 
         results = asyncio.run(run())
 
-        self.assertEqual(results.count(STEAM_AUTO_LOGIN_CLICKED), STEAM_AUTO_LOGIN_MAX_CLICK_ATTEMPTS)
-        self.assertIn(STEAM_AUTO_LOGIN_MANUAL_NEEDED, results)
+        self.assertEqual(results, [STEAM_AUTO_LOGIN_CLICKED] * 12)
         manual_messages = [
             message
             for (message, level) in statuses
             if level == "warning" and "waiting for manual input" in message
         ]
-        self.assertEqual(len(manual_messages), 1)
+        self.assertEqual(manual_messages, [])
 
     def test_steam_auto_login_skips_market_page_after_auth_flow_seen(self):
         self.assertTrue(_should_attempt_steam_auto_login("market", False, False))
@@ -3196,13 +3262,14 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(browser_auth.await_args.kwargs["handle_pa_cookie_consent"])
         manager.api_handler.validate_and_save_imported_session.assert_awaited_once()
         self.assertTrue(manager.steam_browser_profile_prepared)
+        self.assertTrue(manager.steam_pa_cookie_consent_prepared)
         self.assertTrue(manager.saved_session_last_known_valid)
         self.assertTrue(manager.steam_auto_reauth_enabled)
         self.assertTrue(any("Initial Steam browser setup is required" in event for event in manager.events))
         self.assertTrue(any("Initial Steam browser setup saved" in event for event in manager.events))
         await manager.stop_login_status_checker()
 
-    async def test_steam_refresh_marks_one_time_pa_cookie_consent_complete(self):
+    async def test_steam_refresh_marks_one_time_pa_cookie_consent_complete_after_success(self):
         manager = self.make_task_manager()
         manager.account_mode = STEAM_BROWSER_MODE
         manager.api_handler.account_mode = STEAM_BROWSER_MODE
@@ -3210,13 +3277,9 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.steam_pa_cookie_consent_prepared = False
         manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
 
-        async def browser_auth_side_effect(*_args, **kwargs):
-            kwargs["pa_cookie_consent_callback"](COOKIE_CONSENT_NOT_FOUND)
-            return [{"name": "TradeAuth_Session", "value": "ok"}]
-
         with patch(
             "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
-            new=AsyncMock(side_effect=browser_auth_side_effect),
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
         ) as browser_auth:
             refreshed = await manager.refresh_browser_session()
 
@@ -3302,6 +3365,23 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         # No auth failure -- timeout included -- may reset consent. Cookie consent persists in the
         # browser profile and is only invalidated by clearing cookies, so the flag stays prepared and
         # the next refresh stays on the fast, notice-free path.
+        self.assertTrue(manager.steam_pa_cookie_consent_prepared)
+
+    async def test_steam_refresh_validation_failure_keeps_consent_prepared(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_browser_profile_prepared = True
+        manager.steam_pa_cookie_consent_prepared = True
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(side_effect=MarketplaceAPIError("bad session"))
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ):
+            refreshed = await manager.refresh_browser_session(force_refresh=True)
+
+        self.assertFalse(refreshed)
         self.assertTrue(manager.steam_pa_cookie_consent_prepared)
 
     async def test_account_mode_change_stops_monitor_and_clears_session(self):
