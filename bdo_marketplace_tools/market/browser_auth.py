@@ -83,10 +83,13 @@ STEAM_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
 # A Steam login button click can "succeed" (Playwright sees the element as actionable) without
 # firing the page's js-btnLastLoginCheck handler if that handler has not bound yet -- which is
 # common right after the Cookiebot banner is dismissed and the page re-renders. A working click
-# navigates away, so if we are still on the same page after this grace we treat the click as dead
-# and re-click, up to a capped number of attempts before asking the user to finish manually.
-STEAM_AUTO_LOGIN_RETRY_AFTER_SECONDS = 1.5
-STEAM_AUTO_LOGIN_MAX_CLICK_ATTEMPTS = 4
+# navigates away, so if we are still on the same page after a grace we treat the click as dead and
+# re-click. The grace escalates per attempt (base, 2x base, ... capped at max): the first retry is
+# quick so a fast rebind is caught without idle waiting, then it backs off so the login button is
+# never hammered, up to a capped number of attempts before asking the user to finish manually.
+STEAM_AUTO_LOGIN_RETRY_BASE_SECONDS = 0.5
+STEAM_AUTO_LOGIN_RETRY_MAX_SECONDS = 1.5
+STEAM_AUTO_LOGIN_MAX_CLICK_ATTEMPTS = 5
 PA_AUTO_LOGIN_FILL_TIMEOUT_MS = 1000
 PA_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
 PA_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
@@ -108,6 +111,14 @@ PA_AUTO_LOGIN_SKIPPED = "skipped"
 STEAM_LOGIN_COOKIE_NAMES = {
     "steamLoginSecure",
 }
+# Cookie domains whose cookies are preserved when dumping everything else (test tooling): the full
+# Steam web session lives across these domains (steamLoginSecure, sessionid, steamMachineAuth, ...),
+# and keeping all of them avoids having to log back into Steam between re-auth test runs.
+STEAM_AUTH_COOKIE_DOMAIN_SUFFIXES = (
+    "steampowered.com",
+    "steamcommunity.com",
+    "steam-chat.com",
+)
 STEAM_LOGGED_IN_SELECTORS = (
     "#account_pulldown",
     ".user_avatar",
@@ -331,6 +342,62 @@ async def clear_steam_browser_profile_cookies(
             cookies = await context.cookies()
             await context.clear_cookies()
             return len(cookies)
+    except BrowserAuthError:
+        raise
+    except Exception as exc:
+        raise BrowserAuthError(_browser_launch_error_message(exc)) from exc
+    finally:
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
+
+
+def _is_steam_auth_cookie(cookie):
+    if not isinstance(cookie, dict):
+        return False
+    domain = (cookie.get("domain") or "").lstrip(".").lower()
+    if not domain:
+        return False
+    return any(
+        domain == suffix or domain.endswith("." + suffix)
+        for suffix in STEAM_AUTH_COOKIE_DOMAIN_SUFFIXES
+    )
+
+
+async def clear_market_cookies_keep_steam_login(
+    *,
+    profile_path=STEAM_MARKET_PROFILE_PATH,
+):
+    """Clear every cookie in the profile except the Steam web session cookies.
+
+    Test tooling: leaves the user logged into Steam while wiping the marketplace session, the
+    Pearl Abyss session, and the Cookiebot consent cookie, so the next re-auth runs the full
+    cookie-box + Steam-button flow without a Steam re-login. Returns the number of cookies cleared.
+    """
+    try:
+        from patchright.async_api import async_playwright
+    except ImportError as exc:  # pragma: no cover - depends on optional runtime
+        raise BrowserAuthUnavailable(
+            "Patchright is not installed. Install requirements before clearing browser cookies."
+        ) from exc
+
+    profile_path = Path(profile_path)
+    profile_path.mkdir(parents=True, exist_ok=True)
+
+    context = None
+    try:
+        async with async_playwright() as playwright:
+            context = await _launch_persistent_chrome_context(playwright, profile_path)
+            if not context.pages:
+                await context.new_page()
+            all_cookies = await context.cookies()
+            kept = [cookie for cookie in all_cookies if _is_steam_auth_cookie(cookie)]
+            await context.clear_cookies()
+            if kept:
+                await context.add_cookies(kept)
+            return len(all_cookies) - len(kept)
     except BrowserAuthError:
         raise
     except Exception as exc:
@@ -844,11 +911,13 @@ async def _maybe_run_steam_auto_login_target(
 
     last_click_at = tracking["clicked_at"].get(key)
     if last_click_at is not None:
-        # Already clicked this button on this exact page. Give the click time to navigate before
-        # deciding it was a dead click; if it never advances, re-click up to the attempt cap.
-        if now - last_click_at < STEAM_AUTO_LOGIN_RETRY_AFTER_SECONDS:
+        # Already clicked this button on this exact page. Give the click an (escalating) grace to
+        # navigate before deciding it was a dead click; if it never advances, re-click up to the cap.
+        attempts = tracking["click_count"].get(key, 0)
+        retry_delay = min(STEAM_AUTO_LOGIN_RETRY_BASE_SECONDS * attempts, STEAM_AUTO_LOGIN_RETRY_MAX_SECONDS)
+        if now - last_click_at < retry_delay:
             return STEAM_AUTO_LOGIN_WAITING
-        if tracking["click_count"].get(key, 0) >= STEAM_AUTO_LOGIN_MAX_CLICK_ATTEMPTS:
+        if attempts >= STEAM_AUTO_LOGIN_MAX_CLICK_ATTEMPTS:
             if key not in tracking["missing_reported"]:
                 tracking["missing_reported"].add(key)
                 await _emit_status(status_callback, missing_message, "warning")

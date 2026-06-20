@@ -331,8 +331,8 @@ class MarketplaceToolsApp(App[None]):
         margin-top: 1;
     }
 
-    #settings-update-actions {
-        height: auto;
+    .settings-config {
+        margin-bottom: 1;
     }
 
     #settings-update-status {
@@ -369,6 +369,15 @@ class MarketplaceToolsApp(App[None]):
     #content {
         height: 1fr;
         overflow-y: auto;
+        scrollbar-size-vertical: 1;
+        scrollbar-size-horizontal: 1;
+        scrollbar-color: #343434;
+        scrollbar-color-hover: #4a4a4a;
+        scrollbar-color-active: #5f5f5f;
+        scrollbar-background: #101010;
+        scrollbar-background-hover: #101010;
+        scrollbar-background-active: #101010;
+        scrollbar-corner-color: #101010;
     }
 
     Input, Select {
@@ -437,10 +446,12 @@ class MarketplaceToolsApp(App[None]):
                         yield Button("Toggle Test Session", id="toggle-test-session", compact=True)
                         yield Button("Auto Reauth", id="toggle-auto-reauth", compact=True)
                         yield Button("Expire Session", id="expire-test-session", compact=True)
+                        yield Button("Run Session Check", id="run-session-check", compact=True)
                         yield Button("Reauth Check", id="run-reauth-check", compact=True)
                         yield Button("Blank Browser", id="open-blank-browser", compact=True)
                         yield Button("Reset Steam Setup", id="reset-steam-setup", compact=True)
                         yield Button("Clear Browser Cookies", id="clear-browser-cookies", compact=True)
+                        yield Button("Clear (Keep Steam)", id="dump-cookies-keep-steam", compact=True)
                         yield Button("Start Test Scan", id="start-test-monitor", compact=True)
                         yield Button("Start Test Buy", id="start-test-buy", compact=True)
                         yield Button("Stop Test Scan", id="stop-test-monitor", compact=True)
@@ -1098,51 +1109,32 @@ class MarketplaceToolsApp(App[None]):
 
     async def mount_settings(self, content: Container) -> None:
         await content.mount(Static("About", classes="settings-section-title"))
-        await content.mount(
-            Horizontal(
-                Static(id="settings-version", classes="stats-tile"),
-                Static(id="settings-channel", classes="stats-tile"),
-                Static(id="settings-schema", classes="stats-tile"),
-                Static(id="settings-launch", classes="stats-tile"),
-                classes="stats-row",
-            )
-        )
+        await content.mount(Static(id="settings-about", classes="settings-note"))
+
         await content.mount(Static("Updates", classes="settings-section-title"))
         await content.mount(
             Horizontal(
                 Static(id="settings-update", classes="stats-tile"),
-                Static(id="settings-update-startup", classes="stats-tile"),
+                ModalAction("Check Now", "settings-check-update"),
+                ModalAction("Startup: On", "settings-toggle-update-startup"),
+                id="settings-update-row",
                 classes="stats-row",
-            )
-        )
-        await content.mount(
-            Horizontal(
-                ModalAction("Check for Updates", "settings-check-update"),
-                ModalAction("Toggle Startup Check", "settings-toggle-update-startup"),
-                id="settings-update-actions",
             )
         )
         await content.mount(Static("", id="settings-update-status"))
 
-        await content.mount(Static("Configuration", classes="settings-section-title"))
+        await content.mount(Static("Account", classes="settings-section-title"))
         await content.mount(
             Horizontal(
-                Static(id="settings-login", classes="stats-tile"),
-                Static(id="settings-session", classes="stats-tile"),
-                Static(id="settings-mode", classes="stats-tile"),
-                Static(id="settings-polling", classes="stats-tile"),
-                classes="stats-row",
-            )
-        )
-        await content.mount(
-            Horizontal(
-                Static(id="settings-spend", classes="stats-tile"),
-                Static(id="settings-buy-delay", classes="stats-tile"),
                 Static(id="settings-account", classes="stats-tile"),
-                Static(id="settings-tracked", classes="stats-tile"),
+                Static(id="settings-session", classes="stats-tile"),
                 classes="stats-row",
             )
         )
+
+        await content.mount(Static("Configuration", classes="settings-section-title"))
+        await content.mount(Static(id="settings-config-list", classes="settings-config"))
+
         await content.mount(Static("Maintenance", classes="settings-section-title"))
         await content.mount(
             Static(
@@ -1153,9 +1145,9 @@ class MarketplaceToolsApp(App[None]):
         )
         await content.mount(
             Horizontal(
-                ModalAction("Clear Saved Session", "clear-saved-session", extra_classes="modal-action-destructive"),
+                ModalAction("Clear Session", "clear-saved-session", extra_classes="modal-action-destructive"),
                 ModalAction("Clear Browser Cookies", "settings-clear-cookies", extra_classes="modal-action-destructive"),
-                ModalAction("Reset Steam Setup", "settings-reset-steam"),
+                ModalAction("Reset Steam Setup", "settings-reset-steam", extra_classes="modal-action-destructive"),
                 id="settings-actions",
             )
         )
@@ -1164,7 +1156,7 @@ class MarketplaceToolsApp(App[None]):
 
     def refresh_settings_summary(self) -> None:
         try:
-            self.query_one("#settings-version", Static)
+            about = self.query_one("#settings-about", Static)
         except Exception:
             return
 
@@ -1172,9 +1164,15 @@ class MarketplaceToolsApp(App[None]):
         steam_mode = tm.uses_steam_browser_session()
         session_label, session_detail, session_level = self.session_status_state()
 
-        self.refresh_info_tile("settings-version", "Version", APP_VERSION, "App version")
-        self.refresh_info_tile("settings-channel", "Channel", APP_CHANNEL, "Release channel")
-        self.refresh_info_tile("settings-schema", "Schema", f"v{SETTINGS_SCHEMA_VERSION}", "Settings file")
+        about_text = Text()
+        about_text.append("Marketplace Tools", style=COLOR_INFO)
+        about_text.append("   ·   ", style=COLOR_TEXT_MUTED)
+        about_text.append(f"v{APP_VERSION} ({APP_CHANNEL})", style=COLOR_TEXT_MUTED)
+        about_text.append("   ·   ", style=COLOR_TEXT_MUTED)
+        about_text.append(f"schema v{SETTINGS_SCHEMA_VERSION}", style=COLOR_TEXT_MUTED)
+        about_text.append("   ·   ", style=COLOR_TEXT_MUTED)
+        about_text.append(self.launch_mode, style=COLOR_WARNING if self.is_test_mode else COLOR_TEXT_MUTED)
+        about.update(about_text)
 
         if tm.available_update_version:
             self.refresh_info_tile(
@@ -1186,26 +1184,19 @@ class MarketplaceToolsApp(App[None]):
                 True,
             )
         elif tm.update_check_completed:
-            self.refresh_info_tile("settings-update", "Update", "Up to date", "Latest installed", "success")
+            self.refresh_info_tile("settings-update", "Update", "Up to date", f"v{APP_VERSION}", "success", True)
         else:
             self.refresh_info_tile("settings-update", "Update", "Unknown", "Not checked yet")
-        self.refresh_info_tile(
-            "settings-update-startup",
-            "Startup Check",
-            "On" if tm.update_check_on_startup else "Off",
-            "Checks on launch" if tm.update_check_on_startup else "Manual only",
-        )
-        self.refresh_info_tile(
-            "settings-launch",
-            "Launch",
-            self.launch_mode.title(),
-            "Test debug build" if self.is_test_mode else "Normal build",
-            "warning" if self.is_test_mode else "info",
-        )
+        try:
+            self.query_one("#settings-toggle-update-startup", ModalAction).update(
+                f"Startup: {'On' if tm.update_check_on_startup else 'Off'}"
+            )
+        except Exception:
+            pass
 
         self.refresh_info_tile(
-            "settings-login",
-            "Login Method",
+            "settings-account",
+            "Account",
             "Steam" if steam_mode else "Pearl Abyss",
             tm.account_mode_detail(),
         )
@@ -1217,45 +1208,18 @@ class MarketplaceToolsApp(App[None]):
             session_level,
             True,
         )
-        buy_mode = tm.purchase_submission_enabled
-        self.refresh_info_tile(
-            "settings-mode",
-            "Mode",
-            "Buy mode" if buy_mode else "Watch only",
-            "Purchases on" if buy_mode else "Detect only",
-            "warning" if buy_mode else "success",
-            True,
-        )
-        self.refresh_info_tile(
-            "settings-polling",
-            "Polling",
-            tm.current_delay_label(),
-            tm.current_delay_range(),
-        )
-        self.refresh_info_tile(
-            "settings-spend",
-            "Spend Cap",
-            format_compact_silver(tm.max_spend),
-            "This session",
-        )
-        self.refresh_info_tile(
-            "settings-buy-delay",
-            "Buy Delay",
-            tm.purchase_delay_range(),
-            "Between buys",
-        )
-        self.refresh_info_tile(
-            "settings-account",
-            "Account",
-            self.session_account_label(),
-            "Marketplace login",
-        )
-        self.refresh_info_tile(
-            "settings-tracked",
-            "Tracked",
-            "Outfits",
-            "Male & female",
-        )
+
+        config = Table.grid(padding=(0, 2))
+        config.add_column(style=f"bold {COLOR_TEXT_MUTED}", no_wrap=True)
+        config.add_column()
+        config.add_row("Mode", "Buy mode" if tm.purchase_submission_enabled else "Watch only")
+        config.add_row("Polling", f"{tm.current_delay_label()} ({tm.current_delay_range()})")
+        config.add_row("Buy delay", tm.purchase_delay_range())
+        config.add_row("Spend cap", format_compact_silver(tm.max_spend))
+        try:
+            self.query_one("#settings-config-list", Static).update(config)
+        except Exception:
+            pass
 
     def refresh_spend_summary(self) -> None:
         try:
@@ -1588,6 +1552,8 @@ class MarketplaceToolsApp(App[None]):
             await self.toggle_test_steam_auto_reauth()
         elif button_id == "expire-test-session":
             await self.expire_test_session()
+        elif button_id == "run-session-check":
+            await self.run_test_session_check()
         elif button_id == "run-reauth-check":
             await self.run_test_reauthentication_check()
         elif button_id == "prepare-steam-profile":
@@ -1612,6 +1578,14 @@ class MarketplaceToolsApp(App[None]):
                 self.run_worker(
                     self.clear_test_browser_cookies(),
                     name="clear-browser-cookies",
+                    group="actions",
+                    exclusive=True,
+                )
+        elif button_id == "dump-cookies-keep-steam":
+            if self._debug_action_allowed():
+                self.run_worker(
+                    self.dump_test_cookies_keep_steam(),
+                    name="dump-cookies-keep-steam",
                     group="actions",
                     exclusive=True,
                 )
@@ -1989,6 +1963,18 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_modal_summaries()
         await self.return_to_dashboard()
 
+    async def run_test_session_check(self) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        result = await self.task_manager.debug_run_session_check_now()
+        if result:
+            self.set_status("Session check complete: session valid or re-authenticated. See log.", "info")
+        else:
+            self.set_status("Session check: re-authentication required or failed. See log.", "warning")
+        self.refresh_modal_summaries()
+        await self.return_to_dashboard()
+
     async def open_blank_browser_diagnostic(self) -> None:
         self.set_status("Opening blank Chrome diagnostic browser.")
         opened = await self.task_manager.debug_open_blank_browser_diagnostic()
@@ -2019,6 +2005,16 @@ class MarketplaceToolsApp(App[None]):
             self.set_status("Browser cookies cleared from the Steam profile.", "warning")
         else:
             self.set_status("Browser cookie clear failed.", "warning")
+
+    async def dump_test_cookies_keep_steam(self) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        dumped = await self.task_manager.debug_dump_cookies_keep_steam_login()
+        if dumped:
+            self.set_status("Cleared non-Steam cookies; kept Steam login. Run Reauth Check to test.", "warning")
+        else:
+            self.set_status("Cookie dump skipped (Steam Account mode only) or failed; see log.", "warning")
 
     async def start_single_item_test_monitor(self, allow_purchase: bool = False) -> None:
         if not self._debug_action_allowed():
@@ -2263,7 +2259,7 @@ class MarketplaceToolsApp(App[None]):
 
     async def startup_update_check(self) -> None:
         result = await self.task_manager.check_for_update(manual=False)
-        if result and result.update_available:
+        if result is not None:
             self.refresh_settings_summary()
 
     async def clear_browser_cookies_from_settings(self) -> None:
