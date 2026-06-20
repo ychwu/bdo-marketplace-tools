@@ -18,21 +18,25 @@ from bdo_marketplace_tools.market.browser_auth import (
 )
 from bdo_marketplace_tools.market.pricing import apply_price_rules, purchase_record_count, purchase_record_spend
 from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET, check_single_item_stock
+from bdo_marketplace_tools.services.update_checker import RELEASES_URL, check_for_update as run_update_check
 from bdo_marketplace_tools.storage.app_settings import (
     STEAM_BROWSER_MODE,
     account_mode_detail,
     account_mode_label,
     default_app_settings,
     load_account_mode,
+    load_last_seen_update_version,
     load_pa_browser_profile_prepared,
     load_saved_session_last_known_valid,
     load_steam_browser_profile_prepared,
     load_steam_pa_cookie_consent_prepared,
     load_ui_settings,
+    load_update_check_on_startup,
     normalize_account_mode,
     save_account_mode,
     save_buy_mode,
     save_event_log_view,
+    save_last_seen_update_version,
     save_pa_browser_profile_prepared,
     save_polling_settings,
     save_purchase_delay_bounds,
@@ -40,11 +44,13 @@ from bdo_marketplace_tools.storage.app_settings import (
     save_spend_cap,
     save_steam_browser_profile_prepared,
     save_steam_pa_cookie_consent_prepared,
+    save_update_check_on_startup,
 )
 from bdo_marketplace_tools.storage.credentials import CredentialStoreError, load_credentials
 from bdo_marketplace_tools.storage.local_stats import DEFAULT_LOCAL_STATS, load_local_stats, save_local_stats
-from bdo_marketplace_tools.storage.paths import LOCAL_STATS_PATH, PA_MARKET_PROFILE_PATH
+from bdo_marketplace_tools.storage.paths import LOCAL_STATS_PATH, PA_MARKET_PROFILE_PATH, STEAM_MARKET_PROFILE_PATH
 from bdo_marketplace_tools.ui.display import EVENT_LEVEL_COLORS, format_duration
+from bdo_marketplace_tools.version import APP_VERSION
 
 LOCAL_DATA_PATH = LOCAL_STATS_PATH
 DEFAULT_LOCAL_DATA = DEFAULT_LOCAL_STATS
@@ -130,6 +136,15 @@ class BackgroundTasks:
         self.single_item_test_cycle_errors = 0
         self.lifetime_successful_purchases = local_data["successful_purchases"]
         self.lifetime_silver_spent = local_data["silver_spent"]
+        self.update_check_on_startup = (
+            load_update_check_on_startup() if self.persist_ui_settings else True
+        )
+        self.last_seen_update_version = (
+            load_last_seen_update_version() if self.persist_ui_settings else None
+        )
+        self.available_update_version = None
+        self.update_check_completed = False
+        self.update_check_in_progress = False
 
     def reload_lifetime_stats(self):
         local_data = _load_local_data()
@@ -170,6 +185,70 @@ class BackgroundTasks:
         if self.persist_ui_settings:
             self.event_log_view = save_event_log_view(normalized)
         return self.event_log_view
+
+    def set_update_check_on_startup(self, enabled):
+        self.update_check_on_startup = bool(enabled)
+        if self.persist_ui_settings:
+            self.update_check_on_startup = save_update_check_on_startup(self.update_check_on_startup)
+        return self.update_check_on_startup
+
+    async def check_for_update(self, manual=False):
+        """Check GitHub for a newer published version (notify-only).
+
+        Startup checks (``manual=False``) are skipped in test mode and when the user turned
+        off the startup check; a manual check always runs. The check is network-soft: it
+        never raises, and on startup a failure stays silent. Returns the result, or ``None``
+        when the check was skipped.
+        """
+        if not manual and (self.test_mode_enabled or not self.update_check_on_startup):
+            return None
+        if self.update_check_in_progress:
+            return None
+
+        self.update_check_in_progress = True
+        try:
+            result = await asyncio.to_thread(run_update_check)
+        finally:
+            self.update_check_in_progress = False
+
+        if result.status == "update-available":
+            self.update_check_completed = True
+            self.available_update_version = result.latest_version
+            self._announce_available_update(result.latest_version, manual=manual)
+        elif result.status == "up-to-date":
+            self.update_check_completed = True
+            self.available_update_version = None
+            if manual:
+                self.add_event(
+                    f"You are on the latest version ({result.current_version}).",
+                    "info",
+                    channel="ui",
+                )
+        elif manual:  # error, surfaced only for an explicit user-initiated check
+            self.add_event(
+                "Could not check for updates. Check your connection and try again.",
+                "warning",
+                channel="ui",
+            )
+        return result
+
+    def _announce_available_update(self, latest_version, manual=False):
+        message = (
+            f"Update available: version {latest_version} (you have {APP_VERSION}). "
+            f"Download it from {RELEASES_URL}"
+        )
+        if manual:
+            self.add_event(message, "info", channel="ui")
+            return
+        # Startup nudge: announce a given version once so launches are not spammed.
+        if latest_version != self.last_seen_update_version:
+            self.add_event(message, "info")
+            self._remember_seen_update_version(latest_version)
+
+    def _remember_seen_update_version(self, version):
+        self.last_seen_update_version = version
+        if self.persist_ui_settings:
+            self.last_seen_update_version = save_last_seen_update_version(version)
 
     def current_delay_label(self):
         if self.delay == "custom":
@@ -685,14 +764,49 @@ class BackgroundTasks:
         self.add_event("Blank browser diagnostic closed.", "info")
         return True
 
-    def debug_clear_steam_initial_setup_status(self):
-        if not self.test_mode_enabled:
-            return False
+    def reset_steam_initial_setup_status(self):
+        """Mark Steam initial setup incomplete and clear the one-time consent flag.
 
+        Ungated maintenance action used by App Settings; the test-mode debug
+        control delegates here.
+        """
         self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(False)
         self._set_steam_pa_cookie_consent_prepared(False)
         self.steam_auto_reauth_enabled = False
         self.add_event("Initial Steam setup status reset to incomplete.", "warning")
+        return True
+
+    def debug_clear_steam_initial_setup_status(self):
+        if not self.test_mode_enabled:
+            return False
+
+        return self.reset_steam_initial_setup_status()
+
+    async def clear_browser_session_cookies(self):
+        """Clear cookies from the app-owned browser profile for the active login method.
+
+        Ungated maintenance action used by App Settings for recovering a stuck
+        login. Clears the Steam profile in Steam mode (and resets Steam setup
+        state) or the Pearl Abyss profile in PA mode.
+        """
+        steam_mode = self.uses_steam_browser_session()
+        profile_path = STEAM_MARKET_PROFILE_PATH if steam_mode else PA_MARKET_PROFILE_PATH
+        try:
+            cleared_count = await clear_steam_browser_profile_cookies(profile_path=profile_path)
+        except BrowserAuthError as exc:
+            self.add_event(f"Browser cookie clear failed: {exc}", "error")
+            return False
+
+        if steam_mode:
+            self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(False)
+            self._set_steam_pa_cookie_consent_prepared(False)
+            self.steam_auto_reauth_enabled = False
+        else:
+            self._set_pa_browser_profile_prepared(False)
+        self.add_event(
+            f"Browser cookies cleared from the app-owned {self.account_mode_label()} profile ({cleared_count} cookies).",
+            "warning",
+        )
         return True
 
     async def debug_clear_steam_browser_cookies(self):
