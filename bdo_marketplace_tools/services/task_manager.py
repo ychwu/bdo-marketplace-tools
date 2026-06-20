@@ -446,6 +446,7 @@ class BackgroundTasks:
         normalized = normalize_account_mode(mode)
         if normalized != self.account_mode:
             self.steam_auto_reauth_enabled = False
+            self.buy_mode_resume_pending = False
         self.account_mode = save_account_mode(normalized)
         self.api_handler.account_mode = self.account_mode
         return self.account_mode
@@ -464,6 +465,7 @@ class BackgroundTasks:
     async def reset_authentication_context(self, reason):
         await self.stop_login_status_checker()
         self.steam_auto_reauth_enabled = False
+        self.buy_mode_resume_pending = False
         self.set_purchase_submission_enabled(False)
 
         if self.purchase_in_progress:
@@ -490,6 +492,7 @@ class BackgroundTasks:
     def _clear_marketplace_session(self, reason):
         self.pending_auth_reset_reason = None
         self.steam_auto_reauth_enabled = False
+        self.buy_mode_resume_pending = False
         self.set_purchase_submission_enabled(False)
         self.simulated_session_enabled = False
         if hasattr(self.api_handler, "clear_session"):
@@ -1274,12 +1277,12 @@ class BackgroundTasks:
             except BrowserAuthError as exc:
                 self.api_handler.login_status = False
                 self._set_saved_session_last_known_valid(False)
-                # Self-heal: if an auto-login refresh failed while the one-time PA cookie-consent
-                # probe was being skipped (prepared flag set), re-arm it. A "prepared" flag set
-                # without actually dismissing the Cookiebot banner would otherwise let the banner
-                # block the Steam login button on every future refresh.
-                if auto_steam_login and self.steam_pa_cookie_consent_prepared:
-                    self._set_steam_pa_cookie_consent_prepared(False)
+                # Deliberately do NOT touch steam_pa_cookie_consent_prepared here. Cookie consent is
+                # persisted in the browser profile the moment it is accepted, so it is only invalidated
+                # by clearing cookies (the clear_* / reset paths handle that) -- never by a refresh
+                # failure. Re-arming it on auth errors (the user closing the browser, a transient
+                # timeout, etc.) would needlessly re-run the slow first-time cookie path and re-show the
+                # setup notice on the next routine refresh, even though consent was never lost.
                 self.add_event(f"Steam Account refresh failed: {exc}", "error")
                 return False
 

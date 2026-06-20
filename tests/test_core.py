@@ -3263,6 +3263,47 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(manager.saved_session_last_known_valid)
         self.assertFalse(manager.api_handler.login_status)
 
+    async def test_steam_refresh_browser_closed_keeps_consent_prepared(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_browser_profile_prepared = True
+        manager.steam_pa_cookie_consent_prepared = True
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(side_effect=BrowserAuthError("Browser closed before a marketplace session could be captured.")),
+        ):
+            refreshed = await manager.refresh_browser_session(force_refresh=True)
+
+        self.assertFalse(refreshed)
+        # A user-closed browser must NOT re-arm consent handling -- otherwise the next routine refresh
+        # re-runs the slow first-time cookie path and re-shows the setup notice.
+        self.assertTrue(manager.steam_pa_cookie_consent_prepared)
+
+    async def test_steam_refresh_timeout_keeps_consent_prepared(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_browser_profile_prepared = True
+        manager.steam_pa_cookie_consent_prepared = True
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(
+                side_effect=BrowserAuthError(
+                    "Steam Account browser session timed out before Central Market cookies were captured."
+                )
+            ),
+        ):
+            refreshed = await manager.refresh_browser_session(force_refresh=True)
+
+        self.assertFalse(refreshed)
+        # No auth failure -- timeout included -- may reset consent. Cookie consent persists in the
+        # browser profile and is only invalidated by clearing cookies, so the flag stays prepared and
+        # the next refresh stays on the fast, notice-free path.
+        self.assertTrue(manager.steam_pa_cookie_consent_prepared)
+
     async def test_account_mode_change_stops_monitor_and_clears_session(self):
         manager = self.make_task_manager()
         manager.api_handler.login_status = True
@@ -3287,6 +3328,33 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(manager.steam_auto_reauth_enabled)
         self.assertFalse(manager.saved_session_last_known_valid)
         self.assertTrue(any("Marketplace session cleared" in event for event in manager.events))
+
+    async def test_account_mode_change_clears_pending_buy_mode_resume(self):
+        manager = self.make_task_manager()
+        manager.api_handler.login_status = True
+        manager.purchase_submission_enabled = False
+        manager.buy_mode_resume_pending = True
+
+        changed = await manager.change_account_mode(STEAM_BROWSER_MODE)
+
+        self.assertTrue(changed)
+        self.assertFalse(manager.buy_mode_resume_pending)
+        self.assertFalse(manager.resume_buy_mode_after_refresh())
+        self.assertFalse(manager.purchase_submission_enabled)
+
+    async def test_deferred_auth_reset_clears_pending_buy_mode_resume(self):
+        manager = self.make_task_manager()
+        manager.purchase_in_progress = True
+        manager.purchase_submission_enabled = False
+        manager.buy_mode_resume_pending = True
+
+        cleared = await manager.reset_authentication_context("Manual session reset")
+
+        self.assertFalse(cleared)
+        self.assertFalse(manager.buy_mode_resume_pending)
+        self.assertFalse(manager.resume_buy_mode_after_refresh())
+        self.assertFalse(manager.purchase_submission_enabled)
+        self.assertEqual(manager.pending_auth_reset_reason, "Manual session reset")
 
     async def test_account_mode_change_during_purchase_defers_session_clear_until_chain_finishes(self):
         manager = self.make_task_manager()

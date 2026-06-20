@@ -147,26 +147,39 @@ AUTH_CHALLENGE_STATES = {"pa", "steam", "otp"}
 FIRST_TIME_SETUP_NOTICE_SCRIPT = r"""
 (() => {
   const ID = '__bdo_first_time_setup_notice__';
+  const STYLE_ID = '__bdo_first_time_setup_notice_style__';
+  const ensureStyle = () => {
+    if (document.getElementById(STYLE_ID)) return;
+    const st = document.createElement('style');
+    st.id = STYLE_ID;
+    st.textContent = '@keyframes __bdoSetupSpin{to{transform:rotate(360deg)}}';
+    (document.head || document.documentElement).appendChild(st);
+  };
   const show = () => {
     if (!document.body || document.getElementById(ID)) return;
+    ensureStyle();
     const card = document.createElement('div');
     card.id = ID;
     card.setAttribute('style', [
       'position:fixed','top:20px','left:50%','transform:translateX(-50%)',
       'z-index:2147483647','pointer-events:none','box-sizing:border-box',
-      'max-width:560px','width:calc(100% - 32px)','padding:16px 26px',
-      'border-radius:16px','border:1px solid rgba(255,255,255,0.22)',
-      'background:linear-gradient(135deg,#5b6cff 0%,#22d3ee 100%)',
-      'color:#ffffff','text-align:center',
+      'max-width:520px','width:calc(100% - 32px)','padding:14px 24px',
+      'border-radius:14px','border:1px solid #2e2e2e',
+      'background:#141414','color:#cfccc4','text-align:center',
       "font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
-      'box-shadow:0 14px 34px rgba(40,50,120,0.38)',
+      'box-shadow:0 8px 26px rgba(0,0,0,0.45)',
       'opacity:0','transition:opacity .4s ease'
     ].join(';'));
     card.innerHTML =
-      '<div style="font-size:16px;font-weight:700;letter-spacing:.2px;">' +
-        '✨ First-time setup in progress' +
+      '<div style="display:flex;align-items:center;justify-content:center;gap:10px;">' +
+        '<span style="box-sizing:border-box;width:15px;height:15px;border-radius:50%;' +
+          'border:2px solid rgba(255,145,60,0.3);border-top-color:#ff913c;' +
+          'animation:__bdoSetupSpin 0.7s linear infinite;"></span>' +
+        '<span style="font-size:15px;font-weight:600;color:#ff913c;letter-spacing:.2px;">' +
+          'First-time setup in progress' +
+        '</span>' +
       '</div>' +
-      '<div style="font-size:13.5px;font-weight:400;margin-top:5px;opacity:.96;line-height:1.45;">' +
+      '<div style="font-size:13px;font-weight:400;margin-top:6px;opacity:.92;line-height:1.5;">' +
         'This one-time step can take a little longer. Please don’t click anything — ' +
         'it will finish on its own.' +
       '</div>';
