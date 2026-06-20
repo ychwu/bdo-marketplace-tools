@@ -51,8 +51,10 @@ def normalize_account_mode(mode):
 
 
 def default_app_settings():
-    # This is the source-of-truth schema for data/app_settings.json. JSON cannot hold comments,
-    # so each persisted setting is documented here. Values written to disk mirror this shape.
+    # Source-of-truth schema for app_settings.json, stored in the per-user data directory
+    # (see storage/paths.py; %LOCALAPPDATA%\bdo-marketplace-tools\data by default, BDO_DATA_DIR
+    # overrides). JSON cannot hold comments, so each persisted setting is documented here.
+    # Values written to disk mirror this shape.
     return {
         # App/settings metadata (schema version, app version, channel, project). Refreshed on
         # every read/save; not user-editable and not a behavioral setting.
@@ -81,9 +83,9 @@ def default_app_settings():
             "profile_prepared": False,
         },
         "session": {
-            # True only when the saved marketplace cookies (data/session.json) were last confirmed
-            # valid. Startup auto-checks a saved session only when this is True; otherwise it asks
-            # the user to Refresh Session.
+            # True only when the saved marketplace cookies (session.json, in the per-user data
+            # dir) were last confirmed valid. Startup auto-checks a saved session only when this
+            # is True; otherwise it asks the user to Refresh Session.
             "saved_session_last_known_valid": False,
         },
         "ui": {

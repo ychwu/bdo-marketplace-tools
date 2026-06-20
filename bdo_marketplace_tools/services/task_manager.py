@@ -906,6 +906,10 @@ class BackgroundTasks:
                 self.add_event("Re-authentication succeeded. Retrying purchase request.", "success")
                 return True
 
+            # Pause and arm auto-resume (PA path does the same just below): otherwise buy mode stays
+            # on against a dead session and the monitor keeps firing failed buys until the periodic
+            # checker eventually pauses it.
+            self.pause_buy_mode_for_session_refresh("Re-authentication failed.")
             self.add_event("Re-authentication failed. Purchase retry skipped.", "error")
             return False
 
@@ -1133,7 +1137,8 @@ class BackgroundTasks:
             return
 
         if self.uses_steam_browser_session():
-            await self.refresh_browser_session(session_check_error=session_check_error)
+            if not await self.refresh_browser_session(session_check_error=session_check_error):
+                self.pause_buy_mode_for_session_refresh("Steam Account refresh failed.")
             return
 
         if not await self.refresh_pa_browser_session(session_check_error=session_check_error):
@@ -1397,13 +1402,10 @@ class BackgroundTasks:
                     self.add_event("Session expired. Re-authentication successful.", "success")
                     return True
 
-            if self.purchase_submission_enabled:
-                self.set_purchase_submission_enabled(False)
-                self.add_event(
-                    "Session expired. Steam Account refresh required; buy mode paused.",
-                    "warning",
-                )
-            else:
+            # Mirror the PA path below: pause AND arm auto-resume so buy mode comes back on its own
+            # once a later refresh succeeds. set_purchase_submission_enabled(False) alone would leave
+            # buy mode stuck off (it never sets buy_mode_resume_pending), breaking continuity.
+            if not self.pause_buy_mode_for_session_refresh("Session expired. Steam Account refresh required."):
                 self.add_event(
                     "Session expired. Refresh the Steam Account session from Session before buying.",
                     "warning",

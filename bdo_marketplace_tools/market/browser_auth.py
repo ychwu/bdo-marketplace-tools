@@ -81,15 +81,14 @@ STEAM_CONFIRM_LOGIN_SELECTORS = (
 STEAM_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
 STEAM_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
 # A Steam login button click can "succeed" (Playwright sees the element as actionable) without
-# firing the page's js-btnLastLoginCheck handler if that handler has not bound yet -- which is
-# common right after the Cookiebot banner is dismissed and the page re-renders. A working click
-# navigates away, so if we are still on the same page after a grace we treat the click as dead and
-# re-click. The grace escalates per attempt (base, 2x base, ... capped at max): the first retry is
-# quick so a fast rebind is caught without idle waiting, then it backs off so the login button is
-# never hammered, up to a capped number of attempts before asking the user to finish manually.
-STEAM_AUTO_LOGIN_RETRY_BASE_SECONDS = 0.5
-STEAM_AUTO_LOGIN_RETRY_MAX_SECONDS = 1.5
-STEAM_AUTO_LOGIN_MAX_CLICK_ATTEMPTS = 5
+# firing the page's js-btnLastLoginCheck handler if that handler has not bound yet -- common right
+# after the Cookiebot banner is dismissed and the page re-renders. A working click navigates away
+# within this grace (changing the URL, so the key below is never revisited); only if the page has
+# still not advanced after the grace do we treat the click as dead and re-click. The grace is kept
+# longer than a normal click's navigation latency so a slow-but-working click is never re-clicked
+# mid-navigation. Re-click up to a capped number of attempts before asking the user to finish.
+STEAM_AUTO_LOGIN_RETRY_AFTER_SECONDS = 1.5
+STEAM_AUTO_LOGIN_MAX_CLICK_ATTEMPTS = 4
 PA_AUTO_LOGIN_FILL_TIMEOUT_MS = 1000
 PA_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
 PA_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
@@ -141,6 +140,55 @@ AUTH_CHALLENGE_DETECTION_TIMEOUT_MS = 150
 # Only the live auth pages can present a challenge the user must solve; never probe the market page.
 AUTH_CHALLENGE_STATES = {"pa", "steam", "otp"}
 
+# A purely cosmetic notice injected into the visible browser during first-time setup (only while the
+# app is auto-driving the cookie-consent + Steam-login flow, which is the one-time slower path). It
+# reassures the user not to click while the automation works. `pointer-events:none` means it can
+# never intercept a click, and add_init_script re-shows it on every navigation in the flow.
+FIRST_TIME_SETUP_NOTICE_SCRIPT = r"""
+(() => {
+  const ID = '__bdo_first_time_setup_notice__';
+  const show = () => {
+    if (!document.body || document.getElementById(ID)) return;
+    const card = document.createElement('div');
+    card.id = ID;
+    card.setAttribute('style', [
+      'position:fixed','top:20px','left:50%','transform:translateX(-50%)',
+      'z-index:2147483647','pointer-events:none','box-sizing:border-box',
+      'max-width:560px','width:calc(100% - 32px)','padding:16px 26px',
+      'border-radius:16px','border:1px solid rgba(255,255,255,0.22)',
+      'background:linear-gradient(135deg,#5b6cff 0%,#22d3ee 100%)',
+      'color:#ffffff','text-align:center',
+      "font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
+      'box-shadow:0 14px 34px rgba(40,50,120,0.38)',
+      'opacity:0','transition:opacity .4s ease'
+    ].join(';'));
+    card.innerHTML =
+      '<div style="font-size:16px;font-weight:700;letter-spacing:.2px;">' +
+        '✨ First-time setup in progress' +
+      '</div>' +
+      '<div style="font-size:13.5px;font-weight:400;margin-top:5px;opacity:.96;line-height:1.45;">' +
+        'This one-time step can take a little longer. Please don’t click anything — ' +
+        'it will finish on its own.' +
+      '</div>';
+    document.body.appendChild(card);
+    requestAnimationFrame(() => { card.style.opacity = '1'; });
+  };
+  if (document.body) show();
+  else document.addEventListener('DOMContentLoaded', show);
+})();
+"""
+
+
+async def _inject_first_time_setup_notice(context):
+    # Best-effort: never let a cosmetic notice break the auth flow if the runtime lacks the API.
+    add_init_script = getattr(context, "add_init_script", None)
+    if not callable(add_init_script):
+        return
+    try:
+        await add_init_script(FIRST_TIME_SETUP_NOTICE_SCRIPT)
+    except Exception:
+        pass
+
 
 class BrowserAuthError(RuntimeError):
     pass
@@ -191,6 +239,11 @@ async def acquire_market_cookies(
             context = await _launch_persistent_chrome_context(playwright, profile_path)
             try:
                 page = context.pages[0] if context.pages else await context.new_page()
+                if handle_pa_cookie_consent:
+                    # First-time setup (cookie consent still being handled, auto-login driving): show
+                    # a non-blocking notice so the user doesn't fight the automation. Added before
+                    # the first navigation so it appears on every page of the flow.
+                    await _inject_first_time_setup_notice(context)
                 if bootstrap_url:
                     await _bootstrap_browser_profile(page, status_callback, bootstrap_url, account_label)
                 try:
@@ -450,7 +503,6 @@ async def _wait_for_market_cookies(
     # but the app's authenticated calls do not require it.)
     captured_at_callback = []
     callback_done = asyncio.Event()
-
     async def _read_market_cookies_after_callback():
         try:
             cookies = filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
@@ -911,13 +963,12 @@ async def _maybe_run_steam_auto_login_target(
 
     last_click_at = tracking["clicked_at"].get(key)
     if last_click_at is not None:
-        # Already clicked this button on this exact page. Give the click an (escalating) grace to
-        # navigate before deciding it was a dead click; if it never advances, re-click up to the cap.
-        attempts = tracking["click_count"].get(key, 0)
-        retry_delay = min(STEAM_AUTO_LOGIN_RETRY_BASE_SECONDS * attempts, STEAM_AUTO_LOGIN_RETRY_MAX_SECONDS)
-        if now - last_click_at < retry_delay:
+        # Already clicked this button on this exact page. A working click navigates away within this
+        # grace (changing the URL, so this key is never revisited); only if the page has still not
+        # advanced after the grace do we treat it as a dead click and re-click, up to the cap.
+        if now - last_click_at < STEAM_AUTO_LOGIN_RETRY_AFTER_SECONDS:
             return STEAM_AUTO_LOGIN_WAITING
-        if attempts >= STEAM_AUTO_LOGIN_MAX_CLICK_ATTEMPTS:
+        if tracking["click_count"].get(key, 0) >= STEAM_AUTO_LOGIN_MAX_CLICK_ATTEMPTS:
             if key not in tracking["missing_reported"]:
                 tracking["missing_reported"].add(key)
                 await _emit_status(status_callback, missing_message, "warning")

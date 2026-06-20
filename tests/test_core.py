@@ -35,8 +35,7 @@ from bdo_marketplace_tools.market.browser_auth import (
     STEAM_AUTO_LOGIN_DISABLED,
     STEAM_AUTO_LOGIN_MANUAL_NEEDED,
     STEAM_AUTO_LOGIN_MAX_CLICK_ATTEMPTS,
-    STEAM_AUTO_LOGIN_RETRY_BASE_SECONDS,
-    STEAM_AUTO_LOGIN_RETRY_MAX_SECONDS,
+    STEAM_AUTO_LOGIN_RETRY_AFTER_SECONDS,
     STEAM_AUTO_LOGIN_SKIPPED,
     STEAM_AUTO_LOGIN_WAITING,
     PA_AUTO_LOGIN_DISABLED,
@@ -785,6 +784,78 @@ class APIResultTests(unittest.TestCase):
         self.assertTrue(fake_page.closed)
         self.assertTrue(fake_context.closed)
 
+    def _run_acquire_for_notice(self, *, handle_pa_cookie_consent):
+        class FakePlaywrightManager:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class FakePage:
+            def __init__(self):
+                self.closed = False
+
+            async def goto(self, url, wait_until=None, timeout=None):
+                pass
+
+            def is_closed(self):
+                return self.closed
+
+            async def close(self, run_before_unload=None):
+                self.closed = True
+
+        class FakeContext:
+            def __init__(self, page):
+                self.pages = [page]
+                self.closed = False
+                self.init_scripts = []
+
+            async def add_init_script(self, script):
+                self.init_scripts.append(script)
+
+            async def close(self):
+                self.closed = True
+
+        fake_context = FakeContext(FakePage())
+
+        async def wait_for_cookies(*_args, **_kwargs):
+            return [{"name": "TradeAuth_Session", "value": "ok"}]
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "patchright.async_api.async_playwright",
+            return_value=FakePlaywrightManager(),
+        ), patch(
+            "bdo_marketplace_tools.market.browser_auth._launch_persistent_chrome_context",
+            new=AsyncMock(return_value=fake_context),
+        ), patch(
+            "bdo_marketplace_tools.market.browser_auth._wait_for_market_cookies",
+            new=AsyncMock(side_effect=wait_for_cookies),
+        ):
+            asyncio.run(
+                acquire_market_cookies(
+                    profile_path=Path(temp_dir),
+                    auto_steam_login=True,
+                    handle_pa_cookie_consent=handle_pa_cookie_consent,
+                    account_label="Steam Account",
+                )
+            )
+        return fake_context
+
+    def test_first_time_setup_notice_injected_when_handling_cookie_consent(self):
+        fake_context = self._run_acquire_for_notice(handle_pa_cookie_consent=True)
+
+        self.assertEqual(len(fake_context.init_scripts), 1)
+        script = fake_context.init_scripts[0]
+        self.assertIn("First-time setup in progress", script)
+        # Cosmetic only: it must never be able to intercept a click.
+        self.assertIn("pointer-events:none", script)
+
+    def test_first_time_setup_notice_skipped_when_not_handling_cookie_consent(self):
+        fake_context = self._run_acquire_for_notice(handle_pa_cookie_consent=False)
+
+        self.assertEqual(fake_context.init_scripts, [])
+
     def test_browser_context_close_closes_pages_before_context(self):
         async def run_close():
             close_order = []
@@ -1477,7 +1548,7 @@ class APIResultTests(unittest.TestCase):
                     enabled=True,
                     tracking=tracking,
                     status_callback=status_callback,
-                    now=STEAM_AUTO_LOGIN_RETRY_BASE_SECONDS / 2,
+                    now=STEAM_AUTO_LOGIN_RETRY_AFTER_SECONDS / 2,
                 )
             )
             results.append(
@@ -1487,7 +1558,7 @@ class APIResultTests(unittest.TestCase):
                     enabled=True,
                     tracking=tracking,
                     status_callback=status_callback,
-                    now=STEAM_AUTO_LOGIN_RETRY_BASE_SECONDS + 0.1,
+                    now=STEAM_AUTO_LOGIN_RETRY_AFTER_SECONDS + 0.1,
                 )
             )
             return results
@@ -1540,8 +1611,8 @@ class APIResultTests(unittest.TestCase):
                         page, "pa", enabled=True, tracking=tracking, status_callback=status_callback, now=now
                     )
                 )
-                # Advance by the max grace so every call clears the (escalating) retry delay.
-                now += STEAM_AUTO_LOGIN_RETRY_MAX_SECONDS
+                # Advance by the grace so every call clears the retry delay and re-clicks.
+                now += STEAM_AUTO_LOGIN_RETRY_AFTER_SECONDS
             return results
 
         results = asyncio.run(run())
@@ -3874,6 +3945,51 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manager.buy_mode_resume_pending)
         self.assertTrue(any("will resume automatically once the session is refreshed" in event for event in manager.events))
 
+    async def test_expired_steam_session_pauses_and_arms_buy_mode_when_reauth_fails(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_browser_profile_prepared = True
+        manager.purchase_submission_enabled = True
+        manager.refresh_browser_session = AsyncMock(return_value=False)
+
+        recovered = await manager.handle_expired_session()
+
+        self.assertFalse(recovered)
+        manager.refresh_browser_session.assert_awaited_once()
+        # Steam must match PA: paused AND armed so a later refresh auto-resumes buy mode.
+        self.assertFalse(manager.purchase_submission_enabled)
+        self.assertTrue(manager.buy_mode_resume_pending)
+        self.assertTrue(any("will resume automatically once the session is refreshed" in event for event in manager.events))
+
+    async def test_recover_purchase_session_steam_failure_pauses_and_arms_buy_mode(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.purchase_submission_enabled = True
+        manager.refresh_browser_session = AsyncMock(return_value=False)
+
+        recovered = await manager._recover_purchase_session_for_retry()
+
+        self.assertFalse(recovered)
+        manager.refresh_browser_session.assert_awaited_once()
+        self.assertFalse(manager.purchase_submission_enabled)
+        self.assertTrue(manager.buy_mode_resume_pending)
+
+    async def test_login_steam_refresh_failure_pauses_and_arms_buy_mode(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.purchase_submission_enabled = True
+        manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
+        manager.refresh_browser_session = AsyncMock(return_value=False)
+
+        await manager.login()
+
+        manager.refresh_browser_session.assert_awaited_once()
+        self.assertFalse(manager.purchase_submission_enabled)
+        self.assertTrue(manager.buy_mode_resume_pending)
+
     async def test_paused_buy_mode_auto_resumes_after_refresh(self):
         manager = self.make_task_manager()
         manager.purchase_submission_enabled = True
@@ -3925,6 +4041,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.login.assert_not_called()
         manager.refresh_browser_session.assert_not_called()
         self.assertFalse(manager.purchase_submission_enabled)
+        self.assertTrue(manager.buy_mode_resume_pending)
         self.assertTrue(any("Steam Account refresh required" in event for event in manager.events))
 
     async def test_expired_steam_session_auto_reauths_when_initial_setup_is_complete(self):
