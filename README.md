@@ -6,7 +6,7 @@
   <a href="https://www.python.org/downloads/">
     <img alt="Python 3.14+" src="https://img.shields.io/badge/Python-3.14%2B-blue">
   </a>
-  <img alt="Version 1.1.0-beta" src="https://img.shields.io/badge/Version-1.1.0--beta-blueviolet">
+  <img alt="Version 1.2.0-beta" src="https://img.shields.io/badge/Version-1.2.0--beta-blueviolet">
   <img alt="Windows" src="https://img.shields.io/badge/Platform-Windows-0078D6">
   <img alt="MIT License" src="https://img.shields.io/badge/License-MIT-green">
 </p>

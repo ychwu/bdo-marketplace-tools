@@ -6,6 +6,31 @@ All notable released changes for `bdo-marketplace-tools` are documented here.
 
 No released changes yet.
 
+## 1.2.0-beta - 2026-06-20
+
+### Added
+
+- Added notify-only update checks on startup and from App Settings. The app now logs its running version, can compare against `APP_VERSION` on the GitHub `main` branch, shows an update-available indicator when a newer version exists, and lets users disable startup checks while keeping manual checks available.
+- Added verification-challenge detection for visible reCAPTCHA, hCaptcha, and Cloudflare Turnstile widgets during browser re-authentication. The app now pauses automatic clicks or credential submission, keeps the browser open, and logs a clear user action message when a CAPTCHA-style challenge needs manual completion.
+- Added a first-time setup notice inside the login browser while the app is handling slower one-time cookie-consent and Steam-login automation.
+- Added normal-mode App Settings maintenance actions for clearing the current session, clearing browser cookies, and resetting Steam setup, plus visible result feedback.
+- Added test-mode controls for repeated reauth diagnostics: `Clear (Keep Steam)` preserves Steam web-session cookies while clearing marketplace/PA/Cookiebot state, and `Run Session Check` runs one production session-check iteration on demand.
+
+### Changed
+
+- Moved runtime data out of the repo into the per-user data directory (`%LOCALAPPDATA%\bdo-marketplace-tools\data` by default, overrideable with `BDO_DATA_DIR`). On first launch, existing in-repo `data` is copied best-effort to the new location without overwriting existing per-user data.
+- Reworked and decluttered App Settings into focused About, Updates, Account, Configuration, and maintenance areas, with live account/session status and a compact summary of dashboard-controlled settings.
+- Settings schema is now `7` to support the new update-notification preferences.
+- Steam Account reauth now stays on the fast path after first-time setup by treating cookie-consent preparation as browser-cookie state that is cleared only when cookies or setup are reset.
+
+### Fixed
+
+- Fixed auth browser shutdown and cookie capture so fresh marketplace session cookies are captured from the OAuth callback response, stale persistent-profile cookies cannot trigger early success, and still-loading marketplace pages cannot block close.
+- Fixed Steam auto-login reliability by retrying Pearl Abyss Steam and Steam OpenID confirmation clicks when a click does not advance the page, instead of marking a dead click as complete.
+- Fixed Steam buy-mode continuity so periodic expiry handling, inline purchase recovery, and manual refresh failure all pause through the shared session-refresh path and arm auto-resume consistently.
+- Fixed pending buy-mode auto-resume state so explicit auth resets and account-mode changes cannot revive an older app-paused buy mode later.
+- Fixed test-mode forced expiry so it is read by the real session-check path and cleared after recovery, making idle reauth testing match production orchestration more closely.
+
 ## 1.1.0-beta - 2026-06-19
 
 ### Changed
