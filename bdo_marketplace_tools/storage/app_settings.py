@@ -17,6 +17,7 @@ DEFAULT_PURCHASE_DELAY_RANGE = [1.0, 2.5]
 VALID_POLLING_DELAY_KEYS = {"1", "2", "3", "custom"}
 DEFAULT_EVENT_LOG_VIEW = "core"
 VALID_EVENT_LOG_VIEWS = {"core", "ui"}
+DEFAULT_UPDATE_CHECK_ON_STARTUP = True
 
 ACCOUNT_MODE_LABELS = {
     PA_CREDENTIALS_MODE: "Pearl Abyss Account",
@@ -50,8 +51,10 @@ def normalize_account_mode(mode):
 
 
 def default_app_settings():
-    # This is the source-of-truth schema for data/app_settings.json. JSON cannot hold comments,
-    # so each persisted setting is documented here. Values written to disk mirror this shape.
+    # Source-of-truth schema for app_settings.json, stored in the per-user data directory
+    # (see storage/paths.py; %LOCALAPPDATA%\bdo-marketplace-tools\data by default, BDO_DATA_DIR
+    # overrides). JSON cannot hold comments, so each persisted setting is documented here.
+    # Values written to disk mirror this shape.
     return {
         # App/settings metadata (schema version, app version, channel, project). Refreshed on
         # every read/save; not user-editable and not a behavioral setting.
@@ -80,9 +83,9 @@ def default_app_settings():
             "profile_prepared": False,
         },
         "session": {
-            # True only when the saved marketplace cookies (data/session.json) were last confirmed
-            # valid. Startup auto-checks a saved session only when this is True; otherwise it asks
-            # the user to Refresh Session.
+            # True only when the saved marketplace cookies (session.json, in the per-user data
+            # dir) were last confirmed valid. Startup auto-checks a saved session only when this
+            # is True; otherwise it asks the user to Refresh Session.
             "saved_session_last_known_valid": False,
         },
         "ui": {
@@ -106,6 +109,16 @@ def default_app_settings():
             # Which dashboard event-log stream is shown: "core" (monitor/session/API/purchase) or
             # "ui" (interface confirmations).
             "event_log_view": DEFAULT_EVENT_LOG_VIEW,
+        },
+        "updates": {
+            # Most recent version the user has already been notified about, so a newer
+            # release is announced once on startup instead of on every launch. None until
+            # the first notice. The manual "Check for Updates" action ignores this and
+            # always reports the current status.
+            "last_seen_version": None,
+            # Whether to check GitHub for a newer version on startup (soft, non-blocking,
+            # silent on failure, and skipped in test mode). The manual check always works.
+            "check_on_startup": DEFAULT_UPDATE_CHECK_ON_STARTUP,
         },
     }
 
@@ -194,6 +207,7 @@ def _normalize_settings(data):
     ui = data.get("ui") if isinstance(data.get("ui"), dict) else {}
     polling = ui.get("polling") if isinstance(ui.get("polling"), dict) else {}
     buy_delay = ui.get("buy_delay") if isinstance(ui.get("buy_delay"), dict) else {}
+    updates = data.get("updates") if isinstance(data.get("updates"), dict) else {}
 
     raw_mode = account.get("mode", data.get("account_mode", DEFAULT_ACCOUNT_MODE))
     try:
@@ -235,6 +249,17 @@ def _normalize_settings(data):
     settings["ui"]["buy_mode"] = _coerce_bool(ui.get("buy_mode", data.get("purchase_submission_enabled", False)))
     settings["ui"]["event_log_view"] = _normalize_event_log_view(
         ui.get("event_log_view", data.get("event_log_view", DEFAULT_EVENT_LOG_VIEW))
+    )
+
+    last_seen_version = updates.get("last_seen_version", data.get("last_seen_update_version"))
+    settings["updates"]["last_seen_version"] = (
+        str(last_seen_version).strip() if last_seen_version else None
+    )
+    settings["updates"]["check_on_startup"] = _coerce_bool(
+        updates.get(
+            "check_on_startup",
+            data.get("update_check_on_startup", DEFAULT_UPDATE_CHECK_ON_STARTUP),
+        )
     )
     return settings
 
@@ -372,6 +397,30 @@ def save_event_log_view(view):
     ui = load_ui_settings()
     ui["event_log_view"] = _normalize_event_log_view(view)
     return save_ui_settings(ui)["event_log_view"]
+
+
+def load_update_settings():
+    return read_app_settings()["updates"]
+
+
+def load_update_check_on_startup():
+    return read_app_settings()["updates"]["check_on_startup"]
+
+
+def save_update_check_on_startup(enabled):
+    settings = read_app_settings()
+    settings["updates"]["check_on_startup"] = bool(enabled)
+    return save_app_settings(settings)["updates"]["check_on_startup"]
+
+
+def load_last_seen_update_version():
+    return read_app_settings()["updates"]["last_seen_version"]
+
+
+def save_last_seen_update_version(version):
+    settings = read_app_settings()
+    settings["updates"]["last_seen_version"] = str(version).strip() if version else None
+    return save_app_settings(settings)["updates"]["last_seen_version"]
 
 
 def account_mode_label(mode):

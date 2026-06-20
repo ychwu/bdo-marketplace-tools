@@ -16,6 +16,7 @@ from bdo_marketplace_tools.market.api_handler import marketplace_silver_balance
 from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET
 from bdo_marketplace_tools.storage.app_settings import ACCOUNT_MODE_LABELS, PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE
 from bdo_marketplace_tools.storage.credentials import CredentialStoreError, clear_credentials, load_credentials, save_credentials
+from bdo_marketplace_tools.services.update_checker import RELEASES_URL
 from bdo_marketplace_tools.version import SETTINGS_SCHEMA_VERSION
 from bdo_marketplace_tools.ui.display import (
     APP_CHANNEL,
@@ -307,6 +308,40 @@ class MarketplaceToolsApp(App[None]):
         background: transparent;
     }
 
+    .modal-action-destructive {
+        border: round __COLOR_ERROR__;
+        color: __COLOR_ERROR__;
+    }
+
+    .modal-action-destructive:hover {
+        border: round __COLOR_ERROR__;
+        color: #f2c0c0;
+        background: transparent;
+    }
+
+    .settings-section-title {
+        color: __COLOR_BRAND__;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    #settings-maintenance-status {
+        color: __COLOR_TEXT_MUTED__;
+        min-height: 1;
+        margin-top: 1;
+    }
+
+    .settings-config {
+        margin-bottom: 1;
+    }
+
+    #settings-update-status {
+        color: __COLOR_TEXT_MUTED__;
+        min-height: 1;
+        margin-top: 1;
+        margin-bottom: 1;
+    }
+
     .stats-section-title {
         color: __COLOR_BRAND__;
         text-style: bold;
@@ -334,6 +369,15 @@ class MarketplaceToolsApp(App[None]):
     #content {
         height: 1fr;
         overflow-y: auto;
+        scrollbar-size-vertical: 1;
+        scrollbar-size-horizontal: 1;
+        scrollbar-color: #343434;
+        scrollbar-color-hover: #4a4a4a;
+        scrollbar-color-active: #5f5f5f;
+        scrollbar-background: #101010;
+        scrollbar-background-hover: #101010;
+        scrollbar-background-active: #101010;
+        scrollbar-corner-color: #101010;
     }
 
     Input, Select {
@@ -343,7 +387,7 @@ class MarketplaceToolsApp(App[None]):
     Button {
         margin-right: 1;
     }
-    """.replace("__COLOR_BRAND__", COLOR_BRAND).replace("__COLOR_TEXT_MUTED__", COLOR_TEXT_MUTED)
+    """.replace("__COLOR_BRAND__", COLOR_BRAND).replace("__COLOR_TEXT_MUTED__", COLOR_TEXT_MUTED).replace("__COLOR_ERROR__", COLOR_ERROR)
 
     BINDINGS = [
         Binding("escape", "show_dashboard", "Dashboard"),
@@ -402,10 +446,12 @@ class MarketplaceToolsApp(App[None]):
                         yield Button("Toggle Test Session", id="toggle-test-session", compact=True)
                         yield Button("Auto Reauth", id="toggle-auto-reauth", compact=True)
                         yield Button("Expire Session", id="expire-test-session", compact=True)
+                        yield Button("Run Session Check", id="run-session-check", compact=True)
                         yield Button("Reauth Check", id="run-reauth-check", compact=True)
                         yield Button("Blank Browser", id="open-blank-browser", compact=True)
                         yield Button("Reset Steam Setup", id="reset-steam-setup", compact=True)
                         yield Button("Clear Browser Cookies", id="clear-browser-cookies", compact=True)
+                        yield Button("Clear (Keep Steam)", id="dump-cookies-keep-steam", compact=True)
                         yield Button("Start Test Scan", id="start-test-monitor", compact=True)
                         yield Button("Start Test Buy", id="start-test-buy", compact=True)
                         yield Button("Stop Test Scan", id="stop-test-monitor", compact=True)
@@ -431,6 +477,7 @@ class MarketplaceToolsApp(App[None]):
         self.query_one("#nav", ListView).index = 0
         await self.show_view("dashboard")
         self.set_interval(1, self.refresh_live_widgets)
+        self.run_worker(self.startup_update_check(), name="startup-update-check", group="updates")
 
     def on_resize(self, event) -> None:
         self.refresh_layout_density()
@@ -822,6 +869,8 @@ class MarketplaceToolsApp(App[None]):
                 pass
         elif self.current_view == "credentials":
             self.refresh_credentials_summary()
+        elif self.current_view == "settings":
+            self.refresh_settings_summary()
         elif self.current_view == "stats":
             self.refresh_stats()
 
@@ -838,7 +887,7 @@ class MarketplaceToolsApp(App[None]):
 
     def update_chrome_visibility(self) -> None:
         title = self.query_one("#screen-title", Static)
-        title.display = self.current_view not in {"dashboard", "settings"}
+        title.display = self.current_view != "dashboard"
 
     def sync_event_log(self) -> None:
         self.refresh_event_log_filter_controls()
@@ -1059,58 +1108,118 @@ class MarketplaceToolsApp(App[None]):
             pass
 
     async def mount_settings(self, content: Container) -> None:
-        settings_panel = Static(id="settings-summary", classes="settings-panel")
-        settings_panel.border_title = "App Settings"
-        await content.mount(settings_panel)
+        await content.mount(Static("About", classes="settings-section-title"))
+        await content.mount(Static(id="settings-about", classes="settings-note"))
 
-        session_debug = Vertical(id="session-debug-panel", classes="settings-panel")
-        session_debug.border_title = "Session Debug"
-        await content.mount(session_debug)
-        await session_debug.mount(
+        await content.mount(Static("Updates", classes="settings-section-title"))
+        await content.mount(
+            Horizontal(
+                Static(id="settings-update", classes="stats-tile"),
+                ModalAction("Check Now", "settings-check-update"),
+                ModalAction("Startup: On", "settings-toggle-update-startup"),
+                id="settings-update-row",
+                classes="stats-row",
+            )
+        )
+        await content.mount(Static("", id="settings-update-status"))
+
+        await content.mount(Static("Account", classes="settings-section-title"))
+        await content.mount(
+            Horizontal(
+                Static(id="settings-account", classes="stats-tile"),
+                Static(id="settings-session", classes="stats-tile"),
+                classes="stats-row",
+            )
+        )
+
+        await content.mount(Static("Configuration", classes="settings-section-title"))
+        await content.mount(Static(id="settings-config-list", classes="settings-config"))
+
+        await content.mount(Static("Maintenance", classes="settings-section-title"))
+        await content.mount(
             Static(
-                "Clear the saved marketplace session cookies when login state looks stale or corrupted. "
-                "This does not clear saved credentials.",
+                "Reset saved login state when the marketplace session looks stale or stuck. "
+                "These do not delete your saved Pearl Abyss credentials.",
                 classes="settings-note",
             )
         )
-        await session_debug.mount(
+        await content.mount(
             Horizontal(
-                ModalAction("Clear Saved Session", "clear-saved-session"),
+                ModalAction("Clear Session", "clear-saved-session", extra_classes="modal-action-destructive"),
+                ModalAction("Clear Browser Cookies", "settings-clear-cookies", extra_classes="modal-action-destructive"),
+                ModalAction("Reset Steam Setup", "settings-reset-steam", extra_classes="modal-action-destructive"),
                 id="settings-actions",
             )
         )
+        await content.mount(Static("", id="settings-maintenance-status"))
         self.refresh_settings_summary()
 
     def refresh_settings_summary(self) -> None:
         try:
-            summary = self.query_visible_one("#settings-summary", Static)
+            about = self.query_one("#settings-about", Static)
         except Exception:
             return
 
-        app_table = Table.grid(padding=(0, 2))
-        app_table.add_column(style="bold")
-        app_table.add_column()
-        app_table.add_row("App", APP_TITLE)
-        app_table.add_row("Version", APP_VERSION)
-        app_table.add_row("Channel", APP_CHANNEL)
-        app_table.add_row("Settings schema", str(SETTINGS_SCHEMA_VERSION))
-        app_table.add_row("Launch mode", self.launch_mode)
-        app_table.add_row("Theme", self.theme)
+        tm = self.task_manager
+        steam_mode = tm.uses_steam_browser_session()
+        session_label, session_detail, session_level = self.session_status_state()
 
-        settings_table = Table.grid(padding=(0, 2))
-        settings_table.add_column(style="bold")
-        settings_table.add_column()
-        mode = "Buy mode" if self.task_manager.purchase_submission_enabled else "Watch only"
-        settings_table.add_row("Session mode", self.task_manager.account_mode_label())
-        settings_table.add_row("Session refresh", self.task_manager.account_mode_detail())
-        settings_table.add_row("Mode", mode)
-        settings_table.add_row(
-            "Polling interval",
-            f"{self.task_manager.current_delay_label()} ({self.task_manager.current_delay_range()})",
+        about_text = Text()
+        about_text.append("Marketplace Tools", style=COLOR_INFO)
+        about_text.append("   ·   ", style=COLOR_TEXT_MUTED)
+        about_text.append(f"v{APP_VERSION} ({APP_CHANNEL})", style=COLOR_TEXT_MUTED)
+        about_text.append("   ·   ", style=COLOR_TEXT_MUTED)
+        about_text.append(f"schema v{SETTINGS_SCHEMA_VERSION}", style=COLOR_TEXT_MUTED)
+        about_text.append("   ·   ", style=COLOR_TEXT_MUTED)
+        about_text.append(self.launch_mode, style=COLOR_WARNING if self.is_test_mode else COLOR_TEXT_MUTED)
+        about.update(about_text)
+
+        if tm.available_update_version:
+            self.refresh_info_tile(
+                "settings-update",
+                "Update",
+                f"v{tm.available_update_version}",
+                "New version available",
+                "warning",
+                True,
+            )
+        elif tm.update_check_completed:
+            self.refresh_info_tile("settings-update", "Update", "Up to date", f"v{APP_VERSION}", "success", True)
+        else:
+            self.refresh_info_tile("settings-update", "Update", "Unknown", "Not checked yet")
+        try:
+            self.query_one("#settings-toggle-update-startup", ModalAction).update(
+                f"Startup: {'On' if tm.update_check_on_startup else 'Off'}"
+            )
+        except Exception:
+            pass
+
+        self.refresh_info_tile(
+            "settings-account",
+            "Account",
+            "Steam" if steam_mode else "Pearl Abyss",
+            tm.account_mode_detail(),
         )
-        settings_table.add_row("Spend cap", format_compact_silver(self.task_manager.max_spend))
-        settings_table.add_row("Tracked categories", "Outfits: male and female marketplace categories")
-        summary.update(Group(app_table, Text(""), settings_table))
+        self.refresh_info_tile(
+            "settings-session",
+            "Session",
+            session_label,
+            session_detail,
+            session_level,
+            True,
+        )
+
+        config = Table.grid(padding=(0, 2))
+        config.add_column(style=f"bold {COLOR_TEXT_MUTED}", no_wrap=True)
+        config.add_column()
+        config.add_row("Mode", "Buy mode" if tm.purchase_submission_enabled else "Watch only")
+        config.add_row("Polling", f"{tm.current_delay_label()} ({tm.current_delay_range()})")
+        config.add_row("Buy delay", tm.purchase_delay_range())
+        config.add_row("Spend cap", format_compact_silver(tm.max_spend))
+        try:
+            self.query_one("#settings-config-list", Static).update(config)
+        except Exception:
+            pass
 
     def refresh_spend_summary(self) -> None:
         try:
@@ -1279,7 +1388,7 @@ class MarketplaceToolsApp(App[None]):
         )
         self.refresh_stats()
 
-    def refresh_stats_tile(
+    def refresh_info_tile(
         self,
         tile_id: str,
         title: str,
@@ -1298,20 +1407,20 @@ class MarketplaceToolsApp(App[None]):
 
     def refresh_stats(self) -> None:
         self.task_manager.reload_lifetime_stats()
-        self.refresh_stats_tile(
+        self.refresh_info_tile(
             "stats-session-detected",
             "Detected",
             str(self.task_manager.session_detected_outfits),
             "Outfits found",
         )
-        self.refresh_stats_tile(
+        self.refresh_info_tile(
             "stats-session-purchases",
             "Bought",
             str(self.task_manager.session_successful_purchases),
             "This session",
             "success" if self.task_manager.session_successful_purchases else "info",
         )
-        self.refresh_stats_tile(
+        self.refresh_info_tile(
             "stats-session-rate",
             "Success Rate",
             format_percent(
@@ -1321,20 +1430,20 @@ class MarketplaceToolsApp(App[None]):
             f"{self.task_manager.session_successful_purchases}/{self.task_manager.session_detected_outfits} bought",
             self.purchase_rate_level(),
         )
-        self.refresh_stats_tile(
+        self.refresh_info_tile(
             "stats-session-spent",
             "Silver Spent",
             format_compact_silver(self.task_manager.session_silver_spent),
             "This session",
         )
-        self.refresh_stats_tile(
+        self.refresh_info_tile(
             "stats-lifetime-purchases",
             "Bought",
             str(self.task_manager.lifetime_successful_purchases),
             "All time",
             "success" if self.task_manager.lifetime_successful_purchases else "info",
         )
-        self.refresh_stats_tile(
+        self.refresh_info_tile(
             "stats-lifetime-spent",
             "Silver Spent",
             format_compact_silver(self.task_manager.lifetime_silver_spent),
@@ -1342,20 +1451,49 @@ class MarketplaceToolsApp(App[None]):
         )
 
     def on_modal_action_pressed(self, event: ModalAction.Pressed) -> None:
-        if event.action.action_id not in {"refresh-stats", "refresh-wallet", "clear-saved-session", "clear-credentials"}:
+        handled = {
+            "refresh-stats",
+            "refresh-wallet",
+            "clear-saved-session",
+            "clear-credentials",
+            "settings-clear-cookies",
+            "settings-reset-steam",
+            "settings-check-update",
+            "settings-toggle-update-startup",
+        }
+        if event.action.action_id not in handled:
             return
 
         event.stop()
         event.action.blur()
-        if event.action.action_id == "refresh-stats":
+        action_id = event.action.action_id
+        if action_id == "refresh-stats":
             self.refresh_stats()
             self.set_status("Stats refreshed.", "info")
-        elif event.action.action_id == "refresh-wallet":
+        elif action_id == "refresh-wallet":
             self.run_worker(self.refresh_wallet(), name="wallet-refresh", group="actions", exclusive=True)
-        elif event.action.action_id == "clear-saved-session":
+        elif action_id == "clear-saved-session":
             self.run_worker(self.clear_saved_session(), name="clear-saved-session", group="actions", exclusive=True)
-        else:
+        elif action_id == "clear-credentials":
             self.run_worker(self.clear_saved_credentials(), name="clear-credentials", group="actions", exclusive=True)
+        elif action_id == "settings-clear-cookies":
+            self.run_worker(
+                self.clear_browser_cookies_from_settings(),
+                name="settings-clear-cookies",
+                group="actions",
+                exclusive=True,
+            )
+        elif action_id == "settings-reset-steam":
+            self.reset_steam_setup_from_settings()
+        elif action_id == "settings-check-update":
+            self.run_worker(
+                self.check_for_updates_from_settings(),
+                name="check-update",
+                group="actions",
+                exclusive=True,
+            )
+        elif action_id == "settings-toggle-update-startup":
+            self.toggle_update_startup_check()
 
     def on_log_filter_option_pressed(self, event: LogFilterOption.Pressed) -> None:
         event.stop()
@@ -1414,6 +1552,8 @@ class MarketplaceToolsApp(App[None]):
             await self.toggle_test_steam_auto_reauth()
         elif button_id == "expire-test-session":
             await self.expire_test_session()
+        elif button_id == "run-session-check":
+            await self.run_test_session_check()
         elif button_id == "run-reauth-check":
             await self.run_test_reauthentication_check()
         elif button_id == "prepare-steam-profile":
@@ -1438,6 +1578,14 @@ class MarketplaceToolsApp(App[None]):
                 self.run_worker(
                     self.clear_test_browser_cookies(),
                     name="clear-browser-cookies",
+                    group="actions",
+                    exclusive=True,
+                )
+        elif button_id == "dump-cookies-keep-steam":
+            if self._debug_action_allowed():
+                self.run_worker(
+                    self.dump_test_cookies_keep_steam(),
+                    name="dump-cookies-keep-steam",
                     group="actions",
                     exclusive=True,
                 )
@@ -1815,6 +1963,18 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_modal_summaries()
         await self.return_to_dashboard()
 
+    async def run_test_session_check(self) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        result = await self.task_manager.debug_run_session_check_now()
+        if result:
+            self.set_status("Session check complete: session valid or re-authenticated. See log.", "info")
+        else:
+            self.set_status("Session check: re-authentication required or failed. See log.", "warning")
+        self.refresh_modal_summaries()
+        await self.return_to_dashboard()
+
     async def open_blank_browser_diagnostic(self) -> None:
         self.set_status("Opening blank Chrome diagnostic browser.")
         opened = await self.task_manager.debug_open_blank_browser_diagnostic()
@@ -1845,6 +2005,16 @@ class MarketplaceToolsApp(App[None]):
             self.set_status("Browser cookies cleared from the Steam profile.", "warning")
         else:
             self.set_status("Browser cookie clear failed.", "warning")
+
+    async def dump_test_cookies_keep_steam(self) -> None:
+        if not self._debug_action_allowed():
+            return
+
+        dumped = await self.task_manager.debug_dump_cookies_keep_steam_login()
+        if dumped:
+            self.set_status("Cleared non-Steam cookies; kept Steam login. Run Reauth Check to test.", "warning")
+        else:
+            self.set_status("Cookie dump skipped (Steam Account mode only) or failed; see log.", "warning")
 
     async def start_single_item_test_monitor(self, allow_purchase: bool = False) -> None:
         if not self._debug_action_allowed():
@@ -2040,9 +2210,82 @@ class MarketplaceToolsApp(App[None]):
         self.sync_mode_switches(False)
         if cleared_now:
             self.set_status("Saved marketplace session cleared. Refresh Session to log in again.", "warning")
+            self.set_settings_maintenance_status("Saved marketplace session cleared. Refresh Session to log in again.")
         else:
             self.set_status("Session reset queued until the current purchase chain finishes.", "warning")
+            self.set_settings_maintenance_status("Session reset queued until the current purchase chain finishes.")
         self.refresh_settings_summary()
+        self.refresh_live_widgets()
+
+    def set_settings_maintenance_status(self, message: str) -> None:
+        try:
+            self.query_one("#settings-maintenance-status", Static).update(message)
+        except Exception:
+            pass
+
+    def set_settings_update_status(self, message: str) -> None:
+        try:
+            self.query_one("#settings-update-status", Static).update(message)
+        except Exception:
+            pass
+
+    async def check_for_updates_from_settings(self) -> None:
+        self.set_settings_update_status("Checking for updates...")
+        result = await self.task_manager.check_for_update(manual=True)
+        if result is None or result.status == "error":
+            message = "Could not check for updates. Check your connection and try again."
+            self.set_settings_update_status(message)
+            self.set_status("Update check failed.", "warning")
+        elif result.update_available:
+            self.set_settings_update_status(
+                f"Update available: v{result.latest_version} (you have {APP_VERSION}). "
+                f"Download it from {RELEASES_URL}"
+            )
+            self.set_status(f"Update available: v{result.latest_version}.", "warning")
+        else:
+            message = f"You are on the latest version (v{result.current_version})."
+            self.set_settings_update_status(message)
+            self.set_status(message, "info")
+        self.refresh_settings_summary()
+
+    def toggle_update_startup_check(self) -> None:
+        enabled = self.task_manager.set_update_check_on_startup(
+            not self.task_manager.update_check_on_startup
+        )
+        state = "on" if enabled else "off"
+        self.set_settings_update_status(f"Startup update check turned {state}.")
+        self.set_status(f"Startup update check turned {state}.", "info")
+        self.refresh_settings_summary()
+
+    async def startup_update_check(self) -> None:
+        result = await self.task_manager.check_for_update(manual=False)
+        if result is not None:
+            self.refresh_settings_summary()
+
+    async def clear_browser_cookies_from_settings(self) -> None:
+        self.set_settings_maintenance_status("Clearing browser cookies...")
+        cleared = await self.task_manager.clear_browser_session_cookies()
+        if cleared:
+            message = "Browser cookies cleared. Refresh Session to log in again."
+            self.set_status(message, "warning")
+        else:
+            message = "Browser cookie clear failed. See the event log for details."
+            self.set_status("Browser cookie clear failed.", "warning")
+        self.set_settings_maintenance_status(message)
+        self.refresh_settings_summary()
+        self.refresh_credentials_summary()
+        self.refresh_live_widgets()
+
+    def reset_steam_setup_from_settings(self) -> None:
+        if self.task_manager.reset_steam_initial_setup_status():
+            message = "Steam initial setup reset to incomplete. Run setup again from Credentials."
+            self.set_status(message, "warning")
+        else:
+            message = "Steam setup reset failed."
+            self.set_status(message, "warning")
+        self.set_settings_maintenance_status(message)
+        self.refresh_settings_summary()
+        self.refresh_credentials_summary()
         self.refresh_live_widgets()
 
     async def save_settings(self) -> None:

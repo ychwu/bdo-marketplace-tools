@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import requests
 import tempfile
 import unittest
@@ -22,19 +23,18 @@ from bdo_marketplace_tools.market.api_handler import (
 from bdo_marketplace_tools.market.browser_auth import (
     BDO_SITE_BOOTSTRAP_URL,
     BrowserAuthError,
-    COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS,
-    COOKIEBOT_DIALOG_DETECTION_TIMEOUT_MS,
-    COOKIE_CONSENT_MANUAL,
+    AUTH_CHALLENGE_SELECTORS,
     COOKIE_CONSENT_NOT_FOUND,
     COOKIE_CONSENT_SAVED,
     COOKIE_CONSENT_SKIPPED,
-    COOKIE_CONSENT_WAITING,
     STEAM_AUTO_LOGIN_CLICKED,
     STEAM_AUTO_LOGIN_DISABLED,
     STEAM_AUTO_LOGIN_MANUAL_NEEDED,
     STEAM_AUTO_LOGIN_SKIPPED,
+    STEAM_AUTO_LOGIN_WAITING,
     PA_AUTO_LOGIN_DISABLED,
     PA_AUTO_LOGIN_SUBMITTED,
+    PA_CONSENT_BUTTON_READY_TIMEOUT_MS,
     STEAM_BROWSER_CHANNEL,
     STEAM_COMMUNITY_URL,
     STEAM_LOGIN_COOKIE_NAMES,
@@ -43,12 +43,15 @@ from bdo_marketplace_tools.market.browser_auth import (
     STEAM_PROFILE_COOKIE_URLS,
     STEAM_STORE_URL,
     _accept_required_cookie_consent_if_available,
+    _auth_challenge_visible,
     _browser_launch_error_message,
     _classify_url,
     acquire_market_cookies,
+    clear_market_cookies_keep_steam_login,
     clear_steam_browser_profile_cookies,
     _close_browser_context,
     _has_steam_login_cookie,
+    _is_steam_auth_cookie,
     _market_cookie_capture_ready,
     _maybe_run_steam_auto_login,
     _maybe_run_pa_credentials_login,
@@ -74,7 +77,10 @@ from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET, chec
 from bdo_marketplace_tools.storage import app_settings as account_mode_module
 from bdo_marketplace_tools.storage import credentials as credentials_module
 from bdo_marketplace_tools.services import task_manager as task_manager_module
+from bdo_marketplace_tools.services import update_checker as update_checker_module
 from bdo_marketplace_tools.storage.paths import PA_MARKET_PROFILE_PATH
+from bdo_marketplace_tools.storage import paths as paths_module
+from bdo_marketplace_tools.storage import migration as migration_module
 from bdo_marketplace_tools.storage.app_settings import PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE
 from bdo_marketplace_tools.services.task_manager import BackgroundTasks
 from bdo_marketplace_tools.ui.app import BANNER_ART, DEFAULT_THEME, STATUS_STYLES, DashboardTile, MarketplaceToolsApp, ModalAction
@@ -154,7 +160,9 @@ class LaunchModeTests(unittest.IsolatedAsyncioTestCase):
         with patch("main.APIHandler", return_value=fake_api), patch(
             "main.BackgroundTasks",
             return_value=fake_manager,
-        ), patch("main.MarketplaceToolsApp", FakeApp):
+        ), patch("main.MarketplaceToolsApp", FakeApp), patch(
+            "main.migrate_legacy_data_dir", return_value=False
+        ):
             await app_main.run_app(test_mode=True)
 
         fake_manager.initial_login_check.assert_not_called()
@@ -172,11 +180,30 @@ class LaunchModeTests(unittest.IsolatedAsyncioTestCase):
         with patch("main.APIHandler", return_value=fake_api), patch(
             "main.BackgroundTasks",
             return_value=fake_manager,
-        ), patch("main.MarketplaceToolsApp", FakeApp):
+        ), patch("main.MarketplaceToolsApp", FakeApp), patch(
+            "main.migrate_legacy_data_dir", return_value=False
+        ):
             await app_main.run_app(test_mode=False)
 
         fake_manager.initial_login_check.assert_awaited_once()
         self.assertEqual(FakeApp.instances[0].launch_mode, "live")
+
+    async def test_run_app_announces_data_migration(self):
+        fake_api = FakeAPI()
+        with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
+            fake_manager = BackgroundTasks(fake_api, persist_ui_settings=False)
+        fake_manager.initial_login_check = AsyncMock()
+        FakeApp.instances = []
+
+        with patch("main.APIHandler", return_value=fake_api), patch(
+            "main.BackgroundTasks",
+            return_value=fake_manager,
+        ), patch("main.MarketplaceToolsApp", FakeApp), patch(
+            "main.migrate_legacy_data_dir", return_value=True
+        ):
+            await app_main.run_app(test_mode=True)
+
+        self.assertTrue(any("moved to your user data folder" in event for event in fake_manager.events))
 
     def test_env_var_enables_test_mode(self):
         with patch.dict("os.environ", {"BDO_MARKET_TEST_MODE": "true"}):
@@ -236,7 +263,6 @@ class APIResultTests(unittest.TestCase):
     def test_cookiebot_required_consent_click_is_best_effort(self):
         clicked_selectors = []
         statuses = []
-        wait_calls = []
 
         class FakeFirstLocator:
             def __init__(self, selector):
@@ -253,7 +279,7 @@ class APIResultTests(unittest.TestCase):
                 self.selector = selector
 
             async def wait_for(self, state=None, timeout=None):
-                wait_calls.append((self.selector, state, timeout))
+                raise AssertionError("fast consent click should not wait for dialog state")
 
         class FakePage:
             def locator(self, selector):
@@ -268,19 +294,13 @@ class APIResultTests(unittest.TestCase):
         )
         self.assertEqual(
             clicked_selectors,
-            [("#CybotCookiebotDialogBodyButtonDecline", COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS)],
-        )
-        self.assertEqual(
-            wait_calls,
-            [
-                ("#CybotCookiebotDialog", "visible", COOKIEBOT_DIALOG_DETECTION_TIMEOUT_MS),
-                ("#CybotCookiebotDialog", "hidden", 3000),
-            ],
+            [("#CybotCookiebotDialogBodyButtonDecline", PA_CONSENT_BUTTON_READY_TIMEOUT_MS)],
         )
         self.assertEqual(statuses, [("Required cookie consent saved in the Steam browser profile.", "info")])
 
-    def test_cookiebot_required_consent_reports_click_when_dialog_remains(self):
+    def test_cookiebot_required_consent_returns_saved_without_hidden_wait(self):
         statuses = []
+        wait_calls = []
 
         class FakeFirstLocator:
             async def click(self, timeout=None):
@@ -290,8 +310,7 @@ class APIResultTests(unittest.TestCase):
             first = FakeFirstLocator()
 
             async def wait_for(self, state=None, timeout=None):
-                if state == "visible":
-                    return None
+                wait_calls.append((state, timeout))
                 raise RuntimeError("dialog still visible")
 
         class FakePage:
@@ -303,31 +322,33 @@ class APIResultTests(unittest.TestCase):
 
         self.assertEqual(
             asyncio.run(_accept_required_cookie_consent_if_available(FakePage(), status_callback=status_callback)),
-            COOKIE_CONSENT_MANUAL,
+            COOKIE_CONSENT_SAVED,
         )
-        self.assertEqual(
-            statuses,
-            [("Required cookie consent click sent; continue manually if the banner remains.", "info")],
-        )
+        self.assertEqual(wait_calls, [])
+        self.assertEqual(statuses, [("Required cookie consent saved in the Steam browser profile.", "info")])
 
     def test_cookiebot_required_consent_returns_not_found_silently(self):
         clicked_selectors = []
         statuses = []
 
         class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
             async def click(self, timeout=None):
-                clicked_selectors.append(timeout)
+                clicked_selectors.append((self.selector, timeout))
                 raise RuntimeError("not found")
 
         class FakeLocator:
-            first = FakeFirstLocator()
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
 
             async def wait_for(self, state=None, timeout=None):
-                raise RuntimeError("dialog not visible")
+                raise AssertionError("fast consent click should not wait for dialog state")
 
         class FakePage:
             def locator(self, selector):
-                return FakeLocator()
+                return FakeLocator(selector)
 
         async def status_callback(message, level):
             statuses.append((message, level))
@@ -336,7 +357,15 @@ class APIResultTests(unittest.TestCase):
             asyncio.run(_accept_required_cookie_consent_if_available(FakePage(), status_callback=status_callback)),
             COOKIE_CONSENT_NOT_FOUND,
         )
-        self.assertEqual(clicked_selectors, [])
+        self.assertEqual(
+            clicked_selectors,
+            [(selector, PA_CONSENT_BUTTON_READY_TIMEOUT_MS) for selector in (
+                "#CybotCookiebotDialogBodyButtonDecline",
+                "button:has-text('Only Accept Required')",
+                "button:has-text('Accept Necessary')",
+                "button:has-text('Accept Required')",
+            )],
+        )
         self.assertEqual(statuses, [])
 
     def test_pa_cookie_consent_probe_clicks_required_cookie_button_once(self):
@@ -389,12 +418,12 @@ class APIResultTests(unittest.TestCase):
         self.assertEqual(result, COOKIE_CONSENT_SAVED)
         self.assertEqual(
             clicked_selectors,
-            [("#CybotCookiebotDialogBodyButtonDecline", COOKIEBOT_CONSENT_CLICK_TIMEOUT_MS)],
+            [("#CybotCookiebotDialogBodyButtonDecline", PA_CONSENT_BUTTON_READY_TIMEOUT_MS)],
         )
         self.assertEqual(statuses, [("Required cookie consent saved in the Pearl Abyss login page.", "info")])
 
-    def test_pa_cookie_consent_probe_marks_done_when_banner_is_absent(self):
-        checked_selectors = []
+    def test_pa_cookie_consent_probe_does_not_mark_done_when_banner_is_absent(self):
+        clicked_selectors = []
         tracking = _new_pa_cookie_consent_state()
 
         class FakeFirstLocator:
@@ -402,11 +431,11 @@ class APIResultTests(unittest.TestCase):
                 self.selector = selector
 
             async def click(self, timeout=None):
+                clicked_selectors.append((self.selector, timeout))
                 raise RuntimeError("not found")
 
             async def is_visible(self, timeout=None):
-                checked_selectors.append((self.selector, timeout))
-                return self.selector == "#btnSteam"
+                raise AssertionError("fast consent probe should not inspect Steam button visibility")
 
         class FakeLocator:
             def __init__(self, selector):
@@ -427,10 +456,22 @@ class APIResultTests(unittest.TestCase):
         second_result = asyncio.run(_maybe_prepare_pa_cookie_consent(page, "pa", tracking=tracking))
 
         self.assertEqual(result, COOKIE_CONSENT_NOT_FOUND)
-        self.assertEqual(second_result, COOKIE_CONSENT_SKIPPED)
-        self.assertEqual(checked_selectors, [("#btnSteam", 250)])
+        self.assertEqual(second_result, COOKIE_CONSENT_NOT_FOUND)
+        self.assertEqual(
+            clicked_selectors,
+            [
+                ("#CybotCookiebotDialogBodyButtonDecline", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("button:has-text('Only Accept Required')", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("button:has-text('Accept Necessary')", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("button:has-text('Accept Required')", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("#CybotCookiebotDialogBodyButtonDecline", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("button:has-text('Only Accept Required')", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("button:has-text('Accept Necessary')", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("button:has-text('Accept Required')", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+            ],
+        )
 
-    def test_pa_cookie_consent_probe_waits_until_login_page_is_ready(self):
+    def test_pa_cookie_consent_probe_missing_button_returns_not_found_immediately(self):
         tracking = _new_pa_cookie_consent_state()
 
         class FakeFirstLocator:
@@ -438,7 +479,7 @@ class APIResultTests(unittest.TestCase):
                 raise RuntimeError("not found")
 
             async def is_visible(self, timeout=None):
-                return False
+                raise AssertionError("fast consent probe should not inspect Steam button visibility")
 
         class FakeLocator:
             first = FakeFirstLocator()
@@ -454,7 +495,89 @@ class APIResultTests(unittest.TestCase):
 
         result = asyncio.run(_maybe_prepare_pa_cookie_consent(FakePage(), "pa", tracking=tracking))
 
-        self.assertEqual(result, COOKIE_CONSENT_WAITING)
+        self.assertEqual(result, COOKIE_CONSENT_NOT_FOUND)
+
+    def test_market_cookie_wait_clicks_cookiebot_then_steam_in_same_poll(self):
+        fresh = [
+            {
+                "name": "TradeAuth_Session",
+                "value": "fresh-token",
+                "domain": "na-trade.naeu.playblackdesert.com",
+                "path": "/",
+            }
+        ]
+        consent_results = []
+
+        class FakeFirstLocator:
+            def __init__(self, page, selector):
+                self.page = page
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                if self.selector == "#CybotCookiebotDialogBodyButtonDecline":
+                    self.page.clicked.append(("cookie", self.selector, timeout))
+                    return None
+                if self.selector == "#btnSteam":
+                    self.page.clicked.append(("steam", self.selector, timeout))
+                    self.page.steam_clicked = True
+                    return None
+                raise RuntimeError("not found")
+
+            async def is_visible(self, timeout=None):
+                return False
+
+        class FakeLocator:
+            def __init__(self, page, selector):
+                self.first = FakeFirstLocator(page, selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+            frames = []
+
+            def __init__(self):
+                self.clicked = []
+                self.steam_clicked = False
+
+            def is_closed(self):
+                return False
+
+            def locator(self, selector):
+                return FakeLocator(self, selector)
+
+        class FakeContext:
+            def __init__(self):
+                self.page = FakePage()
+                self.pages = [self.page]
+
+            def on(self, event, handler):
+                pass
+
+            async def cookies(self, *_args):
+                return fresh if self.page.steam_clicked else []
+
+        async def run():
+            context = FakeContext()
+            cookies = await _wait_for_market_cookies(
+                context,
+                status_callback=None,
+                timeout_seconds=1,
+                auto_steam_login=True,
+                handle_pa_cookie_consent=True,
+                pa_cookie_consent_callback=consent_results.append,
+            )
+            return context.page.clicked, cookies
+
+        clicked, cookies = asyncio.run(run())
+
+        self.assertEqual(
+            clicked,
+            [
+                ("cookie", "#CybotCookiebotDialogBodyButtonDecline", PA_CONSENT_BUTTON_READY_TIMEOUT_MS),
+                ("steam", "#btnSteam", 1000),
+            ],
+        )
+        self.assertEqual([cookie["name"] for cookie in cookies], ["TradeAuth_Session"])
+        self.assertEqual(consent_results, [True])
 
     def test_steam_profile_login_detection_uses_auth_cookie_names_only(self):
         self.assertEqual(STEAM_LOGIN_COOKIE_NAMES, {"steamLoginSecure"})
@@ -601,6 +724,76 @@ class APIResultTests(unittest.TestCase):
         self.assertTrue(fake_context.cleared)
         self.assertTrue(fake_context.closed)
 
+    def test_is_steam_auth_cookie_matches_steam_domains_only(self):
+        self.assertTrue(_is_steam_auth_cookie({"name": "steamLoginSecure", "domain": "steamcommunity.com"}))
+        self.assertTrue(_is_steam_auth_cookie({"name": "steamLoginSecure", "domain": ".store.steampowered.com"}))
+        self.assertTrue(_is_steam_auth_cookie({"name": "sessionid", "domain": "login.steampowered.com"}))
+        # Marketplace / Pearl Abyss / consent cookies are not Steam auth cookies.
+        self.assertFalse(_is_steam_auth_cookie({"name": "TradeAuth_Session", "domain": "na-trade.naeu.playblackdesert.com"}))
+        self.assertFalse(_is_steam_auth_cookie({"name": "CookieConsent", "domain": ".playblackdesert.com"}))
+        self.assertFalse(_is_steam_auth_cookie({"name": "x", "domain": "account.pearlabyss.com"}))
+        # A look-alike domain must not be matched by the suffix check.
+        self.assertFalse(_is_steam_auth_cookie({"name": "x", "domain": "notsteampowered.com.evil.com"}))
+        self.assertFalse(_is_steam_auth_cookie({"name": "x", "domain": ""}))
+
+    def test_clear_market_cookies_keep_steam_login_keeps_only_steam(self):
+        class FakePlaywrightManager:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        all_cookies = [
+            {"name": "steamLoginSecure", "value": "secret", "domain": "steamcommunity.com", "path": "/"},
+            {"name": "sessionid", "value": "s", "domain": ".store.steampowered.com", "path": "/"},
+            {"name": "TradeAuth_Session", "value": "t", "domain": "na-trade.naeu.playblackdesert.com", "path": "/"},
+            {"name": "CookieConsent", "value": "c", "domain": ".playblackdesert.com", "path": "/"},
+            {"name": "pa", "value": "p", "domain": "account.pearlabyss.com", "path": "/"},
+        ]
+
+        class FakeContext:
+            pages = []
+
+            def __init__(self):
+                self.cleared = False
+                self.closed = False
+                self.added = None
+
+            async def new_page(self):
+                return object()
+
+            async def cookies(self):
+                return list(all_cookies)
+
+            async def clear_cookies(self):
+                self.cleared = True
+
+            async def add_cookies(self, cookies):
+                self.added = list(cookies)
+
+            async def close(self):
+                self.closed = True
+
+        fake_context = FakeContext()
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "patchright.async_api.async_playwright",
+            return_value=FakePlaywrightManager(),
+        ), patch(
+            "bdo_marketplace_tools.market.browser_auth._launch_persistent_chrome_context",
+            new=AsyncMock(return_value=fake_context),
+        ):
+            cleared_count = asyncio.run(clear_market_cookies_keep_steam_login(profile_path=Path(temp_dir)))
+
+        # Three non-Steam cookies cleared; the two Steam cookies re-added so the login survives.
+        self.assertEqual(cleared_count, 3)
+        self.assertTrue(fake_context.cleared)
+        self.assertEqual(
+            [cookie["name"] for cookie in fake_context.added],
+            ["steamLoginSecure", "sessionid"],
+        )
+        self.assertTrue(fake_context.closed)
+
     def test_market_cookie_acquisition_bootstraps_profile_before_auth_start(self):
         class FakePlaywrightManager:
             async def __aenter__(self):
@@ -681,6 +874,78 @@ class APIResultTests(unittest.TestCase):
         wait_for_cookies.assert_awaited_once()
         self.assertTrue(fake_page.closed)
         self.assertTrue(fake_context.closed)
+
+    def _run_acquire_for_notice(self, *, handle_pa_cookie_consent):
+        class FakePlaywrightManager:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class FakePage:
+            def __init__(self):
+                self.closed = False
+
+            async def goto(self, url, wait_until=None, timeout=None):
+                pass
+
+            def is_closed(self):
+                return self.closed
+
+            async def close(self, run_before_unload=None):
+                self.closed = True
+
+        class FakeContext:
+            def __init__(self, page):
+                self.pages = [page]
+                self.closed = False
+                self.init_scripts = []
+
+            async def add_init_script(self, script):
+                self.init_scripts.append(script)
+
+            async def close(self):
+                self.closed = True
+
+        fake_context = FakeContext(FakePage())
+
+        async def wait_for_cookies(*_args, **_kwargs):
+            return [{"name": "TradeAuth_Session", "value": "ok"}]
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "patchright.async_api.async_playwright",
+            return_value=FakePlaywrightManager(),
+        ), patch(
+            "bdo_marketplace_tools.market.browser_auth._launch_persistent_chrome_context",
+            new=AsyncMock(return_value=fake_context),
+        ), patch(
+            "bdo_marketplace_tools.market.browser_auth._wait_for_market_cookies",
+            new=AsyncMock(side_effect=wait_for_cookies),
+        ):
+            asyncio.run(
+                acquire_market_cookies(
+                    profile_path=Path(temp_dir),
+                    auto_steam_login=True,
+                    handle_pa_cookie_consent=handle_pa_cookie_consent,
+                    account_label="Steam Account",
+                )
+            )
+        return fake_context
+
+    def test_first_time_setup_notice_injected_when_handling_cookie_consent(self):
+        fake_context = self._run_acquire_for_notice(handle_pa_cookie_consent=True)
+
+        self.assertEqual(len(fake_context.init_scripts), 1)
+        script = fake_context.init_scripts[0]
+        self.assertIn("First-time setup in progress", script)
+        # Cosmetic only: it must never be able to intercept a click.
+        self.assertIn("pointer-events:none", script)
+
+    def test_first_time_setup_notice_skipped_when_not_handling_cookie_consent(self):
+        fake_context = self._run_acquire_for_notice(handle_pa_cookie_consent=False)
+
+        self.assertEqual(fake_context.init_scripts, [])
 
     def test_browser_context_close_closes_pages_before_context(self):
         async def run_close():
@@ -816,6 +1081,145 @@ class APIResultTests(unittest.TestCase):
 
         result = asyncio.run(run())
         self.assertEqual([cookie["name"] for cookie in result], ["TradeAuth_Session"])
+
+    def test_auth_challenge_detected_on_login_page_when_widget_visible(self):
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def is_visible(self, timeout=None):
+                return self.selector == ".h-captcha"
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-US/Member/Login"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        page = FakePage()
+        self.assertTrue(asyncio.run(_auth_challenge_visible(page, "pa")))
+        # The same widget is on the page, but the market page is never probed for a challenge.
+        self.assertFalse(asyncio.run(_auth_challenge_visible(page, "market")))
+
+    def test_auth_challenge_absent_when_no_widget_visible(self):
+        class FakeFirstLocator:
+            async def is_visible(self, timeout=None):
+                return False
+
+        class FakeLocator:
+            first = FakeFirstLocator()
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-US/Member/Login"
+
+            def locator(self, _selector):
+                return FakeLocator()
+
+        self.assertFalse(asyncio.run(_auth_challenge_visible(FakePage(), "pa")))
+
+    def test_auth_challenge_ignores_passive_recaptcha_badge(self):
+        # The passive reCAPTCHA v3 badge appears on many pages with nothing to solve. It must not
+        # be treated as a challenge, or every login would falsely pause automation.
+        self.assertNotIn(".grecaptcha-badge", AUTH_CHALLENGE_SELECTORS)
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def is_visible(self, timeout=None):
+                return self.selector == ".grecaptcha-badge"
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-US/Member/Login"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        self.assertFalse(asyncio.run(_auth_challenge_visible(FakePage(), "pa")))
+
+    def test_market_cookie_wait_pauses_auto_login_and_warns_on_captcha(self):
+        statuses = []
+        click_attempts = []
+        cookies_calls = {"n": 0}
+        fresh = [
+            {
+                "name": "TradeAuth_Session",
+                "value": "solved-token",
+                "domain": "na-trade.naeu.playblackdesert.com",
+                "path": "/",
+            }
+        ]
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def is_visible(self, timeout=None):
+                return self.selector == ".h-captcha"
+
+            async def click(self, timeout=None):
+                click_attempts.append((self.selector, timeout))
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://steamcommunity.com/openid/login"
+
+            def is_closed(self):
+                return False
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        class FakeContext:
+            def __init__(self):
+                self.pages = [FakePage()]
+
+            def on(self, event, handler):
+                pass
+
+            def remove_listener(self, event, handler):
+                pass
+
+            async def cookies(self, *_args):
+                cookies_calls["n"] += 1
+                # First read is the pre-login baseline; the solved-session cookie only appears once
+                # the user has completed the challenge in the browser.
+                return list(fresh) if cookies_calls["n"] > 1 else []
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        result = asyncio.run(
+            _wait_for_market_cookies(
+                FakeContext(),
+                status_callback=status_callback,
+                timeout_seconds=5,
+                auto_steam_login=True,
+                account_label="Steam Account",
+            )
+        )
+
+        self.assertEqual([cookie["name"] for cookie in result], ["TradeAuth_Session"])
+        # The Steam confirm button is never clicked while the challenge is on screen.
+        self.assertEqual(click_attempts, [])
+        challenge_warnings = [
+            message
+            for (message, level) in statuses
+            if level == "warning" and "Verification challenge (CAPTCHA)" in message
+        ]
+        self.assertEqual(len(challenge_warnings), 1)
+        self.assertIn("Steam Account", challenge_warnings[0])
 
     def test_steam_auto_login_disabled_does_not_click_buttons(self):
         clicked_selectors = []
@@ -1187,6 +1591,106 @@ class APIResultTests(unittest.TestCase):
             statuses,
             [("Automatic Steam re-auth is waiting for manual input on the Pearl Abyss page.", "warning")],
         )
+
+    def test_steam_auto_login_retries_click_every_poll_until_navigation(self):
+        click_times = []
+        statuses = []
+        tracking = _new_steam_auto_login_state()
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                if self.selector != "#btnSteam":
+                    raise RuntimeError("not found")
+                click_times.append(timeout)
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        page = FakePage()
+
+        async def run():
+            results = []
+            for now in (0.0, 0.25, 0.5):
+                results.append(
+                    await _maybe_run_steam_auto_login(
+                        page,
+                        "pa",
+                        enabled=True,
+                        tracking=tracking,
+                        status_callback=status_callback,
+                        now=now,
+                    )
+                )
+            return results
+
+        results = asyncio.run(run())
+
+        self.assertEqual(results, [STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_CLICKED])
+        self.assertEqual(click_times, [1000, 1000, 1000])
+        clicked_messages = [
+            message for (message, _level) in statuses if message == "Automatic Steam re-auth clicked Log in with Steam."
+        ]
+        self.assertEqual(len(clicked_messages), 1)
+
+    def test_steam_auto_login_clickable_button_does_not_exhaust_manual_cap(self):
+        statuses = []
+        tracking = _new_steam_auto_login_state()
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def click(self, timeout=None):
+                if self.selector != "#btnSteam":
+                    raise RuntimeError("not found")
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        page = FakePage()
+
+        async def run():
+            results = []
+            for now in range(12):
+                results.append(
+                    await _maybe_run_steam_auto_login(
+                        page, "pa", enabled=True, tracking=tracking, status_callback=status_callback, now=now
+                    )
+                )
+            return results
+
+        results = asyncio.run(run())
+
+        self.assertEqual(results, [STEAM_AUTO_LOGIN_CLICKED] * 12)
+        manual_messages = [
+            message
+            for (message, level) in statuses
+            if level == "warning" and "waiting for manual input" in message
+        ]
+        self.assertEqual(manual_messages, [])
 
     def test_steam_auto_login_skips_market_page_after_auth_flow_seen(self):
         self.assertTrue(_should_attempt_steam_auto_login("market", False, False))
@@ -2758,13 +3262,14 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(browser_auth.await_args.kwargs["handle_pa_cookie_consent"])
         manager.api_handler.validate_and_save_imported_session.assert_awaited_once()
         self.assertTrue(manager.steam_browser_profile_prepared)
+        self.assertTrue(manager.steam_pa_cookie_consent_prepared)
         self.assertTrue(manager.saved_session_last_known_valid)
         self.assertTrue(manager.steam_auto_reauth_enabled)
         self.assertTrue(any("Initial Steam browser setup is required" in event for event in manager.events))
         self.assertTrue(any("Initial Steam browser setup saved" in event for event in manager.events))
         await manager.stop_login_status_checker()
 
-    async def test_steam_refresh_marks_one_time_pa_cookie_consent_complete(self):
+    async def test_steam_refresh_marks_one_time_pa_cookie_consent_complete_after_success(self):
         manager = self.make_task_manager()
         manager.account_mode = STEAM_BROWSER_MODE
         manager.api_handler.account_mode = STEAM_BROWSER_MODE
@@ -2772,13 +3277,9 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.steam_pa_cookie_consent_prepared = False
         manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
 
-        async def browser_auth_side_effect(*_args, **kwargs):
-            kwargs["pa_cookie_consent_callback"](COOKIE_CONSENT_NOT_FOUND)
-            return [{"name": "TradeAuth_Session", "value": "ok"}]
-
         with patch(
             "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
-            new=AsyncMock(side_effect=browser_auth_side_effect),
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
         ) as browser_auth:
             refreshed = await manager.refresh_browser_session()
 
@@ -2825,6 +3326,64 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(manager.saved_session_last_known_valid)
         self.assertFalse(manager.api_handler.login_status)
 
+    async def test_steam_refresh_browser_closed_keeps_consent_prepared(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_browser_profile_prepared = True
+        manager.steam_pa_cookie_consent_prepared = True
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(side_effect=BrowserAuthError("Browser closed before a marketplace session could be captured.")),
+        ):
+            refreshed = await manager.refresh_browser_session(force_refresh=True)
+
+        self.assertFalse(refreshed)
+        # A user-closed browser must NOT re-arm consent handling -- otherwise the next routine refresh
+        # re-runs the slow first-time cookie path and re-shows the setup notice.
+        self.assertTrue(manager.steam_pa_cookie_consent_prepared)
+
+    async def test_steam_refresh_timeout_keeps_consent_prepared(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_browser_profile_prepared = True
+        manager.steam_pa_cookie_consent_prepared = True
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(
+                side_effect=BrowserAuthError(
+                    "Steam Account browser session timed out before Central Market cookies were captured."
+                )
+            ),
+        ):
+            refreshed = await manager.refresh_browser_session(force_refresh=True)
+
+        self.assertFalse(refreshed)
+        # No auth failure -- timeout included -- may reset consent. Cookie consent persists in the
+        # browser profile and is only invalidated by clearing cookies, so the flag stays prepared and
+        # the next refresh stays on the fast, notice-free path.
+        self.assertTrue(manager.steam_pa_cookie_consent_prepared)
+
+    async def test_steam_refresh_validation_failure_keeps_consent_prepared(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_browser_profile_prepared = True
+        manager.steam_pa_cookie_consent_prepared = True
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(side_effect=MarketplaceAPIError("bad session"))
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ):
+            refreshed = await manager.refresh_browser_session(force_refresh=True)
+
+        self.assertFalse(refreshed)
+        self.assertTrue(manager.steam_pa_cookie_consent_prepared)
+
     async def test_account_mode_change_stops_monitor_and_clears_session(self):
         manager = self.make_task_manager()
         manager.api_handler.login_status = True
@@ -2849,6 +3408,33 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(manager.steam_auto_reauth_enabled)
         self.assertFalse(manager.saved_session_last_known_valid)
         self.assertTrue(any("Marketplace session cleared" in event for event in manager.events))
+
+    async def test_account_mode_change_clears_pending_buy_mode_resume(self):
+        manager = self.make_task_manager()
+        manager.api_handler.login_status = True
+        manager.purchase_submission_enabled = False
+        manager.buy_mode_resume_pending = True
+
+        changed = await manager.change_account_mode(STEAM_BROWSER_MODE)
+
+        self.assertTrue(changed)
+        self.assertFalse(manager.buy_mode_resume_pending)
+        self.assertFalse(manager.resume_buy_mode_after_refresh())
+        self.assertFalse(manager.purchase_submission_enabled)
+
+    async def test_deferred_auth_reset_clears_pending_buy_mode_resume(self):
+        manager = self.make_task_manager()
+        manager.purchase_in_progress = True
+        manager.purchase_submission_enabled = False
+        manager.buy_mode_resume_pending = True
+
+        cleared = await manager.reset_authentication_context("Manual session reset")
+
+        self.assertFalse(cleared)
+        self.assertFalse(manager.buy_mode_resume_pending)
+        self.assertFalse(manager.resume_buy_mode_after_refresh())
+        self.assertFalse(manager.purchase_submission_enabled)
+        self.assertEqual(manager.pending_auth_reset_reason, "Manual session reset")
 
     async def test_account_mode_change_during_purchase_defers_session_clear_until_chain_finishes(self):
         manager = self.make_task_manager()
@@ -3124,6 +3710,172 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result)
         cookie_clear.assert_not_called()
 
+    async def test_debug_dump_cookies_keep_steam_login_rearms_reauth_without_steam_relogin(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_browser_profile_prepared = True
+        manager.steam_pa_cookie_consent_prepared = True
+        manager._set_saved_session_last_known_valid(True)
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.clear_market_cookies_keep_steam_login",
+            new=AsyncMock(return_value=4),
+        ) as cookie_dump:
+            result = await manager.debug_dump_cookies_keep_steam_login()
+
+        self.assertTrue(result)
+        cookie_dump.assert_awaited_once()
+        self.assertTrue(str(cookie_dump.await_args.kwargs["profile_path"]).endswith("steam-market"))
+        # Re-armed for a fresh re-auth run, but the Steam setup/login is intentionally preserved.
+        self.assertFalse(manager.steam_pa_cookie_consent_prepared)
+        self.assertFalse(manager.saved_session_last_known_valid)
+        self.assertTrue(manager.steam_browser_profile_prepared)
+        self.assertTrue(any("kept Steam login" in event for event in manager.events))
+        self.assertTrue(any("4 non-Steam cookies" in event for event in manager.events))
+        self.assertFalse(any("steamLoginSecure" in event for event in manager.events))
+
+    async def test_debug_dump_cookies_keep_steam_login_is_test_mode_only(self):
+        manager = self.make_task_manager(test_mode_enabled=False)
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+
+        with patch("bdo_marketplace_tools.services.task_manager.clear_market_cookies_keep_steam_login") as cookie_dump:
+            result = await manager.debug_dump_cookies_keep_steam_login()
+
+        self.assertFalse(result)
+        cookie_dump.assert_not_called()
+
+    async def test_debug_dump_cookies_keep_steam_login_requires_steam_mode(self):
+        manager = self.make_task_manager(test_mode_enabled=True)  # defaults to Pearl Abyss mode
+
+        with patch("bdo_marketplace_tools.services.task_manager.clear_market_cookies_keep_steam_login") as cookie_dump:
+            result = await manager.debug_dump_cookies_keep_steam_login()
+
+        self.assertFalse(result)
+        cookie_dump.assert_not_called()
+        self.assertTrue(any("only available in Steam Account mode" in event for event in manager.events))
+
+    async def test_check_session_expired_honors_force_flag(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+        manager.api_handler.is_session_expired = AsyncMock(return_value=0)
+
+        manager.debug_force_purchase_session_expired = True
+        self.assertEqual(await manager._check_session_expired(), -1)
+        manager.api_handler.is_session_expired.assert_not_called()
+
+        # Without the override it delegates to the live check.
+        manager.debug_force_purchase_session_expired = False
+        self.assertEqual(await manager._check_session_expired(), 0)
+        manager.api_handler.is_session_expired.assert_awaited_once()
+
+    async def test_forced_expiry_makes_saved_session_invalid_so_browser_opens(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+        manager.debug_force_purchase_session_expired = True
+        manager._api_has_session_cookies = lambda: True
+        # Would report valid if consulted; the override must short-circuit it to invalid.
+        manager.api_handler.is_session_expired = AsyncMock(return_value=0)
+
+        self.assertFalse(await manager._saved_session_is_valid())
+        manager.api_handler.is_session_expired.assert_not_called()
+
+    async def test_debug_run_session_check_now_runs_real_reauth_when_forced_expired(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+        manager.debug_force_purchase_session_expired = True
+        manager.refresh_pa_browser_session = AsyncMock(return_value=True)
+        # The live check must not be consulted while expiry is forced.
+        manager.api_handler.is_session_expired = AsyncMock(side_effect=AssertionError("live check should not run"))
+
+        result = await manager.debug_run_session_check_now()
+
+        self.assertTrue(result)
+        # It went through the production handle_expired_session -> browser refresh path.
+        manager.refresh_pa_browser_session.assert_awaited_once()
+        # Recovered, so the override is dropped and later checks see the real session.
+        self.assertFalse(manager.debug_force_purchase_session_expired)
+        self.assertTrue(any("Re-authentication successful" in event for event in manager.events))
+
+    async def test_debug_run_session_check_now_reports_valid_when_not_forced(self):
+        manager = self.make_task_manager(test_mode_enabled=True)
+        manager.debug_force_purchase_session_expired = False
+        manager.api_handler.is_session_expired = AsyncMock(return_value=0)
+        manager.handle_expired_session = AsyncMock(side_effect=AssertionError("valid session must not re-auth"))
+
+        result = await manager.debug_run_session_check_now()
+
+        self.assertTrue(result)
+        self.assertTrue(manager.api_handler.login_status)
+        manager.api_handler.is_session_expired.assert_awaited_once()
+        self.assertTrue(any("Session still valid" in event for event in manager.events))
+
+    async def test_debug_run_session_check_now_is_test_mode_only(self):
+        manager = self.make_task_manager(test_mode_enabled=False)
+        manager.handle_expired_session = AsyncMock()
+
+        result = await manager.debug_run_session_check_now()
+
+        self.assertIsNone(result)
+        manager.handle_expired_session.assert_not_called()
+
+    async def test_clear_browser_session_cookies_pa_mode_works_without_test_mode(self):
+        manager = self.make_task_manager(test_mode_enabled=False)
+        self.assertTrue(manager.pa_browser_profile_prepared)
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.clear_steam_browser_profile_cookies",
+            new=AsyncMock(return_value=2),
+        ) as cookie_clear:
+            result = await manager.clear_browser_session_cookies()
+
+        self.assertTrue(result)
+        cookie_clear.assert_awaited_once()
+        self.assertTrue(str(cookie_clear.await_args.kwargs["profile_path"]).endswith("pa-market"))
+        self.assertFalse(manager.pa_browser_profile_prepared)
+        self.assertTrue(any("Browser cookies cleared" in event for event in manager.events))
+        self.assertTrue(any("2 cookies" in event for event in manager.events))
+
+    async def test_clear_browser_session_cookies_steam_mode_resets_steam_state(self):
+        manager = self.make_task_manager(test_mode_enabled=False)
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_browser_profile_prepared = True
+        manager.steam_pa_cookie_consent_prepared = True
+        manager.steam_auto_reauth_enabled = True
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.clear_steam_browser_profile_cookies",
+            new=AsyncMock(return_value=5),
+        ) as cookie_clear, patch(
+            "bdo_marketplace_tools.services.task_manager.save_steam_browser_profile_prepared",
+            return_value=False,
+        ):
+            result = await manager.clear_browser_session_cookies()
+
+        self.assertTrue(result)
+        cookie_clear.assert_awaited_once()
+        self.assertTrue(str(cookie_clear.await_args.kwargs["profile_path"]).endswith("steam-market"))
+        self.assertFalse(manager.steam_browser_profile_prepared)
+        self.assertFalse(manager.steam_pa_cookie_consent_prepared)
+        self.assertFalse(manager.steam_auto_reauth_enabled)
+
+    def test_reset_steam_initial_setup_status_works_without_test_mode(self):
+        manager = self.make_task_manager(test_mode_enabled=False)
+        manager.steam_browser_profile_prepared = True
+        manager.steam_pa_cookie_consent_prepared = True
+        manager.steam_auto_reauth_enabled = True
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.save_steam_browser_profile_prepared",
+            return_value=False,
+        ):
+            result = manager.reset_steam_initial_setup_status()
+
+        self.assertTrue(result)
+        self.assertFalse(manager.steam_browser_profile_prepared)
+        self.assertFalse(manager.steam_pa_cookie_consent_prepared)
+        self.assertFalse(manager.steam_auto_reauth_enabled)
+        self.assertTrue(any("Initial Steam setup status reset" in event for event in manager.events))
+
     async def test_steam_buy_expired_response_refreshes_browser_and_retries_once(self):
         manager = self.make_task_manager()
         manager.account_mode = STEAM_BROWSER_MODE
@@ -3341,6 +4093,51 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manager.buy_mode_resume_pending)
         self.assertTrue(any("will resume automatically once the session is refreshed" in event for event in manager.events))
 
+    async def test_expired_steam_session_pauses_and_arms_buy_mode_when_reauth_fails(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_browser_profile_prepared = True
+        manager.purchase_submission_enabled = True
+        manager.refresh_browser_session = AsyncMock(return_value=False)
+
+        recovered = await manager.handle_expired_session()
+
+        self.assertFalse(recovered)
+        manager.refresh_browser_session.assert_awaited_once()
+        # Steam must match PA: paused AND armed so a later refresh auto-resumes buy mode.
+        self.assertFalse(manager.purchase_submission_enabled)
+        self.assertTrue(manager.buy_mode_resume_pending)
+        self.assertTrue(any("will resume automatically once the session is refreshed" in event for event in manager.events))
+
+    async def test_recover_purchase_session_steam_failure_pauses_and_arms_buy_mode(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.purchase_submission_enabled = True
+        manager.refresh_browser_session = AsyncMock(return_value=False)
+
+        recovered = await manager._recover_purchase_session_for_retry()
+
+        self.assertFalse(recovered)
+        manager.refresh_browser_session.assert_awaited_once()
+        self.assertFalse(manager.purchase_submission_enabled)
+        self.assertTrue(manager.buy_mode_resume_pending)
+
+    async def test_login_steam_refresh_failure_pauses_and_arms_buy_mode(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.purchase_submission_enabled = True
+        manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
+        manager.refresh_browser_session = AsyncMock(return_value=False)
+
+        await manager.login()
+
+        manager.refresh_browser_session.assert_awaited_once()
+        self.assertFalse(manager.purchase_submission_enabled)
+        self.assertTrue(manager.buy_mode_resume_pending)
+
     async def test_paused_buy_mode_auto_resumes_after_refresh(self):
         manager = self.make_task_manager()
         manager.purchase_submission_enabled = True
@@ -3392,6 +4189,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.login.assert_not_called()
         manager.refresh_browser_session.assert_not_called()
         self.assertFalse(manager.purchase_submission_enabled)
+        self.assertTrue(manager.buy_mode_resume_pending)
         self.assertTrue(any("Steam Account refresh required" in event for event in manager.events))
 
     async def test_expired_steam_session_auto_reauths_when_initial_setup_is_complete(self):
@@ -3424,7 +4222,11 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
             return_value=PA_CREDENTIALS_MODE,
         ), patch("bdo_marketplace_tools.services.task_manager.load_steam_browser_profile_prepared", return_value=True):
             manager = BackgroundTasks(FakeAPI(), persist_ui_settings=False)
-        return MarketplaceToolsApp(manager, manager.api_handler, launch_mode=launch_mode)
+        app = MarketplaceToolsApp(manager, manager.api_handler, launch_mode=launch_mode)
+        # UI tests must not perform the on-mount network update check; the startup-check
+        # behavior is covered by the focused BackgroundTasks update tests instead.
+        app.startup_update_check = AsyncMock()
+        return app
 
     async def test_app_launches_and_navigates_sidebar(self):
         app = self.make_app()
@@ -3452,8 +4254,10 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("1")
                 self.assertEqual(app.current_view, "settings")
                 self.assertFalse(app.query_one("#banner").display)
-                self.assertFalse(app.query_one("#screen-title").display)
-                self.assertEqual(app.query_one("#settings-summary", Static).border_title, "App Settings")
+                self.assertTrue(app.query_one("#screen-title").display)
+                self.assertEqual(app.query_one("#screen-title", Static).content, "App Settings")
+                self.assertEqual(app.query_one("#settings-update", Static).border_title, "Update")
+                self.assertEqual(len(list(app.query(".stats-tile"))), 3)
                 await pilot.press("2")
                 self.assertEqual(app.current_view, "wallet")
                 self.assertIn(("wallet", "Inventory"), app.NAV_ITEMS)
@@ -3479,6 +4283,8 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(100, 36)):
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertEqual(app.query_one("#content").styles.overflow_y, "auto")
+                self.assertEqual(app.query_one("#content").styles.scrollbar_size_vertical, 1)
+                self.assertEqual(app.query_one("#content").styles.scrollbar_color, Color(52, 52, 52))
                 self.assertGreaterEqual(app.query_one("#event-log").size.height, 6)
                 self.assertLessEqual(app.query_one("#sidebar").region.width, 23)
                 self.assertEqual(app.query_one("#event-log").styles.border_title_color, Color(216, 211, 200))
@@ -3653,11 +4459,17 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.current_view, "settings")
                 self.assertEqual(len(list(app.query("#clear-saved-session"))), 1)
                 self.assertIsInstance(app.query_one("#clear-saved-session"), ModalAction)
+                self.assertIn("Clear Session", str(app.query_one("#clear-saved-session").render()))
                 self.assertEqual(str(app.query_one("#clear-saved-session").styles.background), "Color(0, 0, 0, a=0)")
-                self.assertEqual(app.query_one("#session-debug-panel").border_title, "Session Debug")
-                self.assertEqual(len(list(app.query("#session-debug-panel Button"))), 0)
-                self.assertEqual(len(list(app.query("#settings-summary Button"))), 0)
+                self.assertTrue(app.query_one("#clear-saved-session").has_class("modal-action-destructive"))
+                self.assertTrue(app.query_one("#settings-clear-cookies").has_class("modal-action-destructive"))
+                self.assertTrue(app.query_one("#settings-reset-steam").has_class("modal-action-destructive"))
+                self.assertEqual(len(list(app.query("#settings-actions Button"))), 0)
 
+                # Updates section pushes the maintenance row past this terminal's height; scroll
+                # it into the scrollable content view before clicking.
+                app.query_one("#clear-saved-session").scroll_visible(animate=False)
+                await pilot.pause()
                 await pilot.click("#clear-saved-session")
                 await pilot.pause(0.1)
 
@@ -4254,6 +5066,37 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 app.task_manager.debug_clear_steam_browser_cookies.assert_awaited_once()
                 self.assertIn("Browser cookies cleared", app.status_message)
 
+    async def test_app_settings_maintenance_actions_run_in_live_mode(self):
+        app = self.make_app()
+        app.task_manager.clear_browser_session_cookies = AsyncMock(return_value=True)
+        app.task_manager.reset_steam_initial_setup_status = Mock(return_value=True)
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.press("1")
+                self.assertEqual(app.current_view, "settings")
+                self.assertFalse(app.is_test_mode)
+
+                # The Updates section makes the settings page taller than this terminal, so the
+                # scrollable maintenance actions must be brought into view before clicking.
+                app.query_one("#settings-reset-steam").scroll_visible(animate=False)
+                await pilot.pause()
+                await pilot.click("#settings-reset-steam")
+                await pilot.pause(0.1)
+                app.task_manager.reset_steam_initial_setup_status.assert_called_once()
+                self.assertIn(
+                    "Steam initial setup reset",
+                    str(app.query_one("#settings-maintenance-status", Static).render()),
+                )
+
+                await pilot.click("#settings-clear-cookies")
+                await pilot.pause(0.2)
+                app.task_manager.clear_browser_session_cookies.assert_awaited_once()
+                self.assertIn(
+                    "Browser cookies cleared",
+                    str(app.query_one("#settings-maintenance-status", Static).render()),
+                )
+
     async def test_single_item_test_monitor_sidebar_controls_use_separate_task(self):
         app = self.make_app(launch_mode="test")
         app.api_handler.login_status = True
@@ -4605,6 +5448,228 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.click("#confirm-start")
                 await pilot.pause(0.1)
                 self.assertTrue(app.task_manager.checker_enabled)
+
+
+class UpdateCheckerTests(unittest.TestCase):
+    def test_parse_version_handles_core_and_prerelease(self):
+        self.assertEqual(update_checker_module.parse_version("1.2.3"), ((1, 2, 3), 1, ""))
+        self.assertEqual(update_checker_module.parse_version("v1.2"), ((1, 2, 0), 1, ""))
+        self.assertEqual(update_checker_module.parse_version("1.1.0-beta"), ((1, 1, 0), 0, "beta"))
+        self.assertIsNone(update_checker_module.parse_version("not-a-version"))
+        self.assertIsNone(update_checker_module.parse_version(None))
+
+    def test_is_newer_version_compares_core_then_prerelease(self):
+        self.assertTrue(update_checker_module.is_newer_version("1.2.0", "1.1.0"))
+        self.assertTrue(update_checker_module.is_newer_version("1.1.0", "1.1.0-beta"))
+        self.assertFalse(update_checker_module.is_newer_version("1.1.0-beta", "1.1.0"))
+        self.assertFalse(update_checker_module.is_newer_version("1.1.0", "1.1.0"))
+        self.assertFalse(update_checker_module.is_newer_version("1.0.0", "1.1.0"))
+        # An unparseable remote string must never look newer.
+        self.assertFalse(update_checker_module.is_newer_version("garbage", "1.1.0"))
+
+    def test_extract_remote_version_reads_app_version_assignment(self):
+        text = 'PROJECT_NAME = "x"\nAPP_VERSION = "1.4.0-beta"\nAPP_CHANNEL = "BETA"\n'
+        self.assertEqual(update_checker_module.extract_remote_version(text), "1.4.0-beta")
+        self.assertIsNone(update_checker_module.extract_remote_version("nothing here"))
+
+    def test_check_for_update_reports_each_outcome(self):
+        newer = update_checker_module.check_for_update(
+            current_version="1.1.0-beta",
+            fetcher=lambda: 'APP_VERSION = "1.2.0"\n',
+        )
+        self.assertEqual(newer.status, "update-available")
+        self.assertTrue(newer.update_available)
+        self.assertEqual(newer.latest_version, "1.2.0")
+
+        same = update_checker_module.check_for_update(
+            current_version="1.2.0",
+            fetcher=lambda: 'APP_VERSION = "1.2.0"\n',
+        )
+        self.assertEqual(same.status, "up-to-date")
+        self.assertFalse(same.update_available)
+
+    def test_check_for_update_treats_failures_as_soft_errors(self):
+        def boom():
+            raise RuntimeError("network down")
+
+        errored = update_checker_module.check_for_update(current_version="1.1.0", fetcher=boom)
+        self.assertEqual(errored.status, "error")
+        self.assertFalse(errored.update_available)
+
+        missing = update_checker_module.check_for_update(
+            current_version="1.1.0",
+            fetcher=lambda: "no version assignment here",
+        )
+        self.assertEqual(missing.status, "error")
+
+
+class AppSettingsUpdatePreferenceTests(unittest.TestCase):
+    def test_update_settings_default_and_persist(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "data" / "app_settings.json"
+            with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
+                self.assertTrue(account_mode_module.load_update_check_on_startup())
+                self.assertIsNone(account_mode_module.load_last_seen_update_version())
+                self.assertFalse(account_mode_module.save_update_check_on_startup(False))
+                self.assertEqual(account_mode_module.save_last_seen_update_version("1.5.0"), "1.5.0")
+                self.assertFalse(account_mode_module.load_update_check_on_startup())
+                self.assertEqual(account_mode_module.load_last_seen_update_version(), "1.5.0")
+
+            saved = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertFalse(saved["updates"]["check_on_startup"])
+            self.assertEqual(saved["updates"]["last_seen_version"], "1.5.0")
+
+
+class BackgroundTasksUpdateTests(unittest.IsolatedAsyncioTestCase):
+    def _make_manager(self, *, test_mode_enabled=False):
+        with patch(
+            "bdo_marketplace_tools.services.task_manager._load_local_data",
+            return_value=LOCAL_DATA.copy(),
+        ):
+            return BackgroundTasks(
+                FakeAPI(),
+                test_mode_enabled=test_mode_enabled,
+                persist_ui_settings=False,
+            )
+
+    async def test_startup_check_announces_new_version_once(self):
+        manager = self._make_manager()
+        result = update_checker_module.UpdateCheckResult("update-available", APP_VERSION, latest_version="9.9.9")
+        with patch("bdo_marketplace_tools.services.task_manager.run_update_check", return_value=result):
+            first = await manager.check_for_update(manual=False)
+            second = await manager.check_for_update(manual=False)
+
+        self.assertTrue(first.update_available)
+        self.assertEqual(manager.available_update_version, "9.9.9")
+        self.assertEqual(manager.last_seen_update_version, "9.9.9")
+        # Announced on the core stream exactly once across two startup checks.
+        core_notices = [event for event in manager.core_events if "9.9.9" in event]
+        self.assertEqual(len(core_notices), 1)
+        # The available-update notice is yellow (warning level), not plain info.
+        from bdo_marketplace_tools.ui.display import EVENT_LEVEL_COLORS
+
+        self.assertIn(EVENT_LEVEL_COLORS["warning"], core_notices[0])
+        self.assertNotIn(EVENT_LEVEL_COLORS["info"], core_notices[0])
+        # Every startup also prints the running version to the log.
+        self.assertTrue(any("Marketplace Tools v" in event for event in manager.core_events))
+        self.assertTrue(second.update_available)
+
+    async def test_startup_check_skipped_in_test_mode(self):
+        manager = self._make_manager(test_mode_enabled=True)
+        with patch("bdo_marketplace_tools.services.task_manager.run_update_check") as fetch:
+            result = await manager.check_for_update(manual=False)
+        self.assertIsNone(result)
+        fetch.assert_not_called()
+        # The running version is still printed even though the remote lookup is skipped.
+        self.assertTrue(any("Marketplace Tools v" in event for event in manager.core_events))
+
+    async def test_startup_check_skipped_when_disabled(self):
+        manager = self._make_manager()
+        manager.update_check_on_startup = False
+        with patch("bdo_marketplace_tools.services.task_manager.run_update_check") as fetch:
+            result = await manager.check_for_update(manual=False)
+        self.assertIsNone(result)
+        fetch.assert_not_called()
+        # The running version is still printed even though the remote lookup is skipped.
+        self.assertTrue(any("Marketplace Tools v" in event for event in manager.core_events))
+
+    async def test_manual_check_runs_even_in_test_mode(self):
+        manager = self._make_manager(test_mode_enabled=True)
+        result = update_checker_module.UpdateCheckResult("up-to-date", APP_VERSION, latest_version=APP_VERSION)
+        with patch("bdo_marketplace_tools.services.task_manager.run_update_check", return_value=result):
+            outcome = await manager.check_for_update(manual=True)
+        self.assertEqual(outcome.status, "up-to-date")
+        self.assertIsNone(manager.available_update_version)
+        self.assertTrue(manager.update_check_completed)
+        self.assertTrue(any("latest version" in event for event in manager.ui_events))
+
+    async def test_manual_check_error_warns_only_on_manual(self):
+        manager = self._make_manager()
+        result = update_checker_module.UpdateCheckResult("error", APP_VERSION, error="boom")
+        with patch("bdo_marketplace_tools.services.task_manager.run_update_check", return_value=result):
+            await manager.check_for_update(manual=True)
+        self.assertTrue(any("Could not check for updates" in event for event in manager.ui_events))
+        self.assertFalse(manager.update_check_completed)
+
+
+class DataDirResolutionTests(unittest.TestCase):
+    def test_env_override_wins(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(os.environ, {paths_module.DATA_DIR_ENV_VAR: temp_dir}):
+                self.assertEqual(paths_module.default_data_dir(), Path(temp_dir))
+
+    def test_local_app_data_used_when_no_override(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(
+                os.environ,
+                {paths_module.DATA_DIR_ENV_VAR: "", "LOCALAPPDATA": temp_dir},
+            ):
+                self.assertEqual(
+                    paths_module.default_data_dir(),
+                    Path(temp_dir) / paths_module.APP_DIR_NAME / "data",
+                )
+
+    def test_falls_back_to_xdg_when_no_windows_app_data(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(
+                os.environ,
+                {
+                    paths_module.DATA_DIR_ENV_VAR: "",
+                    "LOCALAPPDATA": "",
+                    "XDG_DATA_HOME": temp_dir,
+                },
+            ):
+                self.assertEqual(
+                    paths_module.default_data_dir(),
+                    Path(temp_dir) / paths_module.APP_DIR_NAME / "data",
+                )
+
+
+class LegacyDataMigrationTests(unittest.TestCase):
+    def _seed_legacy(self, legacy_dir):
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        (legacy_dir / "app_settings.json").write_text('{"legacy": true}', encoding="utf-8")
+        (legacy_dir / "local_stats.json").write_text('{"silver_spent": 5}', encoding="utf-8")
+        profile = legacy_dir / "browser_profiles" / "steam-market"
+        profile.mkdir(parents=True, exist_ok=True)
+        (profile / "marker.txt").write_text("profile", encoding="utf-8")
+
+    def test_migrates_legacy_data_and_keeps_backup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            legacy = Path(temp_dir) / "repo" / "data"
+            target = Path(temp_dir) / "appdata" / "data"
+            self._seed_legacy(legacy)
+
+            self.assertTrue(migration_module.migrate_legacy_data_dir(legacy, target))
+            self.assertEqual((target / "app_settings.json").read_text(encoding="utf-8"), '{"legacy": true}')
+            self.assertTrue((target / "local_stats.json").exists())
+            self.assertTrue((target / "browser_profiles" / "steam-market" / "marker.txt").exists())
+            # Original folder is left in place as a backup.
+            self.assertTrue((legacy / "app_settings.json").exists())
+
+    def test_does_not_overwrite_existing_target_data(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            legacy = Path(temp_dir) / "repo" / "data"
+            target = Path(temp_dir) / "appdata" / "data"
+            self._seed_legacy(legacy)
+            target.mkdir(parents=True)
+            (target / "app_settings.json").write_text('{"existing": true}', encoding="utf-8")
+
+            self.assertFalse(migration_module.migrate_legacy_data_dir(legacy, target))
+            self.assertEqual((target / "app_settings.json").read_text(encoding="utf-8"), '{"existing": true}')
+
+    def test_no_op_when_legacy_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            legacy = Path(temp_dir) / "repo" / "data"
+            target = Path(temp_dir) / "appdata" / "data"
+            self.assertFalse(migration_module.migrate_legacy_data_dir(legacy, target))
+            self.assertFalse(target.exists())
+
+    def test_no_op_when_legacy_and_target_are_same_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            same = Path(temp_dir) / "data"
+            self._seed_legacy(same)
+            self.assertFalse(migration_module.migrate_legacy_data_dir(same, same))
 
 
 if __name__ == "__main__":

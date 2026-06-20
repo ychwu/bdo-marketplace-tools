@@ -12,27 +12,32 @@ from bdo_marketplace_tools.market.browser_auth import (
     BDO_SITE_BOOTSTRAP_URL,
     BrowserAuthError,
     acquire_market_cookies,
+    clear_market_cookies_keep_steam_login,
     clear_steam_browser_profile_cookies,
     open_blank_steam_browser_diagnostic,
     prepare_steam_browser_profile,
 )
 from bdo_marketplace_tools.market.pricing import apply_price_rules, purchase_record_count, purchase_record_spend
 from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET, check_single_item_stock
+from bdo_marketplace_tools.services.update_checker import RELEASES_URL, check_for_update as run_update_check
 from bdo_marketplace_tools.storage.app_settings import (
     STEAM_BROWSER_MODE,
     account_mode_detail,
     account_mode_label,
     default_app_settings,
     load_account_mode,
+    load_last_seen_update_version,
     load_pa_browser_profile_prepared,
     load_saved_session_last_known_valid,
     load_steam_browser_profile_prepared,
     load_steam_pa_cookie_consent_prepared,
     load_ui_settings,
+    load_update_check_on_startup,
     normalize_account_mode,
     save_account_mode,
     save_buy_mode,
     save_event_log_view,
+    save_last_seen_update_version,
     save_pa_browser_profile_prepared,
     save_polling_settings,
     save_purchase_delay_bounds,
@@ -40,11 +45,13 @@ from bdo_marketplace_tools.storage.app_settings import (
     save_spend_cap,
     save_steam_browser_profile_prepared,
     save_steam_pa_cookie_consent_prepared,
+    save_update_check_on_startup,
 )
 from bdo_marketplace_tools.storage.credentials import CredentialStoreError, load_credentials
 from bdo_marketplace_tools.storage.local_stats import DEFAULT_LOCAL_STATS, load_local_stats, save_local_stats
-from bdo_marketplace_tools.storage.paths import LOCAL_STATS_PATH, PA_MARKET_PROFILE_PATH
-from bdo_marketplace_tools.ui.display import EVENT_LEVEL_COLORS, format_duration
+from bdo_marketplace_tools.storage.paths import LOCAL_STATS_PATH, PA_MARKET_PROFILE_PATH, STEAM_MARKET_PROFILE_PATH
+from bdo_marketplace_tools.ui.display import APP_TITLE, EVENT_LEVEL_COLORS, format_duration
+from bdo_marketplace_tools.version import APP_VERSION
 
 LOCAL_DATA_PATH = LOCAL_STATS_PATH
 DEFAULT_LOCAL_DATA = DEFAULT_LOCAL_STATS
@@ -130,6 +137,15 @@ class BackgroundTasks:
         self.single_item_test_cycle_errors = 0
         self.lifetime_successful_purchases = local_data["successful_purchases"]
         self.lifetime_silver_spent = local_data["silver_spent"]
+        self.update_check_on_startup = (
+            load_update_check_on_startup() if self.persist_ui_settings else True
+        )
+        self.last_seen_update_version = (
+            load_last_seen_update_version() if self.persist_ui_settings else None
+        )
+        self.available_update_version = None
+        self.update_check_completed = False
+        self.update_check_in_progress = False
 
     def reload_lifetime_stats(self):
         local_data = _load_local_data()
@@ -170,6 +186,75 @@ class BackgroundTasks:
         if self.persist_ui_settings:
             self.event_log_view = save_event_log_view(normalized)
         return self.event_log_view
+
+    def set_update_check_on_startup(self, enabled):
+        self.update_check_on_startup = bool(enabled)
+        if self.persist_ui_settings:
+            self.update_check_on_startup = save_update_check_on_startup(self.update_check_on_startup)
+        return self.update_check_on_startup
+
+    async def check_for_update(self, manual=False):
+        """Check GitHub for a newer published version (notify-only).
+
+        Startup checks (``manual=False``) skip the remote lookup in test mode and when the
+        user turned off the startup check, but still record the running version. A manual
+        check always runs. The check is network-soft: it never raises, and on startup a
+        failure stays silent. Returns the result, or ``None`` when the remote lookup was
+        skipped.
+        """
+        if not manual:
+            # Always record the running version at startup so the log shows the check ran,
+            # even when the remote lookup is skipped (test mode or disabled).
+            self.add_event(f"{APP_TITLE} v{APP_VERSION}.", "info")
+        if not manual and (self.test_mode_enabled or not self.update_check_on_startup):
+            return None
+        if self.update_check_in_progress:
+            return None
+
+        self.update_check_in_progress = True
+        try:
+            result = await asyncio.to_thread(run_update_check)
+        finally:
+            self.update_check_in_progress = False
+
+        if result.status == "update-available":
+            self.update_check_completed = True
+            self.available_update_version = result.latest_version
+            self._announce_available_update(result.latest_version, manual=manual)
+        elif result.status == "up-to-date":
+            self.update_check_completed = True
+            self.available_update_version = None
+            if manual:
+                self.add_event(
+                    f"You are on the latest version ({result.current_version}).",
+                    "info",
+                    channel="ui",
+                )
+        elif manual:  # error, surfaced only for an explicit user-initiated check
+            self.add_event(
+                "Could not check for updates. Check your connection and try again.",
+                "warning",
+                channel="ui",
+            )
+        return result
+
+    def _announce_available_update(self, latest_version, manual=False):
+        message = (
+            f"Update available: version {latest_version} (you have {APP_VERSION}). "
+            f"Download it from {RELEASES_URL}"
+        )
+        if manual:
+            self.add_event(message, "warning", channel="ui")
+            return
+        # Startup nudge: announce a given version once so launches are not spammed.
+        if latest_version != self.last_seen_update_version:
+            self.add_event(message, "warning")
+            self._remember_seen_update_version(latest_version)
+
+    def _remember_seen_update_version(self, version):
+        self.last_seen_update_version = version
+        if self.persist_ui_settings:
+            self.last_seen_update_version = save_last_seen_update_version(version)
 
     def current_delay_label(self):
         if self.delay == "custom":
@@ -292,7 +377,7 @@ class BackgroundTasks:
         if not self._api_has_session_cookies():
             return False
         try:
-            status = await self.api_handler.is_session_expired()
+            status = await self._check_session_expired()
         except MarketplaceAPIError:
             return False
 
@@ -361,6 +446,7 @@ class BackgroundTasks:
         normalized = normalize_account_mode(mode)
         if normalized != self.account_mode:
             self.steam_auto_reauth_enabled = False
+            self.buy_mode_resume_pending = False
         self.account_mode = save_account_mode(normalized)
         self.api_handler.account_mode = self.account_mode
         return self.account_mode
@@ -379,6 +465,7 @@ class BackgroundTasks:
     async def reset_authentication_context(self, reason):
         await self.stop_login_status_checker()
         self.steam_auto_reauth_enabled = False
+        self.buy_mode_resume_pending = False
         self.set_purchase_submission_enabled(False)
 
         if self.purchase_in_progress:
@@ -405,6 +492,7 @@ class BackgroundTasks:
     def _clear_marketplace_session(self, reason):
         self.pending_auth_reset_reason = None
         self.steam_auto_reauth_enabled = False
+        self.buy_mode_resume_pending = False
         self.set_purchase_submission_enabled(False)
         self.simulated_session_enabled = False
         if hasattr(self.api_handler, "clear_session"):
@@ -672,6 +760,24 @@ class BackgroundTasks:
             self.debug_force_purchase_session_expired = False
         return recovered
 
+    async def debug_run_session_check_now(self):
+        """Run one iteration of the production periodic session checker on demand (test mode).
+
+        This is the real `_run_one_session_check` path: it detects expiry (honoring the "Expire
+        Session" override) and, if expired, runs `handle_expired_session` exactly as the idle bot
+        would. Use "Expire Session" first to exercise the detect -> auto re-auth flow.
+        """
+        if not self.test_mode_enabled:
+            return None
+
+        self.add_event("Test: running the periodic session check now.", "info")
+        result = await self._run_one_session_check()
+        if result and self.debug_force_purchase_session_expired:
+            # A forced-expiry run that recovered: drop the override so later checks see the real
+            # session instead of staying permanently "expired".
+            self.debug_force_purchase_session_expired = False
+        return result
+
     async def debug_open_blank_browser_diagnostic(self):
         if not self.test_mode_enabled:
             return False
@@ -685,14 +791,77 @@ class BackgroundTasks:
         self.add_event("Blank browser diagnostic closed.", "info")
         return True
 
-    def debug_clear_steam_initial_setup_status(self):
-        if not self.test_mode_enabled:
-            return False
+    def reset_steam_initial_setup_status(self):
+        """Mark Steam initial setup incomplete and clear the one-time consent flag.
 
+        Ungated maintenance action used by App Settings; the test-mode debug
+        control delegates here.
+        """
         self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(False)
         self._set_steam_pa_cookie_consent_prepared(False)
         self.steam_auto_reauth_enabled = False
         self.add_event("Initial Steam setup status reset to incomplete.", "warning")
+        return True
+
+    def debug_clear_steam_initial_setup_status(self):
+        if not self.test_mode_enabled:
+            return False
+
+        return self.reset_steam_initial_setup_status()
+
+    async def debug_dump_cookies_keep_steam_login(self):
+        if not self.test_mode_enabled:
+            return False
+
+        if not self.uses_steam_browser_session():
+            self.add_event(
+                "Dump cookies (keep Steam login) is only available in Steam Account mode.",
+                "warning",
+            )
+            return False
+
+        try:
+            cleared_count = await clear_market_cookies_keep_steam_login(profile_path=STEAM_MARKET_PROFILE_PATH)
+        except BrowserAuthError as exc:
+            self.add_event(f"Test cookie dump failed: {exc}", "error")
+            return False
+
+        # Re-arm the re-auth flow so the next refresh runs the full cookie-box + Steam-button path,
+        # while keeping the Steam login and the saved Steam setup so no Steam re-login is needed.
+        self._set_steam_pa_cookie_consent_prepared(False)
+        self._set_saved_session_last_known_valid(False)
+        self.add_event(
+            f"Test mode: cleared {cleared_count} non-Steam cookies (market/PA/consent); kept Steam login. "
+            "Run Reauth Check to exercise the full re-auth flow.",
+            "warning",
+        )
+        return True
+
+    async def clear_browser_session_cookies(self):
+        """Clear cookies from the app-owned browser profile for the active login method.
+
+        Ungated maintenance action used by App Settings for recovering a stuck
+        login. Clears the Steam profile in Steam mode (and resets Steam setup
+        state) or the Pearl Abyss profile in PA mode.
+        """
+        steam_mode = self.uses_steam_browser_session()
+        profile_path = STEAM_MARKET_PROFILE_PATH if steam_mode else PA_MARKET_PROFILE_PATH
+        try:
+            cleared_count = await clear_steam_browser_profile_cookies(profile_path=profile_path)
+        except BrowserAuthError as exc:
+            self.add_event(f"Browser cookie clear failed: {exc}", "error")
+            return False
+
+        if steam_mode:
+            self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(False)
+            self._set_steam_pa_cookie_consent_prepared(False)
+            self.steam_auto_reauth_enabled = False
+        else:
+            self._set_pa_browser_profile_prepared(False)
+        self.add_event(
+            f"Browser cookies cleared from the app-owned {self.account_mode_label()} profile ({cleared_count} cookies).",
+            "warning",
+        )
         return True
 
     async def debug_clear_steam_browser_cookies(self):
@@ -740,6 +909,10 @@ class BackgroundTasks:
                 self.add_event("Re-authentication succeeded. Retrying purchase request.", "success")
                 return True
 
+            # Pause and arm auto-resume (PA path does the same just below): otherwise buy mode stays
+            # on against a dead session and the monitor keeps firing failed buys until the periodic
+            # checker eventually pauses it.
+            self.pause_buy_mode_for_session_refresh("Re-authentication failed.")
             self.add_event("Re-authentication failed. Purchase retry skipped.", "error")
             return False
 
@@ -967,7 +1140,8 @@ class BackgroundTasks:
             return
 
         if self.uses_steam_browser_session():
-            await self.refresh_browser_session(session_check_error=session_check_error)
+            if not await self.refresh_browser_session(session_check_error=session_check_error):
+                self.pause_buy_mode_for_session_refresh("Steam Account refresh failed.")
             return
 
         if not await self.refresh_pa_browser_session(session_check_error=session_check_error):
@@ -1103,12 +1277,12 @@ class BackgroundTasks:
             except BrowserAuthError as exc:
                 self.api_handler.login_status = False
                 self._set_saved_session_last_known_valid(False)
-                # Self-heal: if an auto-login refresh failed while the one-time PA cookie-consent
-                # probe was being skipped (prepared flag set), re-arm it. A "prepared" flag set
-                # without actually dismissing the Cookiebot banner would otherwise let the banner
-                # block the Steam login button on every future refresh.
-                if auto_steam_login and self.steam_pa_cookie_consent_prepared:
-                    self._set_steam_pa_cookie_consent_prepared(False)
+                # Deliberately do NOT touch steam_pa_cookie_consent_prepared here. Cookie consent is
+                # persisted in the browser profile the moment it is accepted, so it is only invalidated
+                # by clearing cookies (the clear_* / reset paths handle that) -- never by a refresh
+                # failure. Re-arming it on auth errors (the user closing the browser, a transient
+                # timeout, etc.) would needlessly re-run the slow first-time cookie path and re-show the
+                # setup notice on the next routine refresh, even though consent was never lost.
                 self.add_event(f"Steam Account refresh failed: {exc}", "error")
                 return False
 
@@ -1122,6 +1296,8 @@ class BackgroundTasks:
 
             if session_valid:
                 self.api_handler.login_status = True
+                if handle_pa_cookie_consent and not self.steam_pa_cookie_consent_prepared:
+                    self._set_steam_pa_cookie_consent_prepared(True)
                 self._set_saved_session_last_known_valid(True)
                 self.steam_auto_reauth_enabled = True
                 self.add_event("Steam Account session validated and saved.", "success")
@@ -1190,22 +1366,37 @@ class BackgroundTasks:
         try:
             while True:
                 await asyncio.sleep(random.uniform(1800, 2400))
-                try:
-                    status = await self.api_handler.is_session_expired()
-                except MarketplaceAPIError as exc:
-                    self.add_event(f"Session check failed: {exc}", "error")
-                    continue
-
-                if status == -1:
-                    recovered = await self.handle_expired_session()
-                    if not recovered:
-                        break
-
-                else:
-                    self.api_handler.login_status = True
-                    self.add_event("Session still valid.")
+                if not await self._run_one_session_check():
+                    break
         except asyncio.CancelledError:
             raise
+
+    async def _check_session_expired(self):
+        # Test-only override: "Expire Session" sets this flag so the production session check below
+        # reports expiry without a live API call, letting the real detect -> re-auth path be tested.
+        if self.test_mode_enabled and self.debug_force_purchase_session_expired:
+            return -1
+        return await self.api_handler.is_session_expired()
+
+    async def _run_one_session_check(self):
+        """Run one periodic session check and react to it.
+
+        Returns True to keep the periodic checker running (session valid, recovered, or a transient
+        check error) and False to stop it (session expired and re-authentication failed). The "Run
+        Session Check" test control calls this same method so the test path is the production path.
+        """
+        try:
+            status = await self._check_session_expired()
+        except MarketplaceAPIError as exc:
+            self.add_event(f"Session check failed: {exc}", "error")
+            return True
+
+        if status == -1:
+            return await self.handle_expired_session()
+
+        self.api_handler.login_status = True
+        self.add_event("Session still valid.")
+        return True
 
     async def handle_expired_session(self):
         self.api_handler.login_status = False
@@ -1216,13 +1407,10 @@ class BackgroundTasks:
                     self.add_event("Session expired. Re-authentication successful.", "success")
                     return True
 
-            if self.purchase_submission_enabled:
-                self.set_purchase_submission_enabled(False)
-                self.add_event(
-                    "Session expired. Steam Account refresh required; buy mode paused.",
-                    "warning",
-                )
-            else:
+            # Mirror the PA path below: pause AND arm auto-resume so buy mode comes back on its own
+            # once a later refresh succeeds. set_purchase_submission_enabled(False) alone would leave
+            # buy mode stuck off (it never sets buy_mode_resume_pending), breaking continuity.
+            if not self.pause_buy_mode_for_session_refresh("Session expired. Steam Account refresh required."):
                 self.add_event(
                     "Session expired. Refresh the Steam Account session from Session before buying.",
                     "warning",

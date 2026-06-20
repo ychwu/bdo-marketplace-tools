@@ -41,8 +41,11 @@ class ModalAction(Static):
             super().__init__()
             self.action = action
 
-    def __init__(self, label: str, action_id: str) -> None:
-        super().__init__(label, id=action_id, classes="modal-action-tile")
+    def __init__(self, label: str, action_id: str, *, extra_classes: str = "") -> None:
+        classes = "modal-action-tile"
+        if extra_classes:
+            classes = f"{classes} {extra_classes}"
+        super().__init__(label, id=action_id, classes=classes)
         self.action_id = action_id
 
     def on_click(self) -> None:
