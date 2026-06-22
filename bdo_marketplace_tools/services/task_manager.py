@@ -26,6 +26,7 @@ from bdo_marketplace_tools.storage.app_settings import (
     account_mode_detail,
     account_mode_label,
     default_app_settings,
+    load_browser_cache_cleanup_threshold_mb,
     load_account_mode,
     load_last_seen_update_version,
     load_pa_browser_profile_prepared,
@@ -35,7 +36,9 @@ from bdo_marketplace_tools.storage.app_settings import (
     load_ui_settings,
     load_update_check_on_startup,
     normalize_account_mode,
+    normalize_browser_cache_cleanup_threshold_mb,
     save_account_mode,
+    save_browser_cache_cleanup_threshold_mb,
     save_buy_mode,
     save_event_log_view,
     save_last_seen_update_version,
@@ -47,6 +50,13 @@ from bdo_marketplace_tools.storage.app_settings import (
     save_steam_browser_profile_prepared,
     save_steam_pa_cookie_consent_prepared,
     save_update_check_on_startup,
+)
+from bdo_marketplace_tools.storage.browser_profile_cache import (
+    MIB,
+    clean_all_disposable_browser_profile_caches,
+    clean_disposable_browser_profile_cache,
+    format_storage_size,
+    measure_all_browser_profile_storage,
 )
 from bdo_marketplace_tools.storage.credentials import CredentialStoreError, load_credentials
 from bdo_marketplace_tools.storage.local_stats import DEFAULT_LOCAL_STATS, load_local_stats, save_local_stats
@@ -65,6 +75,7 @@ BROWSER_VERIFICATION_MARKERS = (
     "manual browser verification",
     "requires browser",
 )
+BROWSER_STORAGE_SUMMARY_CACHE_SECONDS = 5
 
 
 def _load_local_data():
@@ -117,6 +128,11 @@ class BackgroundTasks:
         elif self.delay not in self.delay_choices:
             self.delay = "3"
         self.purchase_delay_bounds = tuple(ui_settings["buy_delay"]["range"])
+        self.browser_cache_cleanup_threshold_mb = (
+            load_browser_cache_cleanup_threshold_mb()
+            if self.persist_ui_settings
+            else default_app_settings()["maintenance"]["browser_cache_cleanup_threshold_mb"]
+        )
         self.events = deque(maxlen=EVENT_LOG_LIMIT)
         self.core_events = deque(maxlen=EVENT_LOG_LIMIT)
         self.ui_events = deque(maxlen=EVENT_LOG_LIMIT)
@@ -148,6 +164,8 @@ class BackgroundTasks:
         self.available_update_version = None
         self.update_check_completed = False
         self.update_check_in_progress = False
+        self._browser_storage_summary = None
+        self._browser_storage_summary_at = 0.0
 
     def reload_lifetime_stats(self):
         local_data = _load_local_data()
@@ -161,6 +179,100 @@ class BackgroundTasks:
                 "silver_spent": self.lifetime_silver_spent,
             }
         )
+
+    def browser_storage_summary(self, *, force=False):
+        now = time.time()
+        if (
+            not force
+            and self._browser_storage_summary is not None
+            and now - self._browser_storage_summary_at < BROWSER_STORAGE_SUMMARY_CACHE_SECONDS
+        ):
+            return self._browser_storage_summary
+
+        self._browser_storage_summary = measure_all_browser_profile_storage()
+        self._browser_storage_summary_at = now
+        return self._browser_storage_summary
+
+    def invalidate_browser_storage_summary(self):
+        self._browser_storage_summary = None
+        self._browser_storage_summary_at = 0.0
+
+    def browser_cache_cleanup_threshold_bytes(self):
+        return int(self.browser_cache_cleanup_threshold_mb) * MIB
+
+    def browser_cache_cleanup_threshold_label(self):
+        if int(self.browser_cache_cleanup_threshold_mb) <= 0:
+            return "Every manual auth open"
+        return format_storage_size(self.browser_cache_cleanup_threshold_bytes())
+
+    def set_browser_cache_cleanup_threshold_mb(self, threshold_mb):
+        threshold = normalize_browser_cache_cleanup_threshold_mb(threshold_mb)
+        self.browser_cache_cleanup_threshold_mb = threshold
+        if self.persist_ui_settings:
+            self.browser_cache_cleanup_threshold_mb = save_browser_cache_cleanup_threshold_mb(threshold)
+        return self.browser_cache_cleanup_threshold_mb
+
+    async def _clean_browser_cache_before_auth(self, profile_path, account_label):
+        try:
+            result = await asyncio.to_thread(
+                clean_disposable_browser_profile_cache,
+                profile_path,
+                threshold_bytes=self.browser_cache_cleanup_threshold_bytes(),
+            )
+        except Exception as exc:
+            self.invalidate_browser_storage_summary()
+            self.add_event(
+                f"Browser cache cleanup skipped for {account_label}: {exc}. Opening Chrome anyway.",
+                "warning",
+            )
+            return False
+
+        self.invalidate_browser_storage_summary()
+        if result.removed_anything:
+            self.add_event(
+                f"Cleaned {format_storage_size(result.removed_bytes)} of disposable "
+                f"{account_label} browser cache before opening Chrome.",
+                "info",
+            )
+        if result.had_failures:
+            self.add_event(
+                f"Browser cache cleanup partially completed for {account_label}; "
+                f"{len(result.failed_paths)} cache path(s) could not be removed. Opening Chrome anyway.",
+                "warning",
+            )
+        return result.removed_anything
+
+    async def clean_browser_cache_now(self):
+        try:
+            results = await asyncio.to_thread(
+                clean_all_disposable_browser_profile_caches,
+                threshold_bytes=1,
+            )
+        except Exception as exc:
+            self.invalidate_browser_storage_summary()
+            self.add_event(f"Manual browser cache cleanup failed: {exc}", "error")
+            return None
+
+        self.invalidate_browser_storage_summary()
+        removed_bytes = sum(result.removed_bytes for result in results)
+        failed_paths = sum(len(result.failed_paths) for result in results)
+        if removed_bytes:
+            self.add_event(
+                f"Cleaned {format_storage_size(removed_bytes)} of disposable browser cache.",
+                "info",
+            )
+        elif not failed_paths:
+            self.add_event("No disposable browser cache found to clean.", "info")
+        if failed_paths:
+            self.add_event(
+                f"Browser cache cleanup partially completed; {failed_paths} cache path(s) could not be removed.",
+                "warning",
+            )
+        return {
+            "removed_bytes": removed_bytes,
+            "failed_paths": failed_paths,
+            "results": results,
+        }
 
     def add_event(self, message, level="info", channel="core"):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -814,6 +926,7 @@ class BackgroundTasks:
         self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(False)
         self._set_steam_pa_cookie_consent_prepared(False)
         self.steam_auto_reauth_enabled = False
+        self.invalidate_browser_storage_summary()
         self.add_event("Initial Steam setup status reset to incomplete.", "warning")
         return True
 
@@ -844,6 +957,7 @@ class BackgroundTasks:
         # while keeping the Steam login and the saved Steam setup so no Steam re-login is needed.
         self._set_steam_pa_cookie_consent_prepared(False)
         self._set_saved_session_last_known_valid(False)
+        self.invalidate_browser_storage_summary()
         self.add_event(
             f"Test mode: cleared {cleared_count} non-Steam cookies (market/PA/consent); kept Steam login. "
             "Run Reauth Check to exercise the full re-auth flow.",
@@ -872,6 +986,7 @@ class BackgroundTasks:
             self.steam_auto_reauth_enabled = False
         else:
             self._set_pa_browser_profile_prepared(False)
+        self.invalidate_browser_storage_summary()
         self.add_event(
             f"Browser cookies cleared from the app-owned {self.account_mode_label()} profile ({cleared_count} cookies).",
             "warning",
@@ -891,10 +1006,11 @@ class BackgroundTasks:
         self.steam_browser_profile_prepared = save_steam_browser_profile_prepared(False)
         self._set_steam_pa_cookie_consent_prepared(False)
         self.steam_auto_reauth_enabled = False
+        self.invalidate_browser_storage_summary()
         self.add_event(f"Steam browser cookies cleared from the app-owned profile ({cleared_count} cookies).", "warning")
         return True
 
-    async def prepare_steam_browser_profile(self, *, allow_inactive_mode=False):
+    async def prepare_steam_browser_profile(self, *, allow_inactive_mode=False, cleanup_browser_cache=True):
         if not self.uses_steam_browser_session() and not allow_inactive_mode:
             self.add_event("Switch to Steam Account before running initial Steam setup.", "warning")
             return False
@@ -902,6 +1018,9 @@ class BackgroundTasks:
         if self.steam_browser_profile_prepared:
             self.add_event("Initial Steam browser setup is already complete.", "info")
             return True
+
+        if cleanup_browser_cache:
+            await self._clean_browser_cache_before_auth(STEAM_MARKET_PROFILE_PATH, "Steam Account")
 
         try:
             await prepare_steam_browser_profile(status_callback=self._browser_auth_status)
@@ -1154,11 +1273,17 @@ class BackgroundTasks:
             return
 
         if self.uses_steam_browser_session():
-            if not await self.refresh_browser_session(session_check_error=session_check_error):
+            if not await self.refresh_browser_session(
+                session_check_error=session_check_error,
+                cleanup_browser_cache=True,
+            ):
                 self.pause_buy_mode_for_session_refresh("Steam Account refresh failed.")
             return
 
-        if not await self.refresh_pa_browser_session(session_check_error=session_check_error):
+        if not await self.refresh_pa_browser_session(
+            session_check_error=session_check_error,
+            cleanup_browser_cache=True,
+        ):
             self.pause_buy_mode_for_session_refresh("Pearl Abyss Account refresh failed.")
 
     def _requires_browser_verification(self, exc):
@@ -1184,6 +1309,7 @@ class BackgroundTasks:
         *,
         auto_pa_login=None,
         force_refresh=False,
+        cleanup_browser_cache=False,
     ):
         async with self.browser_auth_lock:
             if not force_refresh and await self._saved_session_is_valid():
@@ -1236,6 +1362,9 @@ class BackgroundTasks:
                     bootstrap_url = None
                     self.add_event("DIAGNOSTIC: skipping fresh-start bootstrap for this PA refresh.", "warning")
 
+                if cleanup_browser_cache:
+                    await self._clean_browser_cache_before_auth(PA_MARKET_PROFILE_PATH, "Pearl Abyss Account")
+
                 cookies = await acquire_market_cookies(
                     status_callback=self._browser_auth_status,
                     auto_steam_login=False,
@@ -1277,14 +1406,21 @@ class BackgroundTasks:
             )
             return False
 
-    async def refresh_browser_session(self, session_check_error=None, *, auto_steam_login=None, force_refresh=False):
+    async def refresh_browser_session(
+        self,
+        session_check_error=None,
+        *,
+        auto_steam_login=None,
+        force_refresh=False,
+        cleanup_browser_cache=False,
+    ):
         async with self.browser_auth_lock:
             if not force_refresh and await self._saved_session_is_valid():
                 return True
 
             if self.steam_browser_profile_needs_setup():
                 self.add_event("Initial Steam browser setup is required before the market login refresh.", "warning")
-                prepared = await self.prepare_steam_browser_profile()
+                prepared = await self.prepare_steam_browser_profile(cleanup_browser_cache=cleanup_browser_cache)
                 if not prepared:
                     self.api_handler.login_status = False
                     self._set_saved_session_last_known_valid(False)
@@ -1301,6 +1437,8 @@ class BackgroundTasks:
 
             try:
                 handle_pa_cookie_consent = bool(auto_steam_login and not self.steam_pa_cookie_consent_prepared)
+                if cleanup_browser_cache:
+                    await self._clean_browser_cache_before_auth(STEAM_MARKET_PROFILE_PATH, "Steam Account")
                 cookies = await acquire_market_cookies(
                     status_callback=self._browser_auth_status,
                     auto_steam_login=auto_steam_login,

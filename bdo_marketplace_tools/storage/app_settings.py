@@ -1,6 +1,7 @@
 import json
 
 from bdo_marketplace_tools.storage.paths import APP_SETTINGS_PATH
+from bdo_marketplace_tools.storage.browser_profile_cache import DEFAULT_DISPOSABLE_CACHE_CLEANUP_THRESHOLD_BYTES, MIB
 from bdo_marketplace_tools.version import APP_CHANNEL, APP_VERSION, PROJECT_NAME, SETTINGS_SCHEMA_VERSION
 
 
@@ -14,6 +15,8 @@ SETTINGS_VERSION = SETTINGS_SCHEMA_VERSION
 DEFAULT_POLLING_DELAY_KEY = "3"
 DEFAULT_CUSTOM_POLLING_RANGE = [15, 30]
 DEFAULT_PURCHASE_DELAY_RANGE = [1.0, 2.5]
+DEFAULT_BROWSER_CACHE_CLEANUP_THRESHOLD_MB = DEFAULT_DISPOSABLE_CACHE_CLEANUP_THRESHOLD_BYTES // MIB
+MAX_BROWSER_CACHE_CLEANUP_THRESHOLD_MB = 10240
 VALID_POLLING_DELAY_KEYS = {"1", "2", "3", "custom"}
 DEFAULT_EVENT_LOG_VIEW = "core"
 VALID_EVENT_LOG_VIEWS = {"core", "ui"}
@@ -87,6 +90,12 @@ def default_app_settings():
             # dir) were last confirmed valid. Startup auto-checks a saved session only when this
             # is True; otherwise it asks the user to Refresh Session.
             "saved_session_last_known_valid": False,
+        },
+        "maintenance": {
+            # Disposable Chrome cache auto-clean threshold in MiB. 0 means clean before every
+            # user-initiated browser auth open; the manual App Settings cleanup ignores this limit
+            # and cleans any disposable browser cache it finds.
+            "browser_cache_cleanup_threshold_mb": DEFAULT_BROWSER_CACHE_CLEANUP_THRESHOLD_MB,
         },
         "ui": {
             "polling": {
@@ -193,6 +202,27 @@ def _coerce_spend_cap(value):
     return cap if cap > 0 else None
 
 
+def normalize_browser_cache_cleanup_threshold_mb(value):
+    try:
+        threshold = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Browser cache cleanup limit must be a whole number from 0 to {MAX_BROWSER_CACHE_CLEANUP_THRESHOLD_MB} MiB."
+        ) from None
+    if threshold < 0 or threshold > MAX_BROWSER_CACHE_CLEANUP_THRESHOLD_MB:
+        raise ValueError(
+            f"Browser cache cleanup limit must be a whole number from 0 to {MAX_BROWSER_CACHE_CLEANUP_THRESHOLD_MB} MiB."
+        )
+    return threshold
+
+
+def _coerce_browser_cache_cleanup_threshold_mb(value):
+    try:
+        return normalize_browser_cache_cleanup_threshold_mb(value)
+    except ValueError:
+        return DEFAULT_BROWSER_CACHE_CLEANUP_THRESHOLD_MB
+
+
 def _normalize_event_log_view(value):
     normalized = str(value or DEFAULT_EVENT_LOG_VIEW).strip().lower()
     return normalized if normalized in VALID_EVENT_LOG_VIEWS else DEFAULT_EVENT_LOG_VIEW
@@ -204,6 +234,7 @@ def _normalize_settings(data):
     steam_browser = data.get("steam_browser") if isinstance(data.get("steam_browser"), dict) else {}
     pa_browser = data.get("pa_browser") if isinstance(data.get("pa_browser"), dict) else {}
     session = data.get("session") if isinstance(data.get("session"), dict) else {}
+    maintenance = data.get("maintenance") if isinstance(data.get("maintenance"), dict) else {}
     ui = data.get("ui") if isinstance(data.get("ui"), dict) else {}
     polling = ui.get("polling") if isinstance(ui.get("polling"), dict) else {}
     buy_delay = ui.get("buy_delay") if isinstance(ui.get("buy_delay"), dict) else {}
@@ -230,6 +261,15 @@ def _normalize_settings(data):
 
     settings["session"]["saved_session_last_known_valid"] = _coerce_bool(
         session.get("saved_session_last_known_valid", data.get("saved_session_last_known_valid", False))
+    )
+    settings["maintenance"]["browser_cache_cleanup_threshold_mb"] = _coerce_browser_cache_cleanup_threshold_mb(
+        maintenance.get(
+            "browser_cache_cleanup_threshold_mb",
+            data.get(
+                "browser_cache_cleanup_threshold_mb",
+                DEFAULT_BROWSER_CACHE_CLEANUP_THRESHOLD_MB,
+            ),
+        )
     )
 
     selected_delay = str(polling.get("selected", data.get("delay", DEFAULT_POLLING_DELAY_KEY))).strip().lower()
@@ -351,6 +391,22 @@ def save_saved_session_last_known_valid(valid):
 
 def load_ui_settings():
     return read_app_settings()["ui"]
+
+
+def load_maintenance_settings():
+    return read_app_settings()["maintenance"]
+
+
+def load_browser_cache_cleanup_threshold_mb():
+    return load_maintenance_settings()["browser_cache_cleanup_threshold_mb"]
+
+
+def save_browser_cache_cleanup_threshold_mb(threshold_mb):
+    settings = read_app_settings()
+    settings["maintenance"]["browser_cache_cleanup_threshold_mb"] = normalize_browser_cache_cleanup_threshold_mb(
+        threshold_mb
+    )
+    return save_app_settings(settings)["maintenance"]["browser_cache_cleanup_threshold_mb"]
 
 
 def save_ui_settings(ui_settings):

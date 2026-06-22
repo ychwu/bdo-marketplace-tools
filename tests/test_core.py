@@ -81,6 +81,7 @@ from bdo_marketplace_tools.market.pricing import (
 )
 from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET, check_single_item_stock, parse_single_item_stock_response
 from bdo_marketplace_tools.storage import app_settings as account_mode_module
+from bdo_marketplace_tools.storage import browser_profile_cache as browser_profile_cache_module
 from bdo_marketplace_tools.storage import credentials as credentials_module
 from bdo_marketplace_tools.services import task_manager as task_manager_module
 from bdo_marketplace_tools.services import update_checker as update_checker_module
@@ -88,6 +89,15 @@ from bdo_marketplace_tools.storage.paths import PA_MARKET_PROFILE_PATH
 from bdo_marketplace_tools.storage import paths as paths_module
 from bdo_marketplace_tools.storage import migration as migration_module
 from bdo_marketplace_tools.storage.app_settings import PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE
+from bdo_marketplace_tools.storage.browser_profile_cache import (
+    BrowserProfileCleanupResult,
+    BrowserProfileStorageSummary,
+    DEFAULT_DISPOSABLE_CACHE_CLEANUP_THRESHOLD_BYTES,
+    MIB,
+    clean_disposable_browser_profile_cache,
+    format_storage_size,
+    measure_browser_profile_storage,
+)
 from bdo_marketplace_tools.services.task_manager import BackgroundTasks
 from bdo_marketplace_tools.ui.app import BANNER_ART, DEFAULT_THEME, STATUS_STYLES, DashboardTile, MarketplaceToolsApp, ModalAction
 from bdo_marketplace_tools.version import APP_CHANNEL, APP_VERSION, PROJECT_NAME, SETTINGS_SCHEMA_VERSION
@@ -2831,14 +2841,17 @@ class LocalRuntimeFileTests(unittest.TestCase):
                 self.assertFalse(account_mode_module.load_steam_browser_profile_prepared())
                 self.assertFalse(account_mode_module.load_steam_pa_cookie_consent_prepared())
                 self.assertFalse(account_mode_module.load_pa_browser_profile_prepared())
+                self.assertEqual(account_mode_module.load_browser_cache_cleanup_threshold_mb(), 150)
                 self.assertEqual(account_mode_module.save_account_mode(STEAM_BROWSER_MODE), STEAM_BROWSER_MODE)
                 self.assertTrue(account_mode_module.save_steam_browser_profile_prepared(True))
                 self.assertTrue(account_mode_module.save_steam_pa_cookie_consent_prepared(True))
                 self.assertTrue(account_mode_module.save_pa_browser_profile_prepared(True))
+                self.assertEqual(account_mode_module.save_browser_cache_cleanup_threshold_mb(256), 256)
                 self.assertEqual(account_mode_module.load_account_mode(), STEAM_BROWSER_MODE)
                 self.assertTrue(account_mode_module.load_steam_browser_profile_prepared())
                 self.assertTrue(account_mode_module.load_steam_pa_cookie_consent_prepared())
                 self.assertTrue(account_mode_module.load_pa_browser_profile_prepared())
+                self.assertEqual(account_mode_module.load_browser_cache_cleanup_threshold_mb(), 256)
                 self.assertEqual(account_mode_module.account_mode_label(STEAM_BROWSER_MODE), "Steam Account")
                 self.assertEqual(account_mode_module.account_mode_label(PA_CREDENTIALS_MODE), "Pearl Abyss Account")
                 self.assertEqual(account_mode_module.normalize_account_mode("Steam Account"), STEAM_BROWSER_MODE)
@@ -2856,6 +2869,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertTrue(saved_settings["steam_browser"]["pa_cookie_consent_prepared"])
             self.assertTrue(saved_settings["pa_browser"]["profile_prepared"])
             self.assertFalse(saved_settings["session"]["saved_session_last_known_valid"])
+            self.assertEqual(saved_settings["maintenance"]["browser_cache_cleanup_threshold_mb"], 256)
             self.assertEqual(saved_settings["ui"]["polling"]["selected"], "3")
             self.assertEqual(saved_settings["ui"]["polling"]["custom_range"], [15, 30])
             self.assertEqual(saved_settings["ui"]["buy_delay"]["range"], [1.0, 2.5])
@@ -2875,6 +2889,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
                 account_mode_module.save_buy_mode(True)
                 account_mode_module.save_event_log_view("ui")
                 account_mode_module.save_saved_session_last_known_valid(True)
+                account_mode_module.save_browser_cache_cleanup_threshold_mb(0)
                 settings = account_mode_module.read_app_settings()
 
             self.assertEqual(settings["ui"]["polling"]["selected"], "custom")
@@ -2884,10 +2899,14 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertTrue(settings["ui"]["buy_mode"])
             self.assertEqual(settings["ui"]["event_log_view"], "ui")
             self.assertTrue(settings["session"]["saved_session_last_known_valid"])
+            self.assertEqual(settings["maintenance"]["browser_cache_cleanup_threshold_mb"], 0)
             with patch("bdo_marketplace_tools.storage.app_settings.APP_SETTINGS_PATH", settings_path):
                 self.assertFalse(account_mode_module.save_saved_session_last_known_valid(False))
                 self.assertFalse(account_mode_module.load_saved_session_last_known_valid())
                 self.assertEqual(account_mode_module.save_event_log_view("bad-view"), "core")
+                self.assertEqual(account_mode_module.save_browser_cache_cleanup_threshold_mb("512"), 512)
+                with self.assertRaises(ValueError):
+                    account_mode_module.save_browser_cache_cleanup_threshold_mb("-1")
 
     def test_background_tasks_load_and_save_persisted_ui_preferences(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2900,6 +2919,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
                 account_mode_module.save_spend_cap(250)
                 account_mode_module.save_buy_mode(True)
                 account_mode_module.save_event_log_view("ui")
+                account_mode_module.save_browser_cache_cleanup_threshold_mb(512)
 
                 with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
                     manager = BackgroundTasks(FakeAPI())
@@ -2910,12 +2930,14 @@ class LocalRuntimeFileTests(unittest.TestCase):
                 self.assertEqual(manager.max_spend, 250)
                 self.assertTrue(manager.purchase_submission_enabled)
                 self.assertEqual(manager.event_log_view, "ui")
+                self.assertEqual(manager.browser_cache_cleanup_threshold_mb, 512)
 
                 manager.set_delay_choice("2")
                 manager.set_purchase_delay_range("1.25", "3.5")
                 manager.set_spend_cap(0)
                 manager.set_purchase_submission_enabled(False)
                 manager.set_event_log_view("core")
+                manager.set_browser_cache_cleanup_threshold_mb(64)
 
                 with patch("bdo_marketplace_tools.services.task_manager._load_local_data", return_value=LOCAL_DATA.copy()):
                     restored = BackgroundTasks(FakeAPI())
@@ -2926,6 +2948,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertIsNone(restored.max_spend)
             self.assertFalse(restored.purchase_submission_enabled)
             self.assertEqual(restored.event_log_view, "core")
+            self.assertEqual(restored.browser_cache_cleanup_threshold_mb, 64)
 
     def test_old_resource_settings_are_ignored_for_fresh_start(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2956,6 +2979,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertFalse(settings["steam_browser"]["profile_prepared"])
             self.assertFalse(settings["steam_browser"]["pa_cookie_consent_prepared"])
             self.assertFalse(settings["pa_browser"]["profile_prepared"])
+            self.assertEqual(settings["maintenance"]["browser_cache_cleanup_threshold_mb"], 150)
             saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
             self.assertEqual(saved_settings, settings)
 
@@ -2984,6 +3008,7 @@ class LocalRuntimeFileTests(unittest.TestCase):
             self.assertTrue(settings["steam_browser"]["profile_prepared"])
             self.assertFalse(settings["steam_browser"]["pa_cookie_consent_prepared"])
             self.assertFalse(settings["pa_browser"]["profile_prepared"])
+            self.assertEqual(settings["maintenance"]["browser_cache_cleanup_threshold_mb"], 150)
             saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
             self.assertEqual(saved_settings["version"], EXPECTED_APP_SETTINGS_VERSION)
 
@@ -3103,6 +3128,121 @@ class LocalRuntimeFileTests(unittest.TestCase):
         self.assertEqual(PA_MARKET_PROFILE_PATH.name, "pa-market")
         self.assertIn("data", STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH.parts)
         self.assertEqual(STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH.name, "steam-market-diagnostic")
+
+    def test_browser_profile_storage_measures_total_and_disposable_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = Path(temp_dir) / "steam-market"
+            (profile / "BrowserMetrics").mkdir(parents=True)
+            (profile / "BrowserMetrics" / "metrics.pma").write_bytes(b"a" * 4)
+            (profile / "Default" / "Code Cache").mkdir(parents=True)
+            (profile / "Default" / "Code Cache" / "script").write_bytes(b"b" * 6)
+            (profile / "Default" / "Network").mkdir(parents=True)
+            (profile / "Default" / "Network" / "Cookies").write_bytes(b"c" * 8)
+
+            summary = measure_browser_profile_storage(profile)
+
+        self.assertEqual(summary.total_bytes, 18)
+        self.assertEqual(summary.disposable_bytes, 10)
+
+    def test_browser_profile_cache_cleanup_only_removes_allowlisted_disposable_paths(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = Path(temp_dir) / "pa-market"
+            disposable_files = [
+                profile / "BrowserMetrics" / "metrics.pma",
+                profile / "Default" / "Cache" / "Cache_Data" / "data_0",
+                profile / "Default" / "Code Cache" / "js" / "compiled",
+                profile / "Default" / "GPUCache" / "gpu",
+                profile / "GrShaderCache" / "shader",
+                profile / "component_crx_cache" / "component",
+            ]
+            preserved_files = [
+                profile / "Default" / "Network" / "Cookies",
+                profile / "Default" / "Local Storage" / "leveldb" / "state",
+                profile / "Default" / "Session Storage" / "session",
+                profile / "Default" / "IndexedDB" / "db",
+                profile / "Default" / "History",
+                profile / "Default" / "Preferences",
+            ]
+            for index, path in enumerate(disposable_files + preserved_files, start=1):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(bytes([index]) * index)
+
+            result = clean_disposable_browser_profile_cache(profile, threshold_bytes=1)
+
+            self.assertTrue(result.removed_anything)
+            self.assertFalse(result.had_failures)
+            for path in disposable_files:
+                self.assertFalse(path.exists(), path)
+            for path in preserved_files:
+                self.assertTrue(path.exists(), path)
+            self.assertGreater(result.removed_bytes, 0)
+
+    def test_browser_profile_cache_cleanup_missing_paths_are_noop(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = Path(temp_dir) / "empty-profile"
+
+            result = clean_disposable_browser_profile_cache(profile, threshold_bytes=1)
+
+        self.assertTrue(result.skipped)
+        self.assertFalse(result.removed_anything)
+        self.assertFalse(result.had_failures)
+
+    def test_browser_profile_cache_cleanup_skip_avoids_full_profile_scan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = Path(temp_dir) / "small-profile"
+
+            with patch(
+                "bdo_marketplace_tools.storage.browser_profile_cache._disposable_path_size",
+                return_value=10,
+            ) as disposable_size, patch(
+                "bdo_marketplace_tools.storage.browser_profile_cache._path_size",
+                side_effect=AssertionError("full profile scan should be skipped"),
+            ) as path_size:
+                result = clean_disposable_browser_profile_cache(profile, threshold_bytes=20)
+
+        disposable_size.assert_called_once_with(profile)
+        path_size.assert_not_called()
+        self.assertTrue(result.skipped)
+        self.assertEqual(result.total_bytes_before, 0)
+        self.assertEqual(result.disposable_bytes_before, 10)
+
+    def test_browser_profile_cache_cleanup_delete_failure_is_non_fatal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = Path(temp_dir) / "steam-market"
+            cache_file = profile / "Default" / "Cache" / "Cache_Data" / "data_0"
+            cache_file.parent.mkdir(parents=True)
+            cache_file.write_bytes(b"cache")
+
+            with patch("bdo_marketplace_tools.storage.browser_profile_cache.shutil.rmtree", side_effect=OSError("locked")):
+                result = clean_disposable_browser_profile_cache(profile, threshold_bytes=1)
+
+            self.assertFalse(result.removed_anything)
+            self.assertTrue(result.had_failures)
+            self.assertIn("Default/Cache", result.failed_paths)
+            self.assertTrue(cache_file.exists())
+
+    def test_browser_profile_cache_cleanup_path_safety_blocks_outside_targets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            profile = root / "steam-market"
+            outside = root / "outside-cache"
+            outside.mkdir()
+            (outside / "do-not-delete").write_bytes(b"keep")
+
+            with patch.object(
+                browser_profile_cache_module,
+                "DISPOSABLE_BROWSER_PROFILE_PATHS",
+                ("../outside-cache",),
+            ):
+                result = clean_disposable_browser_profile_cache(profile, threshold_bytes=0)
+
+            self.assertTrue(result.had_failures)
+            self.assertTrue((outside / "do-not-delete").exists())
+
+    def test_format_storage_size_uses_binary_units(self):
+        self.assertEqual(format_storage_size(0), "0 B")
+        self.assertEqual(format_storage_size(1024), "1.0 KiB")
+        self.assertEqual(format_storage_size(2 * 1024 * 1024), "2.0 MiB")
 
 
 class APIBuyFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -4024,6 +4164,202 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.api_handler.login.assert_not_called()
         manager.refresh_pa_browser_session.assert_awaited_once()
         self.assertEqual(str(manager.refresh_pa_browser_session.await_args.kwargs["session_check_error"]), "network down")
+        self.assertTrue(manager.refresh_pa_browser_session.await_args.kwargs["cleanup_browser_cache"])
+
+    async def test_manual_pa_login_cleans_browser_cache_before_opening_browser(self):
+        manager = self.make_task_manager()
+        manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
+        cleanup_result = BrowserProfileCleanupResult(
+            profile_path=PA_MARKET_PROFILE_PATH,
+            total_bytes_before=300,
+            disposable_bytes_before=250,
+            removed_bytes=200,
+            removed_paths=("Default/Cache",),
+        )
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.load_credentials",
+            return_value=("user@example.com", "secret"),
+        ), patch(
+            "bdo_marketplace_tools.services.task_manager.clean_disposable_browser_profile_cache",
+            return_value=cleanup_result,
+        ) as cleanup, patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ) as browser_auth:
+            await manager.login()
+
+        cleanup.assert_called_once()
+        self.assertEqual(cleanup.call_args.args[0], PA_MARKET_PROFILE_PATH)
+        browser_auth.assert_awaited_once()
+        self.assertTrue(any("Cleaned 200 B of disposable Pearl Abyss Account browser cache" in event for event in manager.events))
+        await manager.stop_login_status_checker()
+
+    async def test_manual_steam_login_cleans_browser_cache_before_opening_browser(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
+        cleanup_result = BrowserProfileCleanupResult(
+            profile_path=STEAM_MARKET_PROFILE_PATH,
+            total_bytes_before=300,
+            disposable_bytes_before=250,
+            removed_bytes=200,
+            removed_paths=("Default/Cache",),
+        )
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.clean_disposable_browser_profile_cache",
+            return_value=cleanup_result,
+        ) as cleanup, patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ) as browser_auth:
+            await manager.login()
+
+        cleanup.assert_called_once()
+        self.assertEqual(cleanup.call_args.args[0], STEAM_MARKET_PROFILE_PATH)
+        browser_auth.assert_awaited_once()
+        self.assertTrue(any("Cleaned 200 B of disposable Steam Account browser cache" in event for event in manager.events))
+        await manager.stop_login_status_checker()
+
+    async def test_steam_initial_setup_cleans_browser_cache_before_opening_browser(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_browser_profile_prepared = False
+        cleanup_result = BrowserProfileCleanupResult(
+            profile_path=STEAM_MARKET_PROFILE_PATH,
+            total_bytes_before=300,
+            disposable_bytes_before=250,
+            removed_bytes=200,
+            removed_paths=("Default/Cache",),
+        )
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.clean_disposable_browser_profile_cache",
+            return_value=cleanup_result,
+        ) as cleanup, patch(
+            "bdo_marketplace_tools.services.task_manager.prepare_steam_browser_profile",
+            new=AsyncMock(),
+        ) as profile_setup, patch(
+            "bdo_marketplace_tools.services.task_manager.save_steam_browser_profile_prepared",
+            return_value=True,
+        ):
+            prepared = await manager.prepare_steam_browser_profile()
+
+        self.assertTrue(prepared)
+        cleanup.assert_called_once()
+        self.assertEqual(cleanup.call_args.args[0], STEAM_MARKET_PROFILE_PATH)
+        profile_setup.assert_awaited_once()
+        self.assertTrue(any("Cleaned 200 B of disposable Steam Account browser cache" in event for event in manager.events))
+
+    async def test_browser_cache_cleanup_runs_filesystem_work_in_thread(self):
+        manager = self.make_task_manager()
+        cleanup_result = BrowserProfileCleanupResult(
+            profile_path=STEAM_MARKET_PROFILE_PATH,
+            total_bytes_before=300,
+            disposable_bytes_before=250,
+            removed_bytes=200,
+            removed_paths=("Default/Cache",),
+        )
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.asyncio.to_thread",
+            new=AsyncMock(return_value=cleanup_result),
+        ) as to_thread:
+            cleaned = await manager._clean_browser_cache_before_auth(STEAM_MARKET_PROFILE_PATH, "Steam Account")
+
+        self.assertTrue(cleaned)
+        to_thread.assert_awaited_once_with(
+            task_manager_module.clean_disposable_browser_profile_cache,
+            STEAM_MARKET_PROFILE_PATH,
+            threshold_bytes=DEFAULT_DISPOSABLE_CACHE_CLEANUP_THRESHOLD_BYTES,
+        )
+        self.assertTrue(any("Cleaned 200 B of disposable Steam Account browser cache" in event for event in manager.events))
+
+    async def test_browser_cache_cleanup_uses_saved_threshold(self):
+        manager = self.make_task_manager()
+        manager.set_browser_cache_cleanup_threshold_mb(42)
+        cleanup_result = BrowserProfileCleanupResult(
+            profile_path=STEAM_MARKET_PROFILE_PATH,
+            total_bytes_before=0,
+            disposable_bytes_before=10,
+            removed_bytes=0,
+            skipped=True,
+        )
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.asyncio.to_thread",
+            new=AsyncMock(return_value=cleanup_result),
+        ) as to_thread:
+            cleaned = await manager._clean_browser_cache_before_auth(STEAM_MARKET_PROFILE_PATH, "Steam Account")
+
+        self.assertFalse(cleaned)
+        to_thread.assert_awaited_once_with(
+            task_manager_module.clean_disposable_browser_profile_cache,
+            STEAM_MARKET_PROFILE_PATH,
+            threshold_bytes=42 * MIB,
+        )
+
+    async def test_manual_browser_cache_cleanup_cleans_all_profiles_without_saved_threshold(self):
+        manager = self.make_task_manager()
+        manager.set_browser_cache_cleanup_threshold_mb(999)
+        cleanup_results = (
+            BrowserProfileCleanupResult(
+                profile_path=STEAM_MARKET_PROFILE_PATH,
+                total_bytes_before=300,
+                disposable_bytes_before=250,
+                removed_bytes=200,
+                removed_paths=("Default/Cache",),
+            ),
+            BrowserProfileCleanupResult(
+                profile_path=PA_MARKET_PROFILE_PATH,
+                total_bytes_before=100,
+                disposable_bytes_before=70,
+                removed_bytes=60,
+                removed_paths=("Default/Code Cache",),
+            ),
+        )
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.asyncio.to_thread",
+            new=AsyncMock(return_value=cleanup_results),
+        ) as to_thread:
+            result = await manager.clean_browser_cache_now()
+
+        to_thread.assert_awaited_once_with(
+            task_manager_module.clean_all_disposable_browser_profile_caches,
+            threshold_bytes=1,
+        )
+        self.assertEqual(result["removed_bytes"], 260)
+        self.assertEqual(result["failed_paths"], 0)
+        self.assertTrue(any("Cleaned 260 B of disposable browser cache" in event for event in manager.events))
+
+    async def test_browser_cache_cleanup_failure_does_not_block_manual_refresh(self):
+        manager = self.make_task_manager()
+        manager.api_handler.is_session_expired = AsyncMock(return_value=-1)
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.load_credentials",
+            return_value=("user@example.com", "secret"),
+        ), patch(
+            "bdo_marketplace_tools.services.task_manager.clean_disposable_browser_profile_cache",
+            side_effect=OSError("locked"),
+        ) as cleanup, patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ) as browser_auth:
+            await manager.login()
+
+        cleanup.assert_called_once()
+        browser_auth.assert_awaited_once()
+        self.assertTrue(any("Browser cache cleanup skipped" in event for event in manager.events))
+        self.assertTrue(manager.api_handler.login_status)
+        await manager.stop_login_status_checker()
 
     async def test_pa_login_uses_browser_refresh_with_saved_credentials(self):
         manager = self.make_task_manager()
@@ -4855,6 +5191,66 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         # Recovered, so the override is dropped and later checks see the real session.
         self.assertFalse(manager.debug_force_purchase_session_expired)
         self.assertTrue(any("Re-authentication successful" in event for event in manager.events))
+
+    async def test_scheduled_pa_reauth_does_not_clean_browser_cache(self):
+        manager = self.make_task_manager()
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.load_credentials",
+            return_value=("user@example.com", "secret"),
+        ), patch(
+            "bdo_marketplace_tools.services.task_manager.clean_disposable_browser_profile_cache",
+        ) as cleanup, patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ) as browser_auth:
+            recovered = await manager.handle_expired_session()
+
+        self.assertTrue(recovered)
+        cleanup.assert_not_called()
+        browser_auth.assert_awaited_once()
+        await manager.stop_login_status_checker()
+
+    async def test_scheduled_steam_auto_reauth_does_not_clean_browser_cache(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_auto_reauth_enabled = True
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.clean_disposable_browser_profile_cache",
+        ) as cleanup, patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ) as browser_auth:
+            recovered = await manager.handle_expired_session()
+
+        self.assertTrue(recovered)
+        cleanup.assert_not_called()
+        browser_auth.assert_awaited_once()
+        await manager.stop_login_status_checker()
+
+    async def test_buy_retry_reauth_does_not_clean_browser_cache(self):
+        manager = self.make_task_manager()
+        manager.account_mode = STEAM_BROWSER_MODE
+        manager.api_handler.account_mode = STEAM_BROWSER_MODE
+        manager.steam_auto_reauth_enabled = True
+        manager.api_handler.validate_and_save_imported_session = AsyncMock(return_value=True)
+
+        with patch(
+            "bdo_marketplace_tools.services.task_manager.clean_disposable_browser_profile_cache",
+        ) as cleanup, patch(
+            "bdo_marketplace_tools.services.task_manager.acquire_market_cookies",
+            new=AsyncMock(return_value=[{"name": "TradeAuth_Session", "value": "ok"}]),
+        ) as browser_auth:
+            recovered = await manager._recover_purchase_session_for_retry(force_browser_refresh=True)
+
+        self.assertTrue(recovered)
+        cleanup.assert_not_called()
+        browser_auth.assert_awaited_once()
+        await manager.stop_login_status_checker()
 
     async def test_debug_run_session_check_now_reports_valid_when_not_forced(self):
         manager = self.make_task_manager(test_mode_enabled=True)
@@ -6159,6 +6555,9 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app = self.make_app()
         app.task_manager.clear_browser_session_cookies = AsyncMock(return_value=True)
         app.task_manager.reset_steam_initial_setup_status = Mock(return_value=True)
+        app.task_manager.clean_browser_cache_now = AsyncMock(
+            return_value={"removed_bytes": 2 * 1024 * 1024, "failed_paths": 0, "results": ()}
+        )
 
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
@@ -6170,6 +6569,24 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 # scrollable maintenance actions must be brought into view before clicking.
                 app.query_one("#settings-reset-steam").scroll_visible(animate=False)
                 await pilot.pause()
+
+                app.query_one("#settings-cache-threshold-input", Input).value = "321"
+                await pilot.click("#settings-save-cache-limit")
+                await pilot.pause(0.1)
+                self.assertEqual(app.task_manager.browser_cache_cleanup_threshold_mb, 321)
+                self.assertIn(
+                    "Browser cache cleanup limit saved",
+                    str(app.query_one("#settings-maintenance-status", Static).render()),
+                )
+
+                await pilot.click("#settings-clean-cache")
+                await pilot.pause(0.2)
+                app.task_manager.clean_browser_cache_now.assert_awaited_once()
+                self.assertIn(
+                    "Cleaned 2.0 MiB",
+                    str(app.query_one("#settings-maintenance-status", Static).render()),
+                )
+
                 await pilot.click("#settings-reset-steam")
                 await pilot.pause(0.1)
                 app.task_manager.reset_steam_initial_setup_status.assert_called_once()
@@ -6185,6 +6602,32 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                     "Browser cookies cleared",
                     str(app.query_one("#settings-maintenance-status", Static).render()),
                 )
+
+    async def test_app_settings_shows_browser_storage_summary(self):
+        app = self.make_app()
+        app.task_manager.browser_storage_summary = Mock(
+            return_value=BrowserProfileStorageSummary(
+                total_bytes=512 * 1024 * 1024,
+                disposable_bytes=200 * 1024 * 1024,
+                scanned_at=123.0,
+            )
+        )
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.press("1")
+                storage_widget = app.query_one("#settings-browser-storage", Static)
+                console = Console(width=80)
+                with console.capture() as capture:
+                    console.print(storage_widget.render()._renderable)
+                rendered = capture.get()
+
+        self.assertIn("Browser storage", rendered)
+        self.assertIn("512.0 MiB", rendered)
+        self.assertIn("Disposable cache", rendered)
+        self.assertIn("200.0 MiB", rendered)
+        self.assertIn("Auto-clean limit", rendered)
+        self.assertIn("150.0 MiB", rendered)
 
     async def test_single_item_test_monitor_sidebar_controls_use_separate_task(self):
         app = self.make_app(launch_mode="test")

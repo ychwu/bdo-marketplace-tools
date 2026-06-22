@@ -15,6 +15,9 @@ from textual.widgets import Button, Input, Label, ListItem, ListView, RichLog, S
 from bdo_marketplace_tools.market.api_handler import marketplace_silver_balance
 from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET
 from bdo_marketplace_tools.storage.app_settings import ACCOUNT_MODE_LABELS, PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE
+from bdo_marketplace_tools.storage.browser_profile_cache import (
+    format_storage_size,
+)
 from bdo_marketplace_tools.storage.credentials import CredentialStoreError, clear_credentials, load_credentials, save_credentials
 from bdo_marketplace_tools.services.update_checker import RELEASES_URL
 from bdo_marketplace_tools.version import SETTINGS_SCHEMA_VERSION
@@ -153,6 +156,23 @@ class MarketplaceToolsApp(App[None]):
 
     #settings-actions {
         height: auto;
+    }
+
+    #settings-cache-controls {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #settings-cache-threshold-input {
+        width: 12;
+        margin-right: 1;
+    }
+
+    #settings-cache-label {
+        width: auto;
+        margin-right: 1;
+        content-align: center middle;
+        color: __COLOR_TEXT_MUTED__;
     }
 
     .row {
@@ -326,6 +346,10 @@ class MarketplaceToolsApp(App[None]):
         color: __COLOR_TEXT_MUTED__;
         min-height: 1;
         margin-top: 1;
+    }
+
+    #settings-browser-storage {
+        margin-bottom: 1;
     }
 
     .settings-config {
@@ -1148,8 +1172,25 @@ class MarketplaceToolsApp(App[None]):
         await content.mount(
             Static(
                 "Reset saved login state when the marketplace session looks stale or stuck. "
-                "These do not delete your saved Pearl Abyss credentials.",
+                "These do not delete your saved Pearl Abyss credentials. Disposable browser cache "
+                "is cleaned before Refresh Session or Steam Setup once it reaches the saved limit. "
+                "Use 0 MiB to clean at every manual auth open.",
                 classes="settings-note",
+            )
+        )
+        await content.mount(Static(id="settings-browser-storage", classes="settings-config"))
+        await content.mount(
+            Horizontal(
+                Label("Auto-clean limit (MiB)", id="settings-cache-label"),
+                Input(
+                    value=str(self.task_manager.browser_cache_cleanup_threshold_mb),
+                    type="integer",
+                    placeholder="MiB",
+                    id="settings-cache-threshold-input",
+                ),
+                ModalAction("Save Limit", "settings-save-cache-limit"),
+                ModalAction("Clean Cache", "settings-clean-cache"),
+                id="settings-cache-controls",
             )
         )
         await content.mount(
@@ -1227,6 +1268,18 @@ class MarketplaceToolsApp(App[None]):
         config.add_row("Spend cap", format_compact_silver(tm.max_spend))
         try:
             self.query_one("#settings-config-list", Static).update(config)
+        except Exception:
+            pass
+
+        storage = tm.browser_storage_summary()
+        storage_table = Table.grid(padding=(0, 2))
+        storage_table.add_column(style=f"bold {COLOR_TEXT_MUTED}", no_wrap=True)
+        storage_table.add_column()
+        storage_table.add_row("Browser storage", format_storage_size(storage.total_bytes))
+        storage_table.add_row("Disposable cache", format_storage_size(storage.disposable_bytes))
+        storage_table.add_row("Auto-clean limit", tm.browser_cache_cleanup_threshold_label())
+        try:
+            self.query_one("#settings-browser-storage", Static).update(storage_table)
         except Exception:
             pass
 
@@ -1452,6 +1505,8 @@ class MarketplaceToolsApp(App[None]):
             "settings-reset-steam",
             "settings-check-update",
             "settings-toggle-update-startup",
+            "settings-save-cache-limit",
+            "settings-clean-cache",
         }
         if event.action.action_id not in handled:
             return
@@ -1483,6 +1538,15 @@ class MarketplaceToolsApp(App[None]):
             )
         elif action_id == "settings-toggle-update-startup":
             self.toggle_update_startup_check()
+        elif action_id == "settings-save-cache-limit":
+            self.save_browser_cache_limit_from_settings()
+        elif action_id == "settings-clean-cache":
+            self.run_worker(
+                self.clean_browser_cache_from_settings(),
+                name="settings-clean-cache",
+                group="actions",
+                exclusive=True,
+            )
 
     def on_log_filter_option_pressed(self, event: LogFilterOption.Pressed) -> None:
         event.stop()
@@ -2262,6 +2326,50 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_settings_summary()
         self.refresh_credentials_summary()
         self.refresh_live_widgets()
+
+    def save_browser_cache_limit_from_settings(self) -> None:
+        try:
+            value = self.query_one("#settings-cache-threshold-input", Input).value
+            threshold = self.task_manager.set_browser_cache_cleanup_threshold_mb(value)
+        except ValueError as exc:
+            message = str(exc)
+            self.set_settings_maintenance_status(message)
+            self.set_status(message, "warning")
+            return
+        except Exception:
+            message = "Browser cache cleanup limit is not available."
+            self.set_settings_maintenance_status(message)
+            self.set_status(message, "warning")
+            return
+
+        label = self.task_manager.browser_cache_cleanup_threshold_label()
+        try:
+            self.query_one("#settings-cache-threshold-input", Input).value = str(threshold)
+        except Exception:
+            pass
+        message = f"Browser cache cleanup limit saved: {label}."
+        self.set_settings_maintenance_status(message)
+        self.set_status(message, "success")
+        self.refresh_settings_summary()
+
+    async def clean_browser_cache_from_settings(self) -> None:
+        self.set_settings_maintenance_status("Cleaning disposable browser cache...")
+        result = await self.task_manager.clean_browser_cache_now()
+        if result is None:
+            message = "Browser cache cleanup failed. See the event log for details."
+            self.set_status("Browser cache cleanup failed.", "warning")
+        else:
+            removed_bytes = result["removed_bytes"]
+            if removed_bytes:
+                message = f"Cleaned {format_storage_size(removed_bytes)} of disposable browser cache."
+                self.set_status(message, "success")
+            else:
+                message = "No disposable browser cache found to clean."
+                self.set_status(message, "info")
+            if result["failed_paths"]:
+                message += f" {result['failed_paths']} cache path(s) could not be removed."
+        self.set_settings_maintenance_status(message)
+        self.refresh_settings_summary()
 
     def reset_steam_setup_from_settings(self) -> None:
         if self.task_manager.reset_steam_initial_setup_status():
