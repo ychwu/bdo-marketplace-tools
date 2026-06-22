@@ -6,6 +6,33 @@ All notable released changes for `bdo-marketplace-tools` are documented here.
 
 No released changes yet.
 
+## 1.2.1-beta - 2026-06-22
+
+### Added
+
+- Added configurable cleanup for disposable Chrome browser-profile cache before user-initiated session refresh/setup, preserving cookies and browser storage used for login persistence. App Settings now shows storage usage, saves the auto-clean limit, and offers manual cleanup.
+- Added an unread indicator to the dashboard event-log Core/UI tabs when events arrive on the channel that is not currently visible.
+- Added clearer in-browser authentication overlays, including working/manual-action states, page dimming during automation, Steam "Remember me" guidance, and a dedicated saved-credentials-rejected state.
+
+### Changed
+
+- Modernized App Settings into a tighter action-card layout with update/storage controls, a focused danger zone, slimmer settings buttons, shared status text, and less redundant configuration summary content.
+- Reworked the Stats page by removing the redundant refresh action, keeping live session stat tiles, and showing lifetime stats as compact reference values.
+- The auth "please wait" notice now appears on every embedded login/reauth popup with context-aware messages for setup, manual action, rejected credentials, and timeout reasons.
+- Settings schema is now `8` for the browser-cache cleanup preferences.
+
+### Fixed
+
+- Fixed Pearl Abyss saved-credential browser login retry behavior so verification or invalid-credential dialogs stop automation immediately, failed refill attempts do not burn retry budget, and technical retries are bounded.
+- Blocked Pearl Abyss browser refresh when saved PA credentials are missing, with the Session modal marking credentials as required and disabling refresh until credentials are saved.
+- Trimmed Steam browser-auth status noise so repeated click attempts and cookie capture steps do not spam duplicate user-facing events.
+- Fixed test-mode `Expire Session` so it clears the saved/request marketplace session while preserving monitor and buy-mode state for recovery testing.
+- Prevented manual App Settings update checks from writing duplicate UI event-log rows.
+
+### Docs
+
+- Added ignored developer-local operation and timing reference notes for auth, session, monitor, UI controls, and runtime delay ownership.
+
 ## 1.2.0-beta - 2026-06-20
 
 ### Added
