@@ -156,6 +156,7 @@ cython_debug/
 # Legacy in-repo data dir (kept as a migration backup). Live data now lives in the per-user
 # dir resolved by bdo_marketplace_tools/storage/paths.py (%LOCALAPPDATA%\bdo-marketplace-tools).
 data/
+docs/dev/
 .changesets/
 agent/
 agents.md

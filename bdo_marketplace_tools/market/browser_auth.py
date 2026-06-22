@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -81,7 +82,7 @@ PA_AUTO_LOGIN_FILL_TIMEOUT_MS = 1000
 PA_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
 PA_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
 PA_AUTO_LOGIN_RETRY_GRACE_SECONDS = 2.0
-PA_AUTO_LOGIN_MAX_SUBMIT_ATTEMPTS = 3
+PA_AUTO_LOGIN_MAX_TECHNICAL_RETRIES = 2
 PA_LOGIN_FORM_CHECK_TIMEOUT_MS = 150
 PA_CONSENT_BUTTON_READY_TIMEOUT_MS = 250
 BROWSER_AUTH_POLL_SECONDS = 0.25
@@ -113,51 +114,66 @@ STEAM_LOGGED_IN_SELECTORS = (
     "#account_pulldown",
     ".user_avatar",
 )
-# Visible verification-challenge (CAPTCHA) widgets that can appear on the Pearl Abyss / Steam
-# login pages. Detection is deliberately conservative and visibility-gated: it must only fire on
-# an interactive challenge the user has to solve, never on the passive reCAPTCHA v3 badge
-# (`.grecaptcha-badge`), which renders on countless pages with nothing to solve and would be a
-# constant false positive. This is a best-effort starting set; extend it the first time a real
-# challenge selector is observed in the wild (we have no captcha to test against yet).
-AUTH_CHALLENGE_SELECTORS = (
-    "iframe[src*='hcaptcha.com']",
-    ".h-captcha",
-    "iframe[src*='challenges.cloudflare.com']",
-    ".cf-turnstile",
-    ".g-recaptcha",
-    "iframe[src*='recaptcha'][src*='bframe']",
+PA_CREDENTIALS_LOGIN_KEY = "pa_credentials_login"
+PA_LOGIN_PROCESS_PATH = "/en-us/member/login/loginprocess"
+AUTH_DIALOG_VERIFICATION_REQUIRED = "verification_required"
+AUTH_DIALOG_INVALID_CREDENTIALS = "invalid_credentials"
+AUTH_DIALOG_MANUAL_ATTENTION = "manual_attention"
+AUTH_DIALOG_VERIFICATION_MARKERS = (
+    "please complete the verification",
+    "verification",
+    "captcha",
 )
-AUTH_CHALLENGE_DETECTION_TIMEOUT_MS = 150
-# Only the live auth pages can present a challenge the user must solve; never probe the market page.
-AUTH_CHALLENGE_STATES = {"pa", "steam", "otp"}
+AUTH_DIALOG_INVALID_CREDENTIAL_MARKERS = (
+    "please double-check your email and password",
+    "email and password",
+    "double-check",
+    "invalid",
+    "password",
+)
 
 # A purely cosmetic notice injected into the visible browser on EVERY auth pop-up (login / reauth,
-# Steam or PA). It reassures the user not to click while the page loads and the automation drives the
-# login, and can be flipped to a red "manual action required" state via window.__bdoSetupNotice.warn
-# when a captcha appears or auto-login gives up and the user must finish in the window. It is
-# `pointer-events:none` so it can never intercept a click, and add_init_script re-shows it on every
-# navigation in the flow.
+# Steam or PA). It dims + lightly blurs the whole page behind a frosted "Setting up your session"
+# card, making it obvious not to touch the page while the automation drives the login. The dim is a
+# `pointer-events:none` scrim, so it is a visual signal only and never blocks the automation's (or the
+# user's) clicks. add_init_script runs it at document start on every navigation (re-showing it each
+# page), and everything is `pointer-events:none`. The card flips to a red "manual action required"
+# state -- and the scrim lifts so the page is usable -- via _set_setup_notice_warning. NOTE: Patchright
+# runs add_init_script in an isolated world, so the flip must manipulate the shared DOM directly from
+# the main world; it cannot call a function defined here, which is why no window global is exposed.
 SETUP_NOTICE_SCRIPT = r"""
 (() => {
   const ID = '__bdo_setup_notice__';
+  const SCRIM_ID = '__bdo_setup_scrim__';
   const STYLE_ID = '__bdo_setup_notice_style__';
-  const SPIN_ICON = '<span style="box-sizing:border-box;width:15px;height:15px;border-radius:50%;' +
+  const SPIN_ICON = '<span style="box-sizing:border-box;width:18px;height:18px;border-radius:50%;' +
     'border:2px solid rgba(255,145,60,0.3);border-top-color:#ff913c;' +
     'animation:__bdoSetupSpin 0.7s linear infinite;display:inline-block;"></span>';
-  const WARN_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#ff6b5e" ' +
-    'stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:block;">' +
-    '<path d="M12 9v4"/><path d="M12 17h.01"/>' +
-    '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></svg>';
   const ensureStyle = () => {
     if (document.getElementById(STYLE_ID)) return;
     const st = document.createElement('style');
     st.id = STYLE_ID;
-    st.textContent = '@keyframes __bdoSetupSpin{to{transform:rotate(360deg)}}';
+    st.textContent =
+      '@keyframes __bdoSetupSpin{to{transform:rotate(360deg)}}' +
+      '@keyframes __bdoSetupGlow{0%,100%{box-shadow:0 0 0 1px rgba(255,145,60,.4),0 0 20px rgba(255,145,60,.16),0 16px 44px rgba(0,0,0,.55)}50%{box-shadow:0 0 0 1px rgba(255,145,60,.72),0 0 42px rgba(255,145,60,.4),0 16px 44px rgba(0,0,0,.55)}}' +
+      '@keyframes __bdoSetupGlowRed{0%,100%{box-shadow:0 0 0 1px rgba(255,95,85,.5),0 0 22px rgba(255,95,85,.2),0 16px 44px rgba(0,0,0,.55)}50%{box-shadow:0 0 0 1px rgba(255,95,85,.85),0 0 46px rgba(255,95,85,.46),0 16px 44px rgba(0,0,0,.55)}}';
     (document.head || document.documentElement).appendChild(st);
   };
-  const paint = (accent, border, icon, title, body) => {
+  const showSetup = () => {
     if (!document.body) return;
     ensureStyle();
+    let scrim = document.getElementById(SCRIM_ID);
+    if (!scrim) {
+      scrim = document.createElement('div');
+      scrim.id = SCRIM_ID;
+      scrim.setAttribute('style', [
+        'position:fixed','inset:0','z-index:2147483646','pointer-events:none',
+        'background:rgba(8,9,14,0.5)','backdrop-filter:blur(3px)','-webkit-backdrop-filter:blur(3px)',
+        'opacity:0','transition:opacity .35s ease'
+      ].join(';'));
+      document.body.appendChild(scrim);
+      requestAnimationFrame(() => { scrim.style.opacity = '1'; });
+    }
     let card = document.getElementById(ID);
     if (!card) {
       card = document.createElement('div');
@@ -165,42 +181,39 @@ SETUP_NOTICE_SCRIPT = r"""
       card.setAttribute('style', [
         'position:fixed','top:20px','left:50%','transform:translateX(-50%)',
         'z-index:2147483647','pointer-events:none','box-sizing:border-box',
-        'max-width:520px','width:calc(100% - 32px)','padding:14px 24px',
-        'border-radius:14px','background:#141414','color:#cfccc4','text-align:center',
-        "font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
-        'box-shadow:0 8px 26px rgba(0,0,0,0.45)',
+        'max-width:440px','width:calc(100% - 32px)','padding:15px 18px',
+        'border-radius:16px','border:1px solid rgba(255,145,60,0.4)',
+        'background:rgba(17,17,21,0.66)','backdrop-filter:blur(14px)','-webkit-backdrop-filter:blur(14px)',
+        'color:#e6e3dc',"font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
+        'animation:__bdoSetupGlow 2s ease-in-out infinite',
         'opacity:0','transition:opacity .4s ease'
       ].join(';'));
       document.body.appendChild(card);
       requestAnimationFrame(() => { card.style.opacity = '1'; });
     }
-    card.style.border = '1px solid ' + border;
     card.innerHTML =
-      '<div style="display:flex;align-items:center;justify-content:center;gap:10px;">' +
-        icon +
-        '<span style="font-size:15px;font-weight:600;color:' + accent + ';letter-spacing:.2px;">' +
-          title +
-        '</span>' +
-      '</div>' +
-      '<div style="font-size:13px;font-weight:400;margin-top:6px;opacity:.92;line-height:1.5;">' +
-        body +
+      '<div style="display:flex;align-items:center;gap:13px;text-align:left;">' +
+        '<div style="width:36px;height:36px;border-radius:10px;background:rgba(255,145,60,0.18);' +
+          'display:flex;align-items:center;justify-content:center;flex:none;">' + SPIN_ICON + '</div>' +
+        '<div>' +
+          '<div style="font-size:15px;font-weight:600;color:#ffb37a;letter-spacing:.2px;">' +
+            'Setting up your session' +
+          '</div>' +
+          '<div style="font-size:12.5px;font-weight:400;color:#e6e3dc;opacity:.85;margin-top:2px;line-height:1.45;">' +
+            'The app is signing you in — please don’t click anything. It finishes on its own.' +
+          '</div>' +
+        '</div>' +
       '</div>';
-  };
-  const showSetup = () => {
-    paint('#ff913c', '#2e2e2e', SPIN_ICON, 'Setup in progress',
-      'This might take a little. Please don’t click anything — it will finish on its own.');
-  };
-  window.__bdoSetupNotice = {
-    warn: (message) => paint('#ff6b5e', '#4a2b27', WARN_ICON, 'Manual action required',
-      message || 'Action is needed in this window to continue.')
   };
   if (document.body) showSetup();
   else document.addEventListener('DOMContentLoaded', showSetup);
 })();
 """
 
-SETUP_NOTICE_CAPTCHA_MESSAGE = "Solve the verification in this window to continue."
-SETUP_NOTICE_MANUAL_LOGIN_MESSAGE = "Finish signing in to this window to continue."
+SETUP_NOTICE_CAPTCHA_MESSAGE = "Please complete verification in this window to continue."
+SETUP_NOTICE_MANUAL_LOGIN_MESSAGE = "Please log in manually in this window to continue."
+SETUP_NOTICE_INVALID_CREDENTIALS_MESSAGE = "Saved email/password were rejected. Update credentials in the app, then refresh again."
+SETUP_NOTICE_STEAM_LOGIN_MESSAGE = 'Log in to Steam, and check "Remember me" so you stay signed in.'
 
 
 async def _inject_setup_notice(context):
@@ -214,16 +227,221 @@ async def _inject_setup_notice(context):
         pass
 
 
+# Self-contained main-world flip to the red "manual action required" state: it lifts the dim/blur
+# scrim (the page is now the user's to act on) and recolors the box. It manipulates the shared DOM
+# directly (find-or-create the box by id) rather than calling into SETUP_NOTICE_SCRIPT, which runs in
+# Patchright's isolated world and is therefore unreachable from page.evaluate.
+SETUP_NOTICE_WARN_SCRIPT = r"""
+(message) => {
+  const ID = '__bdo_setup_notice__';
+  const SCRIM_ID = '__bdo_setup_scrim__';
+  const STYLE_ID = '__bdo_setup_notice_style__';
+  if (!document.body) return;
+  if (!document.getElementById(STYLE_ID)) {
+    const st = document.createElement('style');
+    st.id = STYLE_ID;
+    st.textContent =
+      '@keyframes __bdoSetupSpin{to{transform:rotate(360deg)}}' +
+      '@keyframes __bdoSetupGlow{0%,100%{box-shadow:0 0 0 1px rgba(255,145,60,.4),0 0 20px rgba(255,145,60,.16),0 16px 44px rgba(0,0,0,.55)}50%{box-shadow:0 0 0 1px rgba(255,145,60,.72),0 0 42px rgba(255,145,60,.4),0 16px 44px rgba(0,0,0,.55)}}' +
+      '@keyframes __bdoSetupGlowRed{0%,100%{box-shadow:0 0 0 1px rgba(255,95,85,.5),0 0 22px rgba(255,95,85,.2),0 16px 44px rgba(0,0,0,.55)}50%{box-shadow:0 0 0 1px rgba(255,95,85,.85),0 0 46px rgba(255,95,85,.46),0 16px 44px rgba(0,0,0,.55)}}';
+    (document.head || document.documentElement).appendChild(st);
+  }
+  const scrim = document.getElementById(SCRIM_ID);
+  if (scrim) scrim.remove();
+  let card = document.getElementById(ID);
+  if (!card) {
+    card = document.createElement('div');
+    card.id = ID;
+    document.body.appendChild(card);
+  }
+  card.setAttribute('style', [
+    'position:fixed','top:20px','left:50%','transform:translateX(-50%)',
+    'z-index:2147483647','pointer-events:none','box-sizing:border-box',
+    'max-width:440px','width:calc(100% - 32px)','padding:15px 18px',
+    'border-radius:16px','border:1px solid rgba(255,95,85,0.45)',
+    'background:rgba(22,14,14,0.68)','backdrop-filter:blur(14px)','-webkit-backdrop-filter:blur(14px)',
+    'color:#ecdfdc',"font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
+    'animation:__bdoSetupGlowRed 1.6s ease-in-out infinite','opacity:1'
+  ].join(';'));
+  var ICON = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff6b5e" ' +
+    'stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:block;">' +
+    '<path d="M12 9v4"/><path d="M12 17h.01"/>' +
+    '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></svg>';
+  card.innerHTML =
+    '<div style="display:flex;align-items:center;gap:13px;text-align:left;">' +
+      '<div style="width:36px;height:36px;border-radius:10px;background:rgba(255,95,85,0.18);' +
+        'display:flex;align-items:center;justify-content:center;flex:none;">' + ICON + '</div>' +
+      '<div>' +
+        '<div style="font-size:15px;font-weight:600;color:#ff8a7e;letter-spacing:.2px;">Manual action required</div>' +
+        '<div style="font-size:12.5px;font-weight:400;color:#ecdfdc;opacity:.9;margin-top:2px;line-height:1.45;">' +
+        (message || 'Action is needed in this window to continue.') +
+        '</div>' +
+      '</div>' +
+    '</div>';
+}
+"""
+
+
 async def _set_setup_notice_warning(page, message):
-    # Flip the in-page notice to its "manual action required" state. Best-effort and never raises;
-    # the notice is cosmetic and must not affect the auth flow.
+    # Flip the in-page notice to its "manual action required" state. Best-effort and never raises; the
+    # notice is cosmetic and must not affect the auth flow. Runs in the main world (see
+    # SETUP_NOTICE_WARN_SCRIPT) so it works regardless of the isolated world add_init_script uses.
     evaluate = getattr(page, "evaluate", None)
     if not callable(evaluate):
         return
     try:
-        await evaluate("(m) => { if (window.__bdoSetupNotice) { window.__bdoSetupNotice.warn(m); } }", message)
+        await evaluate(SETUP_NOTICE_WARN_SCRIPT, message)
     except Exception:
         pass
+
+
+async def _maybe_await(value):
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _new_auth_dialog_state():
+    return {
+        "attached_pages": set(),
+        "records": [],
+        "manual_attention": None,
+        "reported": set(),
+    }
+
+
+def _sanitize_dialog_message(message):
+    message = "" if message is None else str(message)
+    message = re.sub(r"[\w.+-]+@[\w.-]+", "[email]", message)
+    message = re.sub(r"\s+", " ", message).strip()
+    return message[:300]
+
+
+def _classify_auth_dialog_message(message):
+    normalized = _sanitize_dialog_message(message).lower()
+    if not normalized:
+        return None
+    if any(marker in normalized for marker in AUTH_DIALOG_VERIFICATION_MARKERS):
+        return AUTH_DIALOG_VERIFICATION_REQUIRED
+    if any(marker in normalized for marker in AUTH_DIALOG_INVALID_CREDENTIAL_MARKERS):
+        return AUTH_DIALOG_INVALID_CREDENTIALS
+    return None
+
+
+def _auth_dialog_status_message(category):
+    if category == AUTH_DIALOG_VERIFICATION_REQUIRED:
+        return "Pearl Abyss verification is required. Complete it manually in the browser."
+    if category == AUTH_DIALOG_INVALID_CREDENTIALS:
+        return "Pearl Abyss rejected the saved email/password. Update saved credentials before refreshing again."
+    return "Pearl Abyss login needs manual attention. Complete login manually in the browser."
+
+
+def _auth_dialog_notice_message(category):
+    if category == AUTH_DIALOG_VERIFICATION_REQUIRED:
+        return SETUP_NOTICE_CAPTCHA_MESSAGE
+    if category == AUTH_DIALOG_INVALID_CREDENTIALS:
+        return SETUP_NOTICE_INVALID_CREDENTIALS_MESSAGE
+    return SETUP_NOTICE_MANUAL_LOGIN_MESSAGE
+
+
+def _record_auth_dialog(dialog_state, message, dialog_type=None):
+    sanitized = _sanitize_dialog_message(message)
+    category = _classify_auth_dialog_message(sanitized)
+    record = {
+        "message": sanitized,
+        "type": "" if dialog_type is None else str(dialog_type),
+        "category": category or AUTH_DIALOG_MANUAL_ATTENTION,
+    }
+    dialog_state["records"].append(record)
+    if category is not None:
+        dialog_state["manual_attention"] = record
+    return record
+
+
+async def _accept_or_dismiss_dialog(dialog):
+    accept = getattr(dialog, "accept", None)
+    if callable(accept):
+        try:
+            await _maybe_await(accept())
+            return
+        except Exception:
+            pass
+
+    dismiss = getattr(dialog, "dismiss", None)
+    if callable(dismiss):
+        try:
+            await _maybe_await(dismiss())
+        except Exception:
+            pass
+
+
+async def _handle_auth_dialog(dialog, dialog_state):
+    message = getattr(dialog, "message", "")
+    if callable(message):
+        try:
+            message = message()
+        except Exception:
+            message = ""
+    dialog_type = getattr(dialog, "type", "")
+    if callable(dialog_type):
+        try:
+            dialog_type = dialog_type()
+        except Exception:
+            dialog_type = ""
+    _record_auth_dialog(dialog_state, message, dialog_type)
+    await _accept_or_dismiss_dialog(dialog)
+
+
+def _install_auth_dialog_page_handler(page, dialog_state):
+    if page is None:
+        return
+    page_id = id(page)
+    if page_id in dialog_state["attached_pages"]:
+        return
+    page_on = getattr(page, "on", None)
+    if not callable(page_on):
+        return
+
+    def _on_dialog(dialog):
+        asyncio.ensure_future(_handle_auth_dialog(dialog, dialog_state))
+
+    try:
+        page_on("dialog", _on_dialog)
+    except Exception:
+        return
+    dialog_state["attached_pages"].add(page_id)
+
+
+def _install_auth_dialog_handlers(context, dialog_state):
+    for page in getattr(context, "pages", []) or []:
+        _install_auth_dialog_page_handler(page, dialog_state)
+
+    if dialog_state.get("context_attached"):
+        return
+
+    context_on = getattr(context, "on", None)
+    if not callable(context_on):
+        return
+
+    def _on_page(page):
+        _install_auth_dialog_page_handler(page, dialog_state)
+
+    try:
+        context_on("page", _on_page)
+    except Exception:
+        return
+    dialog_state["context_attached"] = True
+
+
+async def _maybe_emit_auth_dialog_manual_attention(dialog_state, status_callback=None):
+    record = (dialog_state or {}).get("manual_attention")
+    if not record:
+        return False
+    key = (record.get("category"), record.get("message"))
+    if key not in dialog_state["reported"]:
+        dialog_state["reported"].add(key)
+        await _emit_status(status_callback, _auth_dialog_status_message(record.get("category")), "warning")
+    return True
 
 
 class BrowserAuthError(RuntimeError):
@@ -271,10 +489,12 @@ async def acquire_market_cookies(
             context = await _launch_persistent_chrome_context(playwright, profile_path)
             try:
                 page = context.pages[0] if context.pages else await context.new_page()
+                auth_dialog_state = _new_auth_dialog_state()
+                _install_auth_dialog_handlers(context, auth_dialog_state)
                 # Non-blocking notice on every auth pop-up so the user doesn't click into the page
                 # while it loads / the automation drives login. Added before the first navigation so
                 # add_init_script re-shows it on every page; it flips to a "manual action required"
-                # warning (see _set_setup_notice_warning) on a captcha or when auto-login gives up.
+                # warning (see _set_setup_notice_warning) when PA asks for manual attention or auto-login gives up.
                 await _inject_setup_notice(context)
                 if bootstrap_url:
                     await _bootstrap_browser_profile(page, status_callback, bootstrap_url, account_label)
@@ -293,6 +513,7 @@ async def acquire_market_cookies(
                     handle_pa_cookie_consent=handle_pa_cookie_consent,
                     pa_cookie_consent_callback=pa_cookie_consent_callback,
                     account_label=account_label,
+                    auth_dialog_state=auth_dialog_state,
                 )
             finally:
                 await _close_browser_context(context, status_callback)
@@ -334,6 +555,9 @@ async def prepare_steam_browser_profile(
         async with async_playwright() as playwright:
             context = await _launch_persistent_chrome_context(playwright, profile_path)
             page = context.pages[0] if context.pages else await context.new_page()
+            # "Setup in progress" notice while the BDO site + cookie consent load; it flips to the
+            # Steam login reminder (see _wait_for_steam_profile_login) once the Steam login page is up.
+            await _inject_setup_notice(context)
             try:
                 await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
                 consent_result = await _accept_required_cookie_consent_if_available(page, status_callback)
@@ -507,6 +731,7 @@ async def _wait_for_market_cookies(
     handle_pa_cookie_consent=False,
     pa_cookie_consent_callback=None,
     account_label="Steam Account",
+    auth_dialog_state=None,
 ):
     deadline = asyncio.get_running_loop().time() + float(timeout_seconds)
     callback_seen = False
@@ -514,6 +739,8 @@ async def _wait_for_market_cookies(
     emitted_states = set()
     auto_login_state = _new_steam_auto_login_state()
     pa_auto_login_state = _new_pa_auto_login_state()
+    auth_dialog_state = auth_dialog_state or _new_auth_dialog_state()
+    _install_auth_dialog_handlers(context, auth_dialog_state)
     pa_cookie_consent_state = _new_pa_cookie_consent_state()
     pa_cookie_consent_completed = not handle_pa_cookie_consent
     pa_credentials_auto_stopped = False
@@ -544,6 +771,10 @@ async def _wait_for_market_cookies(
         except Exception:
             pass
 
+    def _on_request(request):
+        if _is_pa_login_process_request(request):
+            _record_pa_login_process_submit(pa_auto_login_state)
+
     def _on_response(response):
         _state, is_callback = _classify_url(getattr(response, "url", ""))
         if is_callback:
@@ -551,16 +782,15 @@ async def _wait_for_market_cookies(
 
     context_on = getattr(context, "on", None)
     if callable(context_on):
+        context_on("request", _on_request)
         context_on("response", _on_response)
 
     async def _poll_loop():
         nonlocal callback_seen, auth_flow_seen, pa_credentials_auto_stopped
         nonlocal pa_cookie_consent_completed
-        # A verification challenge (CAPTCHA) blocks login until a human solves it. Track it so the
-        # warning is emitted once per appearance (edge-triggered) and the timeout message can say
-        # verification was never completed instead of giving a generic "no cookies" error.
-        challenge_notified = False
-        challenge_ever_seen = False
+        # Track whether automatic login gave up and handed off to the user, so the timeout message can
+        # say the login was never finished manually instead of giving a generic "no cookies" error.
+        manual_login_seen = False
         while asyncio.get_running_loop().time() < deadline:
             now = asyncio.get_running_loop().time()
             pages = [page for page in context.pages if not _page_is_closed(page)]
@@ -568,8 +798,8 @@ async def _wait_for_market_cookies(
                 raise BrowserAuthError("Browser closed before a marketplace session could be captured.")
 
             market_active = False
-            challenge_active = False
             for page in pages:
+                _install_auth_dialog_page_handler(page, auth_dialog_state)
                 state, is_callback = _classify_url(getattr(page, "url", ""))
                 if is_callback:
                     callback_seen = True
@@ -582,14 +812,12 @@ async def _wait_for_market_cookies(
                     message, level = _status_for_state(state)
                     await _emit_status(status_callback, message, level)
 
-                # If a CAPTCHA/challenge is on screen, stop the automation from poking the page
-                # (clicking login / submitting credentials on an active anti-bot challenge is the
-                # worst time to keep acting) and let the visible window wait for the human.
-                page_challenge = await _auth_challenge_visible(page, state)
-                if page_challenge:
-                    challenge_active = True
-                    challenge_ever_seen = True
-                    await _set_setup_notice_warning(page, SETUP_NOTICE_CAPTCHA_MESSAGE)
+                if await _maybe_emit_auth_dialog_manual_attention(auth_dialog_state, status_callback):
+                    pa_credentials_auto_stopped = True
+                    manual_login_seen = True
+                    record = auth_dialog_state.get("manual_attention") or {}
+                    await _set_setup_notice_warning(page, _auth_dialog_notice_message(record.get("category")))
+
                 pa_cookie_consent_result = COOKIE_CONSENT_SKIPPED
                 if not pa_cookie_consent_completed:
                     pa_cookie_consent_result = await _maybe_prepare_pa_cookie_consent(
@@ -603,7 +831,8 @@ async def _wait_for_market_cookies(
                         await _emit_callback(pa_cookie_consent_callback, True)
 
                 auto_login_result = STEAM_AUTO_LOGIN_SKIPPED
-                if not page_challenge and _should_attempt_steam_auto_login(state, auth_flow_seen, callback_seen):
+                manual_attention_pending = bool(auth_dialog_state.get("manual_attention"))
+                if not manual_attention_pending and _should_attempt_steam_auto_login(state, auth_flow_seen, callback_seen):
                     if pa_cookie_consent_result == COOKIE_CONSENT_MANUAL:
                         auto_login_result = STEAM_AUTO_LOGIN_WAITING
                     else:
@@ -618,9 +847,10 @@ async def _wait_for_market_cookies(
                 if auto_login_result in {STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_MANUAL_NEEDED}:
                     auth_flow_seen = True
                 if auto_login_result == STEAM_AUTO_LOGIN_MANUAL_NEEDED:
+                    manual_login_seen = True
                     await _set_setup_notice_warning(page, SETUP_NOTICE_MANUAL_LOGIN_MESSAGE)
                 pa_login_result = PA_AUTO_LOGIN_SKIPPED
-                if not pa_credentials_auto_stopped and not page_challenge:
+                if not pa_credentials_auto_stopped:
                     pa_login_result = await _maybe_run_pa_credentials_login(
                         page,
                         state,
@@ -628,6 +858,7 @@ async def _wait_for_market_cookies(
                         email=pa_email,
                         password=pa_password,
                         tracking=pa_auto_login_state,
+                        dialog_state=auth_dialog_state,
                         status_callback=status_callback,
                         now=now,
                     )
@@ -635,15 +866,8 @@ async def _wait_for_market_cookies(
                     auth_flow_seen = True
                 if pa_login_result == PA_AUTO_LOGIN_MANUAL_NEEDED:
                     pa_credentials_auto_stopped = True
+                    manual_login_seen = True
                     await _set_setup_notice_warning(page, SETUP_NOTICE_MANUAL_LOGIN_MESSAGE)
-
-            # Edge-triggered: announce a challenge once when it appears, and re-arm when it clears
-            # so a second, later challenge is announced again rather than swallowed.
-            if challenge_active and not challenge_notified:
-                challenge_notified = True
-                await _emit_status(status_callback, _auth_challenge_message(account_label), "warning")
-            elif not challenge_active:
-                challenge_notified = False
 
             cookies = filter_market_cookies(await context.cookies(list(MARKET_COOKIE_URLS)))
             if _market_cookie_capture_ready(cookies, baseline_session_values, callback_seen, market_active, auth_flow_seen):
@@ -651,12 +875,16 @@ async def _wait_for_market_cookies(
 
             await asyncio.sleep(BROWSER_AUTH_POLL_SECONDS)
 
-        if challenge_ever_seen:
+        if manual_login_seen:
             raise BrowserAuthError(
-                f"{account_label} browser session timed out before verification was completed. "
-                "Complete the CAPTCHA/verification in the browser, then refresh the session again."
+                f"{account_label} browser session timed out before login was completed. Automatic login "
+                "could not finish, and the login was not completed manually in the browser window in time. "
+                "Refresh the session and finish the login when the window opens."
             )
-        raise BrowserAuthError(f"{account_label} browser session timed out before Central Market cookies were captured.")
+        raise BrowserAuthError(
+            f"{account_label} browser session timed out before the marketplace session was captured. "
+            "The login did not complete in time — refresh the session to try again."
+        )
 
     # Run the polling loop and the OAuth-callback capture concurrently and finish on whichever
     # lands first. The callback capture can complete while the poll loop is parked in a slow,
@@ -785,6 +1013,11 @@ async def _wait_for_steam_profile_login(context, status_callback, timeout_second
                 await _emit_status(status_callback, "Steam login detected in the browser profile.", "info")
                 return
 
+        # Not logged in yet: flip the in-page notice to remind the user to log in and tick
+        # "Remember me" so the Steam session persists and re-auth can stay automatic.
+        for page in pages:
+            await _set_setup_notice_warning(page, SETUP_NOTICE_STEAM_LOGIN_MESSAGE)
+
         await asyncio.sleep(STEAM_PROFILE_SETUP_POLL_SECONDS)
 
     raise BrowserAuthError("Steam setup timed out before Steam login was detected.")
@@ -835,9 +1068,11 @@ def _new_pa_auto_login_state():
     return {
         "pending": {},
         "attempts": {},
+        "network_submit_count": {},
+        "network_count_at_click": {},
+        "technical_retries": {},
         "missing_started_at": {},
         "missing_reported": set(),
-        "retry_reported": set(),
         "manual_reported": set(),
     }
 
@@ -846,6 +1081,28 @@ def _new_pa_cookie_consent_state():
     return {
         "checked": set(),
     }
+
+
+def _is_pa_login_process_url(url):
+    parsed = urlparse(str(url or ""))
+    return parsed.path.lower() == PA_LOGIN_PROCESS_PATH
+
+
+def _is_pa_login_process_request(request):
+    method = getattr(request, "method", "")
+    if callable(method):
+        try:
+            method = method()
+        except Exception:
+            method = ""
+    if str(method or "").upper() != "POST":
+        return False
+    return _is_pa_login_process_url(getattr(request, "url", ""))
+
+
+def _record_pa_login_process_submit(tracking):
+    key = PA_CREDENTIALS_LOGIN_KEY
+    tracking["network_submit_count"][key] = tracking["network_submit_count"].get(key, 0) + 1
 
 
 def _should_attempt_steam_auto_login(state, auth_flow_seen, callback_seen):
@@ -976,12 +1233,16 @@ async def _maybe_run_pa_credentials_login(
     email,
     password,
     tracking,
+    dialog_state=None,
     status_callback=None,
     now=None,
     missing_notice_seconds=PA_AUTO_LOGIN_MISSING_NOTICE_SECONDS,
 ):
     if not enabled or not email or not password:
         return PA_AUTO_LOGIN_DISABLED
+
+    if dialog_state is not None and await _maybe_emit_auth_dialog_manual_attention(dialog_state, status_callback):
+        return PA_AUTO_LOGIN_MANUAL_NEEDED
 
     targets = _pa_credentials_login_targets(page, state)
     if not targets:
@@ -995,6 +1256,7 @@ async def _maybe_run_pa_credentials_login(
             email,
             password,
             tracking=tracking,
+            dialog_state=dialog_state,
             status_callback=status_callback,
             now=now,
             missing_notice_seconds=missing_notice_seconds,
@@ -1013,35 +1275,46 @@ async def _maybe_run_pa_credentials_login_target(
     password,
     *,
     tracking,
+    dialog_state,
     status_callback,
     now,
     missing_notice_seconds,
 ):
-    key = (id(scope), "pa_credentials_login")
+    key = PA_CREDENTIALS_LOGIN_KEY
+    if dialog_state is not None and await _maybe_emit_auth_dialog_manual_attention(dialog_state, status_callback):
+        return PA_AUTO_LOGIN_MANUAL_NEEDED
+
     pending_since = tracking["pending"].get(key)
-    if pending_since is not None:
+    is_retry = pending_since is not None
+    if is_retry:
         if now - pending_since < PA_AUTO_LOGIN_RETRY_GRACE_SECONDS:
             return PA_AUTO_LOGIN_WAITING
         if not await _pa_login_form_visible(scope):
             return PA_AUTO_LOGIN_WAITING
         if not await _pa_password_field_empty(scope):
             return PA_AUTO_LOGIN_WAITING
-        if tracking["attempts"].get(key, 0) >= PA_AUTO_LOGIN_MAX_SUBMIT_ATTEMPTS:
+
+        retries_used = tracking["technical_retries"].get(key, 0)
+        if retries_used >= PA_AUTO_LOGIN_MAX_TECHNICAL_RETRIES:
             if key not in tracking["manual_reported"]:
                 tracking["manual_reported"].add(key)
                 await _emit_status(
                     status_callback,
-                    "Pearl Abyss login did not progress after saved credentials were submitted. Continue manually in the browser.",
+                    "Pearl Abyss login returned to the login page after saved credentials were submitted. Auto-login paused; complete login manually or update saved credentials.",
                     "warning",
                 )
             return PA_AUTO_LOGIN_MANUAL_NEEDED
-        retry_key = (key, tracking["attempts"].get(key, 0))
-        if retry_key not in tracking["retry_reported"]:
-            tracking["retry_reported"].add(retry_key)
-            await _emit_status(
-                status_callback,
-                "Pearl Abyss login returned to the login page; retrying saved credentials.",
-                "warning",
+
+        network_seen = tracking["network_submit_count"].get(key, 0) > tracking["network_count_at_click"].get(key, 0)
+        retry_number = retries_used + 1
+        retry_message = (
+            f"Pearl Abyss login did not submit cleanly; retrying saved credentials "
+            f"({retry_number}/{PA_AUTO_LOGIN_MAX_TECHNICAL_RETRIES})."
+        )
+        if network_seen:
+            retry_message = (
+                f"Pearl Abyss login returned to the login page; retrying saved credentials "
+                f"({retry_number}/{PA_AUTO_LOGIN_MAX_TECHNICAL_RETRIES})."
             )
 
     credentials_filled = await _fill_pa_credentials(scope, email, password)
@@ -1051,7 +1324,13 @@ async def _maybe_run_pa_credentials_login_target(
         timeout=PA_AUTO_LOGIN_CLICK_TIMEOUT_MS,
     ):
         tracking["attempts"][key] = tracking["attempts"].get(key, 0) + 1
+        # Count a technical retry only once a resubmit actually goes out, so a failed retry-fill
+        # doesn't burn the retry budget and jump straight to manual hand-off.
+        if is_retry:
+            tracking["technical_retries"][key] = tracking["technical_retries"].get(key, 0) + 1
+            await _emit_status(status_callback, retry_message, "warning")
         tracking["pending"][key] = now
+        tracking["network_count_at_click"][key] = tracking["network_submit_count"].get(key, 0)
         tracking["missing_started_at"].pop(key, None)
         if tracking["attempts"][key] == 1:
             await _emit_status(status_callback, "Automatic Pearl Abyss login submitted saved credentials.", "info")
@@ -1233,20 +1512,6 @@ async def _selector_visible(page, selectors, timeout):
         except Exception:
             continue
     return False
-
-
-async def _auth_challenge_visible(page, state):
-    if state not in AUTH_CHALLENGE_STATES:
-        return False
-    return await _selector_visible(page, AUTH_CHALLENGE_SELECTORS, timeout=AUTH_CHALLENGE_DETECTION_TIMEOUT_MS)
-
-
-def _auth_challenge_message(account_label):
-    return (
-        f"Verification challenge (CAPTCHA) detected on the {account_label} login page. "
-        "Automatic login is paused — complete the verification in the open browser window. "
-        "Login will continue automatically once it is solved."
-    )
 
 
 async def _fill_first_available_selector(page, selectors, value, timeout):
