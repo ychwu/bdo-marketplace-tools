@@ -154,24 +154,32 @@ class MarketplaceToolsApp(App[None]):
         margin-bottom: 1;
     }
 
-    #settings-actions {
-        height: auto;
-    }
-
-    #settings-cache-controls {
-        height: auto;
-        margin-bottom: 1;
+    #settings-about {
+        margin-bottom: 0;
     }
 
     #settings-cache-threshold-input {
-        width: 12;
+        width: 8;
+        height: 3;
         margin-right: 1;
+        border: round #d8d3c8;
+        background: transparent;
+        color: #d8d3c8;
+        padding: 0 1;
     }
 
-    #settings-cache-label {
-        width: auto;
-        margin-right: 1;
-        content-align: center middle;
+    #settings-cache-threshold-input:focus {
+        border: round #d8d3c8;
+        background: transparent;
+        color: #d8d3c8;
+    }
+
+    #settings-cache-threshold-input > .input--cursor {
+        background: #d8d3c8;
+        color: #111111;
+    }
+
+    #settings-cache-threshold-input > .input--placeholder {
         color: __COLOR_TEXT_MUTED__;
     }
 
@@ -336,30 +344,74 @@ class MarketplaceToolsApp(App[None]):
         background: transparent;
     }
 
+    .action-card {
+        height: auto;
+        border: round #3a3a3a;
+        border-title-color: #d8d3c8;
+        border-title-style: bold;
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+
+    #settings-update-card, #settings-storage-card {
+        margin-bottom: 0;
+    }
+
+    .action-card-info {
+        width: 1fr;
+        height: 3;
+        content-align: left middle;
+    }
+
+    .action-card-line {
+        width: 1fr;
+        height: 1;
+        content-align: left middle;
+        margin-bottom: 1;
+    }
+
+    .action-card-spacer {
+        width: 1fr;
+        height: 1;
+    }
+
+    #settings-storage-card, #settings-danger-card {
+        padding: 1 1;
+    }
+
+    .danger-card {
+        border: round __COLOR_ERROR__;
+        border-title-color: __COLOR_ERROR__;
+    }
+
+    .cache-controls-row, .danger-actions-row {
+        height: 3;
+    }
+
+    .cache-inline-label {
+        width: auto;
+        height: 3;
+        content-align: center middle;
+        color: __COLOR_TEXT_MUTED__;
+        margin-right: 1;
+    }
+
+    .modal-action-compact {
+        width: auto;
+        min-width: 10;
+        padding: 0 2;
+    }
+
     .settings-section-title {
         color: __COLOR_BRAND__;
         text-style: bold;
         margin-bottom: 1;
     }
 
-    #settings-maintenance-status {
+    #settings-status {
         color: __COLOR_TEXT_MUTED__;
         min-height: 1;
-        margin-top: 1;
-    }
-
-    #settings-browser-storage {
-        margin-bottom: 1;
-    }
-
-    .settings-config {
-        margin-bottom: 1;
-    }
-
-    #settings-update-status {
-        color: __COLOR_TEXT_MUTED__;
-        min-height: 1;
-        margin-top: 1;
+        margin-top: 0;
         margin-bottom: 1;
     }
 
@@ -636,6 +688,18 @@ class MarketplaceToolsApp(App[None]):
         if message and level:
             self.task_manager.add_event(message, level, channel="ui")
         self.refresh_live_widgets()
+
+    def on_click(self, event) -> None:
+        focused = self.focused
+        if not isinstance(focused, Input) or focused.id != "settings-cache-threshold-input":
+            return
+
+        node = getattr(event, "widget", None) or getattr(event, "target", None)
+        while node is not None:
+            if node is focused:
+                return
+            node = getattr(node, "parent", None)
+        focused.blur()
 
     def query_visible_one(self, selector: str, expect_type=None):
         screens = list(reversed(self.screen_stack))
@@ -1141,22 +1205,8 @@ class MarketplaceToolsApp(App[None]):
             pass
 
     async def mount_settings(self, content: Container) -> None:
-        await content.mount(Static("About", classes="settings-section-title"))
         await content.mount(Static(id="settings-about", classes="settings-note"))
 
-        await content.mount(Static("Updates", classes="settings-section-title"))
-        await content.mount(
-            Horizontal(
-                Static(id="settings-update", classes="stats-tile"),
-                ModalAction("Check Now", "settings-check-update"),
-                ModalAction("Startup: On", "settings-toggle-update-startup"),
-                id="settings-update-row",
-                classes="stats-row",
-            )
-        )
-        await content.mount(Static("", id="settings-update-status"))
-
-        await content.mount(Static("Account", classes="settings-section-title"))
         await content.mount(
             Horizontal(
                 Static(id="settings-account", classes="stats-tile"),
@@ -1165,43 +1215,68 @@ class MarketplaceToolsApp(App[None]):
             )
         )
 
-        await content.mount(Static("Configuration", classes="settings-section-title"))
-        await content.mount(Static(id="settings-config-list", classes="settings-config"))
+        await content.mount(
+            Horizontal(
+                Static(id="settings-update", classes="action-card-info"),
+                ModalAction("Check Now", "settings-check-update", extra_classes="modal-action-compact"),
+                ModalAction("Startup: On", "settings-toggle-update-startup", extra_classes="modal-action-compact"),
+                id="settings-update-card",
+                classes="action-card",
+            )
+        )
 
-        await content.mount(Static("Maintenance", classes="settings-section-title"))
         await content.mount(
-            Static(
-                "Reset saved login state when the marketplace session looks stale or stuck. "
-                "These do not delete your saved Pearl Abyss credentials. Disposable browser cache "
-                "is cleaned before Refresh Session or Steam Setup once it reaches the saved limit. "
-                "Use 0 MiB to clean at every manual auth open.",
-                classes="settings-note",
-            )
-        )
-        await content.mount(Static(id="settings-browser-storage", classes="settings-config"))
-        await content.mount(
-            Horizontal(
-                Label("Auto-clean limit (MiB)", id="settings-cache-label"),
-                Input(
-                    value=str(self.task_manager.browser_cache_cleanup_threshold_mb),
-                    type="integer",
-                    placeholder="MiB",
-                    id="settings-cache-threshold-input",
+            Vertical(
+                Static(id="settings-storage-facts", classes="action-card-line"),
+                Horizontal(
+                    Label("Auto-clean at", classes="cache-inline-label"),
+                    Input(
+                        value=str(self.task_manager.browser_cache_cleanup_threshold_mb),
+                        type="integer",
+                        id="settings-cache-threshold-input",
+                    ),
+                    Label("MiB", classes="cache-inline-label"),
+                    Static(classes="action-card-spacer"),
+                    ModalAction("Save", "settings-save-cache-limit", extra_classes="modal-action-compact"),
+                    ModalAction("Clean now", "settings-clean-cache", extra_classes="modal-action-compact"),
+                    classes="cache-controls-row",
                 ),
-                ModalAction("Save Limit", "settings-save-cache-limit"),
-                ModalAction("Clean Cache", "settings-clean-cache"),
-                id="settings-cache-controls",
+                id="settings-storage-card",
+                classes="action-card",
             )
         )
+        await content.mount(Static("", id="settings-status"))
+
         await content.mount(
-            Horizontal(
-                ModalAction("Clear Session", "clear-saved-session", extra_classes="modal-action-destructive"),
-                ModalAction("Clear Browser Cookies", "settings-clear-cookies", extra_classes="modal-action-destructive"),
-                ModalAction("Reset Steam Setup", "settings-reset-steam", extra_classes="modal-action-destructive"),
-                id="settings-actions",
+            Vertical(
+                Static(
+                    "Reset login state. Won't delete your saved credentials.",
+                    id="settings-danger-note",
+                    classes="action-card-line",
+                ),
+                Horizontal(
+                    ModalAction(
+                        "Clear Session",
+                        "clear-saved-session",
+                        extra_classes="modal-action-destructive modal-action-compact",
+                    ),
+                    ModalAction(
+                        "Clear Cookies",
+                        "settings-clear-cookies",
+                        extra_classes="modal-action-destructive modal-action-compact",
+                    ),
+                    ModalAction(
+                        "Reset Steam",
+                        "settings-reset-steam",
+                        extra_classes="modal-action-destructive modal-action-compact",
+                    ),
+                    classes="danger-actions-row",
+                ),
+                id="settings-danger-card",
+                classes="action-card danger-card",
             )
         )
-        await content.mount(Static("", id="settings-maintenance-status"))
+        self.query_one("#settings-danger-card", Vertical).border_title = "Danger zone"
         self.refresh_settings_summary()
 
     def refresh_settings_summary(self) -> None:
@@ -1224,26 +1299,6 @@ class MarketplaceToolsApp(App[None]):
         about_text.append(self.launch_mode, style=COLOR_WARNING if self.is_test_mode else COLOR_TEXT_MUTED)
         about.update(about_text)
 
-        if tm.available_update_version:
-            self.refresh_info_tile(
-                "settings-update",
-                "Update",
-                f"v{tm.available_update_version}",
-                "New version available",
-                "warning",
-                True,
-            )
-        elif tm.update_check_completed:
-            self.refresh_info_tile("settings-update", "Update", "Up to date", f"v{APP_VERSION}", "success", True)
-        else:
-            self.refresh_info_tile("settings-update", "Update", "Unknown", "Not checked yet")
-        try:
-            self.query_one("#settings-toggle-update-startup", ModalAction).update(
-                f"Startup: {'On' if tm.update_check_on_startup else 'Off'}"
-            )
-        except Exception:
-            pass
-
         self.refresh_info_tile(
             "settings-account",
             "Account",
@@ -1259,27 +1314,43 @@ class MarketplaceToolsApp(App[None]):
             True,
         )
 
-        config = Table.grid(padding=(0, 2))
-        config.add_column(style=f"bold {COLOR_TEXT_MUTED}", no_wrap=True)
-        config.add_column()
-        config.add_row("Mode", "Buy mode" if tm.purchase_submission_enabled else "Watch only")
-        config.add_row("Polling", f"{tm.current_delay_label()} ({tm.current_delay_range()})")
-        config.add_row("Buy delay", tm.purchase_delay_range())
-        config.add_row("Spend cap", format_compact_silver(tm.max_spend))
+        update_line = Text()
+        update_line.append("Update", style=f"bold {COLOR_TEXT_MUTED}")
+        update_line.append("   ")
+        if tm.available_update_version:
+            update_line.append(f"v{tm.available_update_version}", style=STATUS_STYLES["warning"])
+            update_detail = "New version available"
+        elif tm.update_check_completed:
+            update_line.append("✓ ", style=STATUS_STYLES["success"])
+            update_line.append("Up to date", style=STATUS_STYLES["success"])
+            update_detail = f"v{APP_VERSION}"
+        else:
+            update_line.append("Unknown", style=STATUS_STYLES["info"])
+            update_detail = "Not checked yet"
+        update_line.append("   ·   ", style=COLOR_TEXT_MUTED)
+        update_line.append(update_detail, style=COLOR_TEXT_MUTED)
         try:
-            self.query_one("#settings-config-list", Static).update(config)
+            self.query_one("#settings-update", Static).update(update_line)
+        except Exception:
+            pass
+        try:
+            self.query_one("#settings-toggle-update-startup", ModalAction).update(
+                f"Startup: {'On' if tm.update_check_on_startup else 'Off'}"
+            )
         except Exception:
             pass
 
         storage = tm.browser_storage_summary()
-        storage_table = Table.grid(padding=(0, 2))
-        storage_table.add_column(style=f"bold {COLOR_TEXT_MUTED}", no_wrap=True)
-        storage_table.add_column()
-        storage_table.add_row("Browser storage", format_storage_size(storage.total_bytes))
-        storage_table.add_row("Disposable cache", format_storage_size(storage.disposable_bytes))
-        storage_table.add_row("Auto-clean limit", tm.browser_cache_cleanup_threshold_label())
+        storage_line = Text()
+        storage_line.append("Storage", style=f"bold {COLOR_TEXT_MUTED}")
+        storage_line.append("   ")
+        storage_line.append(f"{format_storage_size(storage.total_bytes)} used", style=COLOR_INFO)
+        storage_line.append("   ·   ", style=COLOR_TEXT_MUTED)
+        storage_line.append(
+            f"{format_storage_size(storage.disposable_bytes)} disposable", style=COLOR_TEXT_MUTED
+        )
         try:
-            self.query_one("#settings-browser-storage", Static).update(storage_table)
+            self.query_one("#settings-storage-facts", Static).update(storage_line)
         except Exception:
             pass
 
@@ -2270,13 +2341,13 @@ class MarketplaceToolsApp(App[None]):
 
     def set_settings_maintenance_status(self, message: str) -> None:
         try:
-            self.query_one("#settings-maintenance-status", Static).update(message)
+            self.query_one("#settings-status", Static).update(message)
         except Exception:
             pass
 
     def set_settings_update_status(self, message: str) -> None:
         try:
-            self.query_one("#settings-update-status", Static).update(message)
+            self.query_one("#settings-status", Static).update(message)
         except Exception:
             pass
 
@@ -2329,7 +2400,9 @@ class MarketplaceToolsApp(App[None]):
 
     def save_browser_cache_limit_from_settings(self) -> None:
         try:
-            value = self.query_one("#settings-cache-threshold-input", Input).value
+            cache_input = self.query_one("#settings-cache-threshold-input", Input)
+            value = cache_input.value
+            cache_input.blur()
             threshold = self.task_manager.set_browser_cache_cleanup_threshold_mb(value)
         except ValueError as exc:
             message = str(exc)
@@ -2344,7 +2417,7 @@ class MarketplaceToolsApp(App[None]):
 
         label = self.task_manager.browser_cache_cleanup_threshold_label()
         try:
-            self.query_one("#settings-cache-threshold-input", Input).value = str(threshold)
+            cache_input.value = str(threshold)
         except Exception:
             pass
         message = f"Browser cache cleanup limit saved: {label}."

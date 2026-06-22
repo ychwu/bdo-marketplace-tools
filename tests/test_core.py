@@ -5713,8 +5713,11 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(app.query_one("#banner").display)
                 self.assertTrue(app.query_one("#screen-title").display)
                 self.assertEqual(app.query_one("#screen-title", Static).content, "App Settings")
-                self.assertEqual(app.query_one("#settings-update", Static).border_title, "Update")
-                self.assertEqual(len(list(app.query(".stats-tile"))), 3)
+                self.assertEqual(app.query_one("#settings-danger-card").border_title, "Danger zone")
+                self.assertIn("Update", str(app.query_one("#settings-update", Static).render()))
+                self.assertEqual(len(list(app.query(".stats-tile"))), 2)
+                self.assertEqual(len(list(app.query("#settings-config-list"))), 0)
+                self.assertNotIn("Configuration", str(app.query_one("#content").render()))
                 await pilot.press("2")
                 self.assertEqual(app.current_view, "wallet")
                 self.assertIn(("wallet", "Inventory"), app.NAV_ITEMS)
@@ -5921,7 +5924,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(app.query_one("#clear-saved-session").has_class("modal-action-destructive"))
                 self.assertTrue(app.query_one("#settings-clear-cookies").has_class("modal-action-destructive"))
                 self.assertTrue(app.query_one("#settings-reset-steam").has_class("modal-action-destructive"))
-                self.assertEqual(len(list(app.query("#settings-actions Button"))), 0)
+                self.assertEqual(len(list(app.query("#settings-danger-card Button"))), 0)
 
                 # Updates section pushes the maintenance row past this terminal's height; scroll
                 # it into the scrollable content view before clicking.
@@ -5953,7 +5956,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await app.check_for_updates_from_settings()
 
                 self.assertEqual(
-                    str(app.query_one("#settings-update-status", Static).content),
+                    str(app.query_one("#settings-status", Static).content),
                     f"You are on the latest version (v{APP_VERSION}).",
                 )
 
@@ -6573,10 +6576,11 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 app.query_one("#settings-cache-threshold-input", Input).value = "321"
                 await pilot.click("#settings-save-cache-limit")
                 await pilot.pause(0.1)
+                self.assertIsNot(app.focused, app.query_one("#settings-cache-threshold-input", Input))
                 self.assertEqual(app.task_manager.browser_cache_cleanup_threshold_mb, 321)
                 self.assertIn(
                     "Browser cache cleanup limit saved",
-                    str(app.query_one("#settings-maintenance-status", Static).render()),
+                    str(app.query_one("#settings-status", Static).render()),
                 )
 
                 await pilot.click("#settings-clean-cache")
@@ -6584,7 +6588,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 app.task_manager.clean_browser_cache_now.assert_awaited_once()
                 self.assertIn(
                     "Cleaned 2.0 MiB",
-                    str(app.query_one("#settings-maintenance-status", Static).render()),
+                    str(app.query_one("#settings-status", Static).render()),
                 )
 
                 await pilot.click("#settings-reset-steam")
@@ -6592,7 +6596,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 app.task_manager.reset_steam_initial_setup_status.assert_called_once()
                 self.assertIn(
                     "Steam initial setup reset",
-                    str(app.query_one("#settings-maintenance-status", Static).render()),
+                    str(app.query_one("#settings-status", Static).render()),
                 )
 
                 await pilot.click("#settings-clear-cookies")
@@ -6600,7 +6604,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 app.task_manager.clear_browser_session_cookies.assert_awaited_once()
                 self.assertIn(
                     "Browser cookies cleared",
-                    str(app.query_one("#settings-maintenance-status", Static).render()),
+                    str(app.query_one("#settings-status", Static).render()),
                 )
 
     async def test_app_settings_shows_browser_storage_summary(self):
@@ -6616,18 +6620,29 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.press("1")
-                storage_widget = app.query_one("#settings-browser-storage", Static)
-                console = Console(width=80)
-                with console.capture() as capture:
-                    console.print(storage_widget.render()._renderable)
-                rendered = capture.get()
+                rendered = str(app.query_one("#settings-storage-facts", Static).render())
+                cache_input = app.query_one("#settings-cache-threshold-input", Input)
+                cache_input_value = cache_input.value
+                cache_input_width = cache_input.styles.width.value
+                cache_input_height = cache_input.styles.height.value
+                cache_input_background = str(cache_input.styles.background)
+                settings_status_margin_bottom = app.query_one("#settings-status", Static).styles.margin.bottom
+                cache_input.focus()
+                await pilot.pause()
+                await pilot.click("#settings-storage-facts")
+                await pilot.pause()
+                cache_input_kept_focus_after_click_away = app.focused is cache_input
 
-        self.assertIn("Browser storage", rendered)
+        self.assertIn("Storage", rendered)
         self.assertIn("512.0 MiB", rendered)
-        self.assertIn("Disposable cache", rendered)
+        self.assertIn("disposable", rendered)
         self.assertIn("200.0 MiB", rendered)
-        self.assertIn("Auto-clean limit", rendered)
-        self.assertIn("150.0 MiB", rendered)
+        self.assertEqual(cache_input_value, str(app.task_manager.browser_cache_cleanup_threshold_mb))
+        self.assertEqual(cache_input_width, 8)
+        self.assertEqual(cache_input_height, 3)
+        self.assertEqual(cache_input_background, "Color(0, 0, 0, a=0)")
+        self.assertEqual(settings_status_margin_bottom, 1)
+        self.assertFalse(cache_input_kept_focus_after_click_away)
 
     async def test_single_item_test_monitor_sidebar_controls_use_separate_task(self):
         app = self.make_app(launch_mode="test")
