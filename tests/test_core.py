@@ -1024,6 +1024,78 @@ class APIResultTests(unittest.TestCase):
         asyncio.run(_set_setup_notice_warning(FakePageNoEvaluate(), "x"))
         asyncio.run(_set_setup_notice_warning(FakePageRaises(), "x"))
 
+    def test_steam_remember_me_guide_targets_checkbox_by_label(self):
+        from bdo_marketplace_tools.market.browser_auth import (
+            STEAM_REMEMBER_ME_GUIDE_SCRIPT,
+            _show_steam_remember_me_guide,
+        )
+
+        # Located by the visible label text + role, never by Steam's build-hashed class names.
+        self.assertIn("remember me", STEAM_REMEMBER_ME_GUIDE_SCRIPT.lower())
+        self.assertIn('role="checkbox"', STEAM_REMEMBER_ME_GUIDE_SCRIPT)
+        # Cosmetic only: it must never intercept the user's click on the checkbox.
+        self.assertIn("pointer-events:none", STEAM_REMEMBER_ME_GUIDE_SCRIPT)
+
+        calls = []
+
+        class FakePage:
+            async def evaluate(self, script, *args):
+                calls.append(script)
+
+        asyncio.run(_show_steam_remember_me_guide(FakePage()))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("__bdo_remember_ring__", calls[0])
+
+    def test_steam_remember_me_guide_is_best_effort(self):
+        from bdo_marketplace_tools.market.browser_auth import _show_steam_remember_me_guide
+
+        class FakePageNoEvaluate:
+            pass
+
+        class FakePageRaises:
+            async def evaluate(self, script, *args):
+                raise RuntimeError("boom")
+
+        asyncio.run(_show_steam_remember_me_guide(FakePageNoEvaluate()))
+        asyncio.run(_show_steam_remember_me_guide(FakePageRaises()))
+
+    def test_set_setup_notice_credentials_rejected_uses_distinct_state(self):
+        from bdo_marketplace_tools.market.browser_auth import (
+            SETUP_NOTICE_CREDENTIALS_SCRIPT,
+            _set_setup_notice_credentials_rejected,
+        )
+
+        # A calm "fix it in the app, safe to close" card, distinct from the red "act here" warning.
+        self.assertIn("Wrong email or password", SETUP_NOTICE_CREDENTIALS_SCRIPT)
+        self.assertIn("Safe to close this window", SETUP_NOTICE_CREDENTIALS_SCRIPT)
+        self.assertIn("in the app", SETUP_NOTICE_CREDENTIALS_SCRIPT)
+        # Re-dims the page (the user must not log in here) and stays click-through.
+        self.assertIn("__bdo_setup_scrim__", SETUP_NOTICE_CREDENTIALS_SCRIPT)
+        self.assertIn("pointer-events:none", SETUP_NOTICE_CREDENTIALS_SCRIPT)
+
+        calls = []
+
+        class FakePage:
+            async def evaluate(self, script, *args):
+                calls.append(script)
+
+        asyncio.run(_set_setup_notice_credentials_rejected(FakePage()))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("__bdo_setup_notice__", calls[0])
+
+    def test_set_setup_notice_credentials_rejected_is_best_effort(self):
+        from bdo_marketplace_tools.market.browser_auth import _set_setup_notice_credentials_rejected
+
+        class FakePageNoEvaluate:
+            pass
+
+        class FakePageRaises:
+            async def evaluate(self, script, *args):
+                raise RuntimeError("boom")
+
+        asyncio.run(_set_setup_notice_credentials_rejected(FakePageNoEvaluate()))
+        asyncio.run(_set_setup_notice_credentials_rejected(FakePageRaises()))
+
     def test_market_cookie_wait_dialog_manual_attention_flips_notice_to_warning(self):
         warn = AsyncMock()
         statuses = []

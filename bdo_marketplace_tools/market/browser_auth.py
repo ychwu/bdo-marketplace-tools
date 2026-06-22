@@ -295,6 +295,173 @@ async def _set_setup_notice_warning(page, message):
         pass
 
 
+# Distinct state for "saved credentials were rejected". Unlike the captcha/OTP/Steam manual states,
+# the user must NOT log in on this page -- they fix the saved email/password in the app and refresh.
+# So this re-dims the page (recreating the scrim a prior warning flip may have removed) and shows a
+# calm amber "fix it in the app / safe to close" card instead of the red "act here" warning. Runs in
+# the main world via page.evaluate; cosmetic and pointer-events:none.
+SETUP_NOTICE_CREDENTIALS_SCRIPT = r"""
+() => {
+  const ID = '__bdo_setup_notice__';
+  const SCRIM_ID = '__bdo_setup_scrim__';
+  if (!document.body) return;
+  let scrim = document.getElementById(SCRIM_ID);
+  if (!scrim) {
+    scrim = document.createElement('div');
+    scrim.id = SCRIM_ID;
+    scrim.setAttribute('style', 'position:fixed;inset:0;z-index:2147483646;pointer-events:none;background:rgba(8,9,14,0.5);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);');
+    document.body.appendChild(scrim);
+  }
+  let card = document.getElementById(ID);
+  if (!card) {
+    card = document.createElement('div');
+    card.id = ID;
+    document.body.appendChild(card);
+  }
+  card.setAttribute('style', [
+    'position:fixed','top:50%','left:50%','transform:translate(-50%,-50%)',
+    'z-index:2147483647','pointer-events:none','box-sizing:border-box',
+    'width:calc(100% - 48px)','max-width:400px','padding:16px 18px',
+    'border-radius:16px','border:1px solid rgba(224,168,72,0.5)',
+    'background:rgba(20,16,12,0.74)','backdrop-filter:blur(14px)','-webkit-backdrop-filter:blur(14px)',
+    'color:#e6e0d4','text-align:center',"font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
+    'box-shadow:0 0 30px rgba(224,168,72,0.16),0 16px 44px rgba(0,0,0,0.5)','opacity:1'
+  ].join(';'));
+  var KEY = '<svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="#e8b65a" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;">' +
+    '<circle cx="8" cy="16" r="3.2"/><path d="M10.3 13.7 19 5"/><path d="M16 8l2.6 2.6"/><path d="M4 4l16 16"/></svg>';
+  var CHECK = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#7eb88a" ' +
+    'stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:block;">' +
+    '<circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.5 2.5 4.5-4.5"/></svg>';
+  card.innerHTML =
+    '<div style="width:38px;height:38px;border-radius:11px;background:rgba(224,168,72,0.16);display:flex;align-items:center;justify-content:center;margin:0 auto 9px;">' + KEY + '</div>' +
+    '<div style="font-size:15px;font-weight:600;color:#f0c069;letter-spacing:.2px;">Wrong email or password</div>' +
+    '<div style="font-size:12.5px;color:#e6e0d4;opacity:.88;margin-top:5px;line-height:1.5;">Update your saved login in the app, then refresh the session. You don’t need to log in here.</div>' +
+    '<div style="display:inline-flex;align-items:center;gap:6px;margin-top:11px;padding:5px 11px;border-radius:20px;background:rgba(126,184,138,0.14);">' +
+      CHECK + '<span style="font-size:12px;font-weight:600;color:#8fce9c;">Safe to close this window</span>' +
+    '</div>';
+}
+"""
+
+
+async def _set_setup_notice_credentials_rejected(page):
+    # Best-effort, main-world (see SETUP_NOTICE_CREDENTIALS_SCRIPT). Never raises; the notice is
+    # cosmetic and must not affect the auth flow.
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return
+    try:
+        await evaluate(SETUP_NOTICE_CREDENTIALS_SCRIPT)
+    except Exception:
+        pass
+
+
+# Cosmetic guide that points at Steam's "Remember me" checkbox during the manual Steam-login step,
+# nudging the user to tick it (so the Steam session persists and re-auth can stay automatic). Runs in
+# the main world via page.evaluate; finds the checkbox by its visible "Remember me" label text + the
+# role=checkbox attribute (Steam's class names are build-hashed and change between releases, so they
+# are not reliable). pointer-events:none, so it never blocks the click; it repositions on a short
+# interval and self-hides once the box is ticked or is not on the page.
+STEAM_REMEMBER_ME_GUIDE_SCRIPT = r"""
+() => {
+  const RING_ID = '__bdo_remember_ring__';
+  const CALLOUT_ID = '__bdo_remember_callout__';
+  const ARROW_ID = '__bdo_remember_arrow__';
+  const STYLE_ID = '__bdo_remember_style__';
+  const BORDER = '1px solid rgba(255,145,60,0.42)';
+  const BG = 'rgba(17,17,21,0.78)';
+  if (!document.body) return;
+  if (!document.getElementById(STYLE_ID)) {
+    const st = document.createElement('style');
+    st.id = STYLE_ID;
+    st.textContent = '@keyframes __bdoRememberPulse{0%,100%{box-shadow:0 0 0 0 rgba(255,145,60,.5),0 0 14px rgba(255,145,60,.35)}50%{box-shadow:0 0 0 7px rgba(255,145,60,0),0 0 22px rgba(255,145,60,.55)}}';
+    (document.head || document.documentElement).appendChild(st);
+  }
+  const findCheckbox = () => {
+    const boxes = document.querySelectorAll('[role="checkbox"]');
+    for (let i = 0; i < boxes.length; i++) {
+      const box = boxes[i];
+      let txt = '';
+      const lblId = box.getAttribute('aria-labelledby');
+      if (lblId) { const l = document.getElementById(lblId); if (l) txt = l.textContent || ''; }
+      if (!txt && box.parentElement) txt = box.parentElement.textContent || '';
+      if (/remember me/i.test(txt)) return box;
+    }
+    return null;
+  };
+  let ring = document.getElementById(RING_ID);
+  if (!ring) {
+    ring = document.createElement('div');
+    ring.id = RING_ID;
+    ring.setAttribute('style', 'position:fixed;z-index:2147483645;pointer-events:none;border:2px solid rgba(255,145,60,0.95);border-radius:5px;animation:__bdoRememberPulse 1.4s ease-in-out infinite;');
+    document.body.appendChild(ring);
+  }
+  let callout = document.getElementById(CALLOUT_ID);
+  if (!callout) {
+    callout = document.createElement('div');
+    callout.id = CALLOUT_ID;
+    callout.setAttribute('style',
+      'position:fixed;z-index:2147483645;pointer-events:none;max-width:230px;padding:8px 12px;' +
+      'border-radius:10px;border:' + BORDER + ';background:' + BG + ';' +
+      'backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);box-shadow:0 0 22px rgba(255,145,60,0.18);' +
+      "font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;");
+    callout.innerHTML =
+      '<div id="' + ARROW_ID + '" style="position:absolute;width:10px;height:10px;background:' + BG + ';"></div>' +
+      '<div style="font-size:12.5px;font-weight:600;color:#ffb37a;letter-spacing:.2px;">Tick this to stay signed in</div>' +
+      '<div style="font-size:11px;color:#d7d4cd;opacity:.82;margin-top:1px;line-height:1.4;">so the app can re-login on its own</div>';
+    document.body.appendChild(callout);
+  }
+  const arrow = document.getElementById(ARROW_ID);
+  const hide = () => { ring.style.display = 'none'; callout.style.display = 'none'; };
+  const place = () => {
+    const cb = findCheckbox();
+    if (!cb) { hide(); return; }
+    if (cb.getAttribute('aria-checked') === 'true') {
+      hide();
+      if (window.__bdoRememberGuideInterval) { clearInterval(window.__bdoRememberGuideInterval); window.__bdoRememberGuideInterval = null; }
+      return;
+    }
+    const r = cb.getBoundingClientRect();
+    if (!r.width && !r.height) { hide(); return; }
+    ring.style.display = 'block';
+    callout.style.display = 'block';
+    ring.style.left = (r.left - 4) + 'px';
+    ring.style.top = (r.top - 4) + 'px';
+    ring.style.width = (r.width + 8) + 'px';
+    ring.style.height = (r.height + 8) + 'px';
+    const cw = callout.offsetWidth || 210;
+    const ch = callout.offsetHeight || 46;
+    if (r.right + 16 + cw <= window.innerWidth) {
+      callout.style.left = (r.right + 16) + 'px';
+      callout.style.top = (r.top + r.height / 2 - ch / 2) + 'px';
+      if (arrow) arrow.setAttribute('style', 'position:absolute;width:10px;height:10px;background:' + BG + ';left:-6px;top:50%;transform:translateY(-50%) rotate(45deg);border-left:' + BORDER + ';border-bottom:' + BORDER + ';');
+    } else {
+      callout.style.left = Math.max(8, r.left - 8) + 'px';
+      callout.style.top = (r.bottom + 14) + 'px';
+      if (arrow) arrow.setAttribute('style', 'position:absolute;width:10px;height:10px;background:' + BG + ';left:16px;top:-6px;transform:rotate(45deg);border-left:' + BORDER + ';border-top:' + BORDER + ';');
+    }
+  };
+  const start = findCheckbox();
+  const alreadyDone = start && start.getAttribute('aria-checked') === 'true';
+  place();
+  if (window.__bdoRememberGuideInterval) clearInterval(window.__bdoRememberGuideInterval);
+  if (!alreadyDone) window.__bdoRememberGuideInterval = setInterval(place, 400);
+}
+"""
+
+
+async def _show_steam_remember_me_guide(page):
+    # Best-effort cosmetic highlight pointing at Steam's "Remember me" checkbox. pointer-events:none so
+    # it never blocks the click; safe to call repeatedly from the Steam-login wait loop.
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return
+    try:
+        await evaluate(STEAM_REMEMBER_ME_GUIDE_SCRIPT)
+    except Exception:
+        pass
+
+
 async def _maybe_await(value):
     if inspect.isawaitable(value):
         return await value
@@ -816,7 +983,10 @@ async def _wait_for_market_cookies(
                     pa_credentials_auto_stopped = True
                     manual_login_seen = True
                     record = auth_dialog_state.get("manual_attention") or {}
-                    await _set_setup_notice_warning(page, _auth_dialog_notice_message(record.get("category")))
+                    if record.get("category") == AUTH_DIALOG_INVALID_CREDENTIALS:
+                        await _set_setup_notice_credentials_rejected(page)
+                    else:
+                        await _set_setup_notice_warning(page, _auth_dialog_notice_message(record.get("category")))
 
                 pa_cookie_consent_result = COOKIE_CONSENT_SKIPPED
                 if not pa_cookie_consent_completed:
@@ -1017,6 +1187,7 @@ async def _wait_for_steam_profile_login(context, status_callback, timeout_second
         # "Remember me" so the Steam session persists and re-auth can stay automatic.
         for page in pages:
             await _set_setup_notice_warning(page, SETUP_NOTICE_STEAM_LOGIN_MESSAGE)
+            await _show_steam_remember_me_guide(page)
 
         await asyncio.sleep(STEAM_PROFILE_SETUP_POLL_SECONDS)
 
