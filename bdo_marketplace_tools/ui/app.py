@@ -1953,6 +1953,7 @@ class MarketplaceToolsApp(App[None]):
             return
 
         if self.task_manager.debug_invalidate_marketplace_session():
+            self.set_status("Test marketplace session cleared. Run Session Check or Reauth Check to test recovery.", "warning")
             self.refresh_modal_summaries()
         await self.return_to_dashboard()
 

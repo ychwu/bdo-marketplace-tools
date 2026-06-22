@@ -80,6 +80,9 @@ STEAM_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
 PA_AUTO_LOGIN_FILL_TIMEOUT_MS = 1000
 PA_AUTO_LOGIN_CLICK_TIMEOUT_MS = 1000
 PA_AUTO_LOGIN_MISSING_NOTICE_SECONDS = 5
+PA_AUTO_LOGIN_RETRY_GRACE_SECONDS = 2.0
+PA_AUTO_LOGIN_MAX_SUBMIT_ATTEMPTS = 3
+PA_LOGIN_FORM_CHECK_TIMEOUT_MS = 150
 PA_CONSENT_BUTTON_READY_TIMEOUT_MS = 250
 BROWSER_AUTH_POLL_SECONDS = 0.25
 BROWSER_PAGE_CLOSE_TIMEOUT_SECONDS = 0.5
@@ -481,7 +484,7 @@ async def _wait_for_market_cookies(
     pa_auto_login_state = _new_pa_auto_login_state()
     pa_cookie_consent_state = _new_pa_cookie_consent_state()
     pa_cookie_consent_completed = not handle_pa_cookie_consent
-    pa_credentials_submitted = False
+    pa_credentials_auto_stopped = False
 
     # Snapshot any marketplace session cookie value already in the persistent profile so a
     # fresh login is recognized by a *changed* TradeAuth_Session value, not its mere presence.
@@ -519,7 +522,7 @@ async def _wait_for_market_cookies(
         context_on("response", _on_response)
 
     async def _poll_loop():
-        nonlocal callback_seen, auth_flow_seen, pa_credentials_submitted
+        nonlocal callback_seen, auth_flow_seen, pa_credentials_auto_stopped
         nonlocal pa_cookie_consent_completed
         # A verification challenge (CAPTCHA) blocks login until a human solves it. Track it so the
         # warning is emitted once per appearance (edge-triggered) and the timeout message can say
@@ -582,7 +585,7 @@ async def _wait_for_market_cookies(
                 if auto_login_result in {STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_MANUAL_NEEDED}:
                     auth_flow_seen = True
                 pa_login_result = PA_AUTO_LOGIN_SKIPPED
-                if not pa_credentials_submitted and not page_challenge:
+                if not pa_credentials_auto_stopped and not page_challenge:
                     pa_login_result = await _maybe_run_pa_credentials_login(
                         page,
                         state,
@@ -593,13 +596,10 @@ async def _wait_for_market_cookies(
                         status_callback=status_callback,
                         now=now,
                     )
-                # Once credentials are submitted, stop re-attempting the fill. The post-submit
-                # redirect pages (LoginProcess/AuthorizeOauth) still classify as "pa" but have no
-                # login form, so retrying would block each poll on the fill timeout.
-                if pa_login_result == PA_AUTO_LOGIN_SUBMITTED:
-                    pa_credentials_submitted = True
                 if pa_login_result in {PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_MANUAL_NEEDED}:
                     auth_flow_seen = True
+                if pa_login_result == PA_AUTO_LOGIN_MANUAL_NEEDED:
+                    pa_credentials_auto_stopped = True
 
             # Edge-triggered: announce a challenge once when it appears, and re-arm when it clears
             # so a second, later challenge is announced again rather than swallowed.
@@ -797,9 +797,12 @@ def _new_steam_auto_login_state():
 
 def _new_pa_auto_login_state():
     return {
-        "submitted": set(),
+        "pending": {},
+        "attempts": {},
         "missing_started_at": {},
         "missing_reported": set(),
+        "retry_reported": set(),
+        "manual_reported": set(),
     }
 
 
@@ -978,9 +981,32 @@ async def _maybe_run_pa_credentials_login_target(
     now,
     missing_notice_seconds,
 ):
-    key = (id(scope), "pa_credentials_login", getattr(scope, "url", ""))
-    if key in tracking["submitted"]:
-        return PA_AUTO_LOGIN_SKIPPED
+    key = (id(scope), "pa_credentials_login")
+    pending_since = tracking["pending"].get(key)
+    if pending_since is not None:
+        if now - pending_since < PA_AUTO_LOGIN_RETRY_GRACE_SECONDS:
+            return PA_AUTO_LOGIN_WAITING
+        if not await _pa_login_form_visible(scope):
+            return PA_AUTO_LOGIN_WAITING
+        if not await _pa_password_field_empty(scope):
+            return PA_AUTO_LOGIN_WAITING
+        if tracking["attempts"].get(key, 0) >= PA_AUTO_LOGIN_MAX_SUBMIT_ATTEMPTS:
+            if key not in tracking["manual_reported"]:
+                tracking["manual_reported"].add(key)
+                await _emit_status(
+                    status_callback,
+                    "Pearl Abyss login did not progress after saved credentials were submitted. Continue manually in the browser.",
+                    "warning",
+                )
+            return PA_AUTO_LOGIN_MANUAL_NEEDED
+        retry_key = (key, tracking["attempts"].get(key, 0))
+        if retry_key not in tracking["retry_reported"]:
+            tracking["retry_reported"].add(retry_key)
+            await _emit_status(
+                status_callback,
+                "Pearl Abyss login returned to the login page; retrying saved credentials.",
+                "warning",
+            )
 
     credentials_filled = await _fill_pa_credentials(scope, email, password)
     if credentials_filled and await _click_first_available_selector(
@@ -988,9 +1014,11 @@ async def _maybe_run_pa_credentials_login_target(
         PA_LOGIN_BUTTON_SELECTORS,
         timeout=PA_AUTO_LOGIN_CLICK_TIMEOUT_MS,
     ):
-        tracking["submitted"].add(key)
+        tracking["attempts"][key] = tracking["attempts"].get(key, 0) + 1
+        tracking["pending"][key] = now
         tracking["missing_started_at"].pop(key, None)
-        await _emit_status(status_callback, "Automatic Pearl Abyss login submitted saved credentials.", "info")
+        if tracking["attempts"][key] == 1:
+            await _emit_status(status_callback, "Automatic Pearl Abyss login submitted saved credentials.", "info")
         return PA_AUTO_LOGIN_SUBMITTED
 
     started_at = tracking["missing_started_at"].setdefault(key, now)
@@ -1021,6 +1049,31 @@ async def _fill_pa_credentials(scope, email, password):
         str(password),
         timeout=PA_AUTO_LOGIN_FILL_TIMEOUT_MS,
     )
+
+
+async def _pa_login_form_visible(scope):
+    email_visible = await _selector_visible(
+        scope,
+        PA_EMAIL_SELECTORS,
+        timeout=PA_LOGIN_FORM_CHECK_TIMEOUT_MS,
+    )
+    if not email_visible:
+        return False
+    return await _selector_visible(
+        scope,
+        PA_PASSWORD_SELECTORS,
+        timeout=PA_LOGIN_FORM_CHECK_TIMEOUT_MS,
+    )
+
+
+async def _pa_password_field_empty(scope):
+    for selector in PA_PASSWORD_SELECTORS:
+        try:
+            value = await scope.locator(selector).first.input_value(timeout=PA_LOGIN_FORM_CHECK_TIMEOUT_MS)
+        except Exception:
+            continue
+        return value == ""
+    return False
 
 
 def _pa_credentials_login_targets(page, state):

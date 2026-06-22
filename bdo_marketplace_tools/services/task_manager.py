@@ -1,4 +1,5 @@
 import asyncio
+import os
 import random
 import time
 from collections import deque
@@ -743,11 +744,17 @@ class BackgroundTasks:
         if not self.test_mode_enabled:
             return False
 
+        was_logged_in = bool(getattr(self.api_handler, "login_status", False))
         self.simulated_session_enabled = False
         self.debug_force_purchase_session_expired = True
+        if hasattr(self.api_handler, "clear_session"):
+            self.api_handler.clear_session()
+        else:
+            self.api_handler.login_status = False
         self._set_saved_session_last_known_valid(False)
-        if self.uses_steam_browser_session() and getattr(self.api_handler, "login_status", False):
+        if self.uses_steam_browser_session() and was_logged_in:
             self.steam_auto_reauth_enabled = True
+        self.add_event("Test: marketplace session cleared; next session check will run re-authentication.", "warning")
         return True
 
     def debug_toggle_steam_auto_reauth(self):
@@ -1205,6 +1212,13 @@ class BackgroundTasks:
                 bootstrap_url = None
                 if not self.pa_browser_profile_prepared:
                     bootstrap_url = BDO_SITE_BOOTSTRAP_URL
+
+                # DIAGNOSTIC (temporary): set BDO_PA_SKIP_BOOTSTRAP=1 to skip the fresh-start bootstrap
+                # detour and test whether it is what makes the PA login submission bounce back. Off by
+                # default, so normal behavior and the test suite are unchanged. Remove once diagnosed.
+                if bootstrap_url and os.environ.get("BDO_PA_SKIP_BOOTSTRAP"):
+                    bootstrap_url = None
+                    self.add_event("DIAGNOSTIC: skipping fresh-start bootstrap for this PA refresh.", "warning")
 
                 cookies = await acquire_market_cookies(
                     status_callback=self._browser_auth_status,

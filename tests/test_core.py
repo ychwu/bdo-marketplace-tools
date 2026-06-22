@@ -33,7 +33,9 @@ from bdo_marketplace_tools.market.browser_auth import (
     STEAM_AUTO_LOGIN_SKIPPED,
     STEAM_AUTO_LOGIN_WAITING,
     PA_AUTO_LOGIN_DISABLED,
+    PA_AUTO_LOGIN_MANUAL_NEEDED,
     PA_AUTO_LOGIN_SUBMITTED,
+    PA_AUTO_LOGIN_WAITING,
     PA_CONSENT_BUTTON_READY_TIMEOUT_MS,
     STEAM_BROWSER_CHANNEL,
     STEAM_COMMUNITY_URL,
@@ -1082,6 +1084,130 @@ class APIResultTests(unittest.TestCase):
         result = asyncio.run(run())
         self.assertEqual([cookie["name"] for cookie in result], ["TradeAuth_Session"])
 
+    def test_market_cookie_wait_pa_submit_keeps_polling_until_session_captured(self):
+        fresh = [
+            {
+                "name": "TradeAuth_Session",
+                "value": "fresh-token",
+                "domain": "na-trade.naeu.playblackdesert.com",
+                "path": "/",
+            }
+        ]
+
+        class FakeFirstLocator:
+            async def is_visible(self, timeout=None):
+                return False
+
+        class FakeLocator:
+            first = FakeFirstLocator()
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-US/Member/Login"
+            frames = []
+
+            def is_closed(self):
+                return False
+
+            def locator(self, _selector):
+                return FakeLocator()
+
+        class FakeContext:
+            def __init__(self, auto_login):
+                self.pages = [FakePage()]
+                self.auto_login = auto_login
+
+            def on(self, event, handler):
+                pass
+
+            def remove_listener(self, event, handler):
+                pass
+
+            async def cookies(self, *_args):
+                if self.auto_login.await_count >= 1:
+                    return list(fresh)
+                return []
+
+        async def run():
+            auto_login = AsyncMock(return_value=PA_AUTO_LOGIN_SUBMITTED)
+            context = FakeContext(auto_login)
+            with patch(
+                "bdo_marketplace_tools.market.browser_auth._maybe_run_pa_credentials_login",
+                new=auto_login,
+            ):
+                cookies = await _wait_for_market_cookies(
+                    context,
+                    status_callback=None,
+                    timeout_seconds=1,
+                    auto_pa_login=True,
+                    pa_email="user@example.com",
+                    pa_password="secret",
+                    account_label="Pearl Abyss Account",
+                )
+            return cookies, auto_login.await_count
+
+        cookies, auto_login_calls = asyncio.run(run())
+
+        self.assertEqual([cookie["name"] for cookie in cookies], ["TradeAuth_Session"])
+        self.assertEqual(auto_login_calls, 1)
+
+    def test_market_cookie_wait_pa_manual_needed_stops_auto_login_attempts(self):
+        class FakeFirstLocator:
+            async def is_visible(self, timeout=None):
+                return False
+
+        class FakeLocator:
+            first = FakeFirstLocator()
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-US/Member/Login"
+            frames = []
+
+            def is_closed(self):
+                return False
+
+            def locator(self, _selector):
+                return FakeLocator()
+
+        class FakeContext:
+            pages = [FakePage()]
+
+            def on(self, event, handler):
+                pass
+
+            def remove_listener(self, event, handler):
+                pass
+
+            async def cookies(self, *_args):
+                return []
+
+        async def run():
+            auto_login = AsyncMock(
+                side_effect=[
+                    PA_AUTO_LOGIN_SUBMITTED,
+                    PA_AUTO_LOGIN_MANUAL_NEEDED,
+                    AssertionError("PA auto-login should stop after manual fallback"),
+                ]
+            )
+            with patch(
+                "bdo_marketplace_tools.market.browser_auth._maybe_run_pa_credentials_login",
+                new=auto_login,
+            ), patch("bdo_marketplace_tools.market.browser_auth.BROWSER_AUTH_POLL_SECONDS", 0.01):
+                with self.assertRaisesRegex(BrowserAuthError, "Pearl Abyss Account browser session timed out"):
+                    await _wait_for_market_cookies(
+                        FakeContext(),
+                        status_callback=None,
+                        timeout_seconds=0.08,
+                        auto_pa_login=True,
+                        pa_email="user@example.com",
+                        pa_password="secret",
+                        account_label="Pearl Abyss Account",
+                    )
+            return auto_login.await_count
+
+        auto_login_calls = asyncio.run(run())
+
+        self.assertEqual(auto_login_calls, 2)
+
     def test_auth_challenge_detected_on_login_page_when_widget_visible(self):
         class FakeFirstLocator:
             def __init__(self, selector):
@@ -1346,6 +1472,305 @@ class APIResultTests(unittest.TestCase):
 
         self.assertEqual(result, PA_AUTO_LOGIN_DISABLED)
         self.assertEqual(clicked_selectors, [])
+
+    def test_pa_credentials_auto_login_retries_when_login_form_returns_after_submit(self):
+        filled_fields = []
+        clicked_selectors = []
+        statuses = []
+        tracking = _new_pa_auto_login_state()
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def fill(self, value, timeout=None):
+                if self.selector not in {"#_email", "#_password"}:
+                    raise RuntimeError("not found")
+                filled_fields.append((self.selector, value, timeout))
+
+            async def click(self, timeout=None):
+                if self.selector != "#btnLogin":
+                    raise RuntimeError("not found")
+                clicked_selectors.append((self.selector, timeout))
+
+            async def is_visible(self, timeout=None):
+                return self.selector in {"#_email", "#_password"}
+
+            async def input_value(self, timeout=None):
+                if self.selector == "#_password":
+                    return ""
+                raise RuntimeError("not found")
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        async def run():
+            page = FakePage()
+            return [
+                await _maybe_run_pa_credentials_login(
+                    page,
+                    "pa",
+                    enabled=True,
+                    email="user@example.com",
+                    password="secret",
+                    tracking=tracking,
+                    status_callback=status_callback,
+                    now=0,
+                ),
+                await _maybe_run_pa_credentials_login(
+                    page,
+                    "pa",
+                    enabled=True,
+                    email="user@example.com",
+                    password="secret",
+                    tracking=tracking,
+                    status_callback=status_callback,
+                    now=1,
+                ),
+                await _maybe_run_pa_credentials_login(
+                    page,
+                    "pa",
+                    enabled=True,
+                    email="user@example.com",
+                    password="secret",
+                    tracking=tracking,
+                    status_callback=status_callback,
+                    now=2.1,
+                ),
+            ]
+
+        results = asyncio.run(run())
+
+        self.assertEqual(results, [PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_WAITING, PA_AUTO_LOGIN_SUBMITTED])
+        self.assertEqual(clicked_selectors, [("#btnLogin", 1000), ("#btnLogin", 1000)])
+        self.assertEqual(
+            filled_fields,
+            [
+                ("#_email", "user@example.com", 1000),
+                ("#_password", "secret", 1000),
+                ("#_email", "user@example.com", 1000),
+                ("#_password", "secret", 1000),
+            ],
+        )
+        self.assertEqual(
+            statuses,
+            [
+                ("Automatic Pearl Abyss login submitted saved credentials.", "info"),
+                ("Pearl Abyss login returned to the login page; retrying saved credentials.", "warning"),
+            ],
+        )
+
+    def test_pa_credentials_auto_login_does_not_retry_without_login_form(self):
+        clicked_selectors = []
+        tracking = _new_pa_auto_login_state()
+        form_visible = True
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def fill(self, _value, timeout=None):
+                if not form_visible or self.selector not in {"#_email", "#_password"}:
+                    raise RuntimeError("not found")
+
+            async def click(self, timeout=None):
+                if not form_visible or self.selector != "#btnLogin":
+                    raise RuntimeError("not found")
+                clicked_selectors.append((self.selector, timeout))
+
+            async def is_visible(self, timeout=None):
+                return form_visible and self.selector in {"#_email", "#_password"}
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/LoginProcess"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        async def run():
+            nonlocal form_visible
+            page = FakePage()
+            first = await _maybe_run_pa_credentials_login(
+                page,
+                "pa",
+                enabled=True,
+                email="user@example.com",
+                password="secret",
+                tracking=tracking,
+                now=0,
+            )
+            form_visible = False
+            second = await _maybe_run_pa_credentials_login(
+                page,
+                "pa",
+                enabled=True,
+                email="user@example.com",
+                password="secret",
+                tracking=tracking,
+                now=3,
+            )
+            return [first, second]
+
+        results = asyncio.run(run())
+
+        self.assertEqual(results, [PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_WAITING])
+        self.assertEqual(clicked_selectors, [("#btnLogin", 1000)])
+
+    def test_pa_credentials_auto_login_does_not_retry_when_password_remains_filled(self):
+        clicked_selectors = []
+        statuses = []
+        tracking = _new_pa_auto_login_state()
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def fill(self, _value, timeout=None):
+                if self.selector not in {"#_email", "#_password"}:
+                    raise RuntimeError("not found")
+
+            async def click(self, timeout=None):
+                if self.selector != "#btnLogin":
+                    raise RuntimeError("not found")
+                clicked_selectors.append((self.selector, timeout))
+
+            async def is_visible(self, timeout=None):
+                return self.selector in {"#_email", "#_password"}
+
+            async def input_value(self, timeout=None):
+                if self.selector == "#_password":
+                    return "secret"
+                raise RuntimeError("not found")
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        async def run():
+            page = FakePage()
+            return [
+                await _maybe_run_pa_credentials_login(
+                    page,
+                    "pa",
+                    enabled=True,
+                    email="user@example.com",
+                    password="secret",
+                    tracking=tracking,
+                    status_callback=status_callback,
+                    now=0,
+                ),
+                await _maybe_run_pa_credentials_login(
+                    page,
+                    "pa",
+                    enabled=True,
+                    email="user@example.com",
+                    password="secret",
+                    tracking=tracking,
+                    status_callback=status_callback,
+                    now=3,
+                ),
+            ]
+
+        results = asyncio.run(run())
+
+        self.assertEqual(results, [PA_AUTO_LOGIN_SUBMITTED, PA_AUTO_LOGIN_WAITING])
+        self.assertEqual(clicked_selectors, [("#btnLogin", 1000)])
+        self.assertEqual(statuses, [("Automatic Pearl Abyss login submitted saved credentials.", "info")])
+
+    def test_pa_credentials_auto_login_stops_after_retry_cap(self):
+        clicked_selectors = []
+        statuses = []
+        tracking = _new_pa_auto_login_state()
+
+        class FakeFirstLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            async def fill(self, _value, timeout=None):
+                if self.selector not in {"#_email", "#_password"}:
+                    raise RuntimeError("not found")
+
+            async def click(self, timeout=None):
+                if self.selector != "#btnLogin":
+                    raise RuntimeError("not found")
+                clicked_selectors.append((self.selector, timeout))
+
+            async def is_visible(self, timeout=None):
+                return self.selector in {"#_email", "#_password"}
+
+            async def input_value(self, timeout=None):
+                if self.selector == "#_password":
+                    return ""
+                raise RuntimeError("not found")
+
+        class FakeLocator:
+            def __init__(self, selector):
+                self.first = FakeFirstLocator(selector)
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-us/Member/Login"
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+        async def status_callback(message, level):
+            statuses.append((message, level))
+
+        async def run():
+            page = FakePage()
+            results = []
+            for now in (0, 2.1, 4.2, 6.3):
+                results.append(
+                    await _maybe_run_pa_credentials_login(
+                        page,
+                        "pa",
+                        enabled=True,
+                        email="user@example.com",
+                        password="secret",
+                        tracking=tracking,
+                        status_callback=status_callback,
+                        now=now,
+                    )
+                )
+            return results
+
+        results = asyncio.run(run())
+
+        self.assertEqual(
+            results,
+            [
+                PA_AUTO_LOGIN_SUBMITTED,
+                PA_AUTO_LOGIN_SUBMITTED,
+                PA_AUTO_LOGIN_SUBMITTED,
+                PA_AUTO_LOGIN_MANUAL_NEEDED,
+            ],
+        )
+        self.assertEqual(clicked_selectors, [("#btnLogin", 1000), ("#btnLogin", 1000), ("#btnLogin", 1000)])
+        self.assertEqual(statuses[-1][0], "Pearl Abyss login did not progress after saved credentials were submitted. Continue manually in the browser.")
+        self.assertEqual(statuses[-1][1], "warning")
 
     def test_steam_auto_login_clicks_pa_steam_button(self):
         clicked_selectors = []
@@ -3559,7 +3984,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("buy chain done" in event for event in manager.events))
         self.assertTrue(any("Marketplace session cleared" in event for event in manager.events))
 
-    async def test_debug_session_invalidation_keeps_running_monitor_and_buy_mode(self):
+    async def test_debug_session_invalidation_clears_session_but_keeps_running_monitor_and_buy_mode(self):
         manager = self.make_task_manager(test_mode_enabled=True)
         manager.api_handler.login_status = True
         manager.purchase_submission_enabled = True
@@ -3577,11 +4002,11 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(invalidated)
         self.assertTrue(manager.checker_enabled)
         self.assertTrue(manager.purchase_submission_enabled)
-        self.assertTrue(manager.api_handler.login_status)
-        self.assertFalse(manager.api_handler.session_cleared)
+        self.assertFalse(manager.api_handler.login_status)
+        self.assertTrue(manager.api_handler.session_cleared)
         self.assertTrue(manager.debug_force_purchase_session_expired)
         self.assertFalse(manager.saved_session_last_known_valid)
-        self.assertEqual(len(manager.events), 0)
+        self.assertTrue(any("marketplace session cleared" in event for event in manager.events))
 
         await manager.stop_checker()
 
@@ -3597,7 +4022,8 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(invalidated)
         self.assertTrue(manager.debug_force_purchase_session_expired)
         self.assertTrue(manager.steam_auto_reauth_enabled)
-        self.assertTrue(manager.api_handler.login_status)
+        self.assertFalse(manager.api_handler.login_status)
+        self.assertTrue(manager.api_handler.session_cleared)
         self.assertFalse(manager.saved_session_last_known_valid)
 
     async def test_debug_toggle_steam_auto_reauth_requires_test_mode_and_steam_mode(self):
@@ -3625,7 +4051,12 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.purchase_submission_enabled = True
         manager.debug_invalidate_marketplace_session()
         manager.api_handler.login = AsyncMock(return_value=1)
-        manager.refresh_pa_browser_session = AsyncMock(return_value=True)
+
+        async def successful_pa_refresh(*_args, **_kwargs):
+            manager.api_handler.login_status = True
+            return True
+
+        manager.refresh_pa_browser_session = AsyncMock(side_effect=successful_pa_refresh)
 
         recovered = await manager.debug_run_reauthentication_check()
 
@@ -5107,12 +5538,11 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 app.task_manager.debug_toggle_steam_auto_reauth.assert_called_once()
                 self.assertIn("debug override enabled", app.status_message)
 
-                previous_status = app.status_message
                 await pilot.click("#expire-test-session")
                 await pilot.pause(0.1)
 
                 app.task_manager.debug_invalidate_marketplace_session.assert_called_once()
-                self.assertEqual(app.status_message, previous_status)
+                self.assertIn("marketplace session cleared", app.status_message)
 
                 await pilot.click("#run-reauth-check")
                 await pilot.pause(0.1)
