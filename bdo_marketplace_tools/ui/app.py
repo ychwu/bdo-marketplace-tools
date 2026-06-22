@@ -29,6 +29,7 @@ from bdo_marketplace_tools.ui.display import (
     COLOR_SUCCESS,
     COLOR_TEXT_MUTED,
     COLOR_WARNING,
+    format_compact_number,
     format_compact_silver,
     format_percent,
     mask_email,
@@ -128,6 +129,7 @@ class MarketplaceToolsApp(App[None]):
     .screen-heading {
         text-style: bold;
         color: __COLOR_BRAND__;
+        margin-bottom: 1;
     }
 
     .panel {
@@ -1336,12 +1338,12 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_modal_tile(
             "session-credentials-tile",
             "Credentials",
-            "Set" if credentials_ready else "Optional",
-            "Automatic browser login" if credentials_ready else "Manual browser login available",
-            "success" if credentials_ready else "info",
+            "Set" if credentials_ready else "Required",
+            "Automatic browser login" if credentials_ready else "Save PA credentials first",
+            "success" if credentials_ready else "warning",
             True,
         )
-        refresh_button.disabled = False
+        refresh_button.disabled = not credentials_ready
 
     def refresh_modal_summaries(self) -> None:
         self.refresh_credentials_summary()
@@ -1369,12 +1371,6 @@ class MarketplaceToolsApp(App[None]):
         await content.mount(Static("Inventory data has not been loaded yet.", id="wallet-output", classes="panel"))
 
     async def mount_stats(self, content: Container) -> None:
-        await content.mount(
-            Horizontal(
-                ModalAction("Refresh Stats", "refresh-stats"),
-                id="stats-actions",
-            )
-        )
         await content.mount(Static("This Session", classes="stats-section-title"))
         await content.mount(
             Horizontal(
@@ -1386,13 +1382,7 @@ class MarketplaceToolsApp(App[None]):
             )
         )
         await content.mount(Static("Lifetime", classes="stats-section-title"))
-        await content.mount(
-            Horizontal(
-                Static(id="stats-lifetime-purchases", classes="stats-tile"),
-                Static(id="stats-lifetime-spent", classes="stats-tile"),
-                classes="stats-row",
-            )
-        )
+        await content.mount(Static(id="stats-lifetime-list", classes="settings-config"))
         self.refresh_stats()
 
     def refresh_info_tile(
@@ -1443,23 +1433,18 @@ class MarketplaceToolsApp(App[None]):
             format_compact_silver(self.task_manager.session_silver_spent),
             "This session",
         )
-        self.refresh_info_tile(
-            "stats-lifetime-purchases",
-            "Bought",
-            str(self.task_manager.lifetime_successful_purchases),
-            "All time",
-            "success" if self.task_manager.lifetime_successful_purchases else "info",
-        )
-        self.refresh_info_tile(
-            "stats-lifetime-spent",
-            "Silver Spent",
-            format_compact_silver(self.task_manager.lifetime_silver_spent),
-            "All time",
-        )
+        lifetime = Table.grid(padding=(0, 2))
+        lifetime.add_column(style=f"bold {COLOR_TEXT_MUTED}", no_wrap=True)
+        lifetime.add_column()
+        lifetime.add_row("Bought", format_compact_number(self.task_manager.lifetime_successful_purchases))
+        lifetime.add_row("Spent", format_compact_silver(self.task_manager.lifetime_silver_spent))
+        try:
+            self.query_one("#stats-lifetime-list", Static).update(lifetime)
+        except Exception:
+            pass
 
     def on_modal_action_pressed(self, event: ModalAction.Pressed) -> None:
         handled = {
-            "refresh-stats",
             "refresh-wallet",
             "clear-saved-session",
             "clear-credentials",
@@ -1474,10 +1459,7 @@ class MarketplaceToolsApp(App[None]):
         event.stop()
         event.action.blur()
         action_id = event.action.action_id
-        if action_id == "refresh-stats":
-            self.refresh_stats()
-            self.set_status("Stats refreshed.", "info")
-        elif action_id == "refresh-wallet":
+        if action_id == "refresh-wallet":
             self.run_worker(self.refresh_wallet(), name="wallet-refresh", group="actions", exclusive=True)
         elif action_id == "clear-saved-session":
             self.run_worker(self.clear_saved_session(), name="clear-saved-session", group="actions", exclusive=True)
@@ -1548,9 +1530,6 @@ class MarketplaceToolsApp(App[None]):
             self.push_screen(SessionRefreshConfirmScreen(), callback=self._handle_session_refresh_confirmation)
         elif button_id == "refresh-wallet":
             self.run_worker(self.refresh_wallet(), name="wallet-refresh", group="actions", exclusive=True)
-        elif button_id == "refresh-stats":
-            self.refresh_stats()
-            self.set_status("Stats refreshed.", "info")
         elif button_id == "add-test-log":
             await self.add_test_log()
         elif button_id == "toggle-test-session":
@@ -2243,17 +2222,17 @@ class MarketplaceToolsApp(App[None]):
         if result is None or result.status == "error":
             message = "Could not check for updates. Check your connection and try again."
             self.set_settings_update_status(message)
-            self.set_status("Update check failed.", "warning")
+            self.set_status("Update check failed.")
         elif result.update_available:
             self.set_settings_update_status(
                 f"Update available: v{result.latest_version} (you have {APP_VERSION}). "
                 f"Download it from {RELEASES_URL}"
             )
-            self.set_status(f"Update available: v{result.latest_version}.", "warning")
+            self.set_status(f"Update available: v{result.latest_version}.")
         else:
             message = f"You are on the latest version (v{result.current_version})."
             self.set_settings_update_status(message)
-            self.set_status(message, "info")
+            self.set_status(message)
         self.refresh_settings_summary()
 
     def toggle_update_startup_check(self) -> None:

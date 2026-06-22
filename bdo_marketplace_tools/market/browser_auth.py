@@ -131,14 +131,23 @@ AUTH_CHALLENGE_DETECTION_TIMEOUT_MS = 150
 # Only the live auth pages can present a challenge the user must solve; never probe the market page.
 AUTH_CHALLENGE_STATES = {"pa", "steam", "otp"}
 
-# A purely cosmetic notice injected into the visible browser during first-time setup (only while the
-# app is auto-driving the cookie-consent + Steam-login flow, which is the one-time slower path). It
-# reassures the user not to click while the automation works. `pointer-events:none` means it can
-# never intercept a click, and add_init_script re-shows it on every navigation in the flow.
-FIRST_TIME_SETUP_NOTICE_SCRIPT = r"""
+# A purely cosmetic notice injected into the visible browser on EVERY auth pop-up (login / reauth,
+# Steam or PA). It reassures the user not to click while the page loads and the automation drives the
+# login, and can be flipped to a red "manual action required" state via window.__bdoSetupNotice.warn
+# when a captcha appears or auto-login gives up and the user must finish in the window. It is
+# `pointer-events:none` so it can never intercept a click, and add_init_script re-shows it on every
+# navigation in the flow.
+SETUP_NOTICE_SCRIPT = r"""
 (() => {
-  const ID = '__bdo_first_time_setup_notice__';
-  const STYLE_ID = '__bdo_first_time_setup_notice_style__';
+  const ID = '__bdo_setup_notice__';
+  const STYLE_ID = '__bdo_setup_notice_style__';
+  const SPIN_ICON = '<span style="box-sizing:border-box;width:15px;height:15px;border-radius:50%;' +
+    'border:2px solid rgba(255,145,60,0.3);border-top-color:#ff913c;' +
+    'animation:__bdoSetupSpin 0.7s linear infinite;display:inline-block;"></span>';
+  const WARN_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#ff6b5e" ' +
+    'stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:block;">' +
+    '<path d="M12 9v4"/><path d="M12 17h.01"/>' +
+    '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></svg>';
   const ensureStyle = () => {
     if (document.getElementById(STYLE_ID)) return;
     const st = document.createElement('style');
@@ -146,50 +155,73 @@ FIRST_TIME_SETUP_NOTICE_SCRIPT = r"""
     st.textContent = '@keyframes __bdoSetupSpin{to{transform:rotate(360deg)}}';
     (document.head || document.documentElement).appendChild(st);
   };
-  const show = () => {
-    if (!document.body || document.getElementById(ID)) return;
+  const paint = (accent, border, icon, title, body) => {
+    if (!document.body) return;
     ensureStyle();
-    const card = document.createElement('div');
-    card.id = ID;
-    card.setAttribute('style', [
-      'position:fixed','top:20px','left:50%','transform:translateX(-50%)',
-      'z-index:2147483647','pointer-events:none','box-sizing:border-box',
-      'max-width:520px','width:calc(100% - 32px)','padding:14px 24px',
-      'border-radius:14px','border:1px solid #2e2e2e',
-      'background:#141414','color:#cfccc4','text-align:center',
-      "font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
-      'box-shadow:0 8px 26px rgba(0,0,0,0.45)',
-      'opacity:0','transition:opacity .4s ease'
-    ].join(';'));
+    let card = document.getElementById(ID);
+    if (!card) {
+      card = document.createElement('div');
+      card.id = ID;
+      card.setAttribute('style', [
+        'position:fixed','top:20px','left:50%','transform:translateX(-50%)',
+        'z-index:2147483647','pointer-events:none','box-sizing:border-box',
+        'max-width:520px','width:calc(100% - 32px)','padding:14px 24px',
+        'border-radius:14px','background:#141414','color:#cfccc4','text-align:center',
+        "font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
+        'box-shadow:0 8px 26px rgba(0,0,0,0.45)',
+        'opacity:0','transition:opacity .4s ease'
+      ].join(';'));
+      document.body.appendChild(card);
+      requestAnimationFrame(() => { card.style.opacity = '1'; });
+    }
+    card.style.border = '1px solid ' + border;
     card.innerHTML =
       '<div style="display:flex;align-items:center;justify-content:center;gap:10px;">' +
-        '<span style="box-sizing:border-box;width:15px;height:15px;border-radius:50%;' +
-          'border:2px solid rgba(255,145,60,0.3);border-top-color:#ff913c;' +
-          'animation:__bdoSetupSpin 0.7s linear infinite;"></span>' +
-        '<span style="font-size:15px;font-weight:600;color:#ff913c;letter-spacing:.2px;">' +
-          'First-time setup in progress' +
+        icon +
+        '<span style="font-size:15px;font-weight:600;color:' + accent + ';letter-spacing:.2px;">' +
+          title +
         '</span>' +
       '</div>' +
       '<div style="font-size:13px;font-weight:400;margin-top:6px;opacity:.92;line-height:1.5;">' +
-        'This one-time step can take a little longer. Please don’t click anything — ' +
-        'it will finish on its own.' +
+        body +
       '</div>';
-    document.body.appendChild(card);
-    requestAnimationFrame(() => { card.style.opacity = '1'; });
   };
-  if (document.body) show();
-  else document.addEventListener('DOMContentLoaded', show);
+  const showSetup = () => {
+    paint('#ff913c', '#2e2e2e', SPIN_ICON, 'Setup in progress',
+      'This might take a little. Please don’t click anything — it will finish on its own.');
+  };
+  window.__bdoSetupNotice = {
+    warn: (message) => paint('#ff6b5e', '#4a2b27', WARN_ICON, 'Manual action required',
+      message || 'Action is needed in this window to continue.')
+  };
+  if (document.body) showSetup();
+  else document.addEventListener('DOMContentLoaded', showSetup);
 })();
 """
 
+SETUP_NOTICE_CAPTCHA_MESSAGE = "Solve the verification in this window to continue."
+SETUP_NOTICE_MANUAL_LOGIN_MESSAGE = "Finish signing in to this window to continue."
 
-async def _inject_first_time_setup_notice(context):
+
+async def _inject_setup_notice(context):
     # Best-effort: never let a cosmetic notice break the auth flow if the runtime lacks the API.
     add_init_script = getattr(context, "add_init_script", None)
     if not callable(add_init_script):
         return
     try:
-        await add_init_script(FIRST_TIME_SETUP_NOTICE_SCRIPT)
+        await add_init_script(SETUP_NOTICE_SCRIPT)
+    except Exception:
+        pass
+
+
+async def _set_setup_notice_warning(page, message):
+    # Flip the in-page notice to its "manual action required" state. Best-effort and never raises;
+    # the notice is cosmetic and must not affect the auth flow.
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return
+    try:
+        await evaluate("(m) => { if (window.__bdoSetupNotice) { window.__bdoSetupNotice.warn(m); } }", message)
     except Exception:
         pass
 
@@ -239,11 +271,11 @@ async def acquire_market_cookies(
             context = await _launch_persistent_chrome_context(playwright, profile_path)
             try:
                 page = context.pages[0] if context.pages else await context.new_page()
-                if handle_pa_cookie_consent:
-                    # First-time setup (cookie consent still being handled, auto-login driving): show
-                    # a non-blocking notice so the user doesn't fight the automation. Added before
-                    # the first navigation so it appears on every page of the flow.
-                    await _inject_first_time_setup_notice(context)
+                # Non-blocking notice on every auth pop-up so the user doesn't click into the page
+                # while it loads / the automation drives login. Added before the first navigation so
+                # add_init_script re-shows it on every page; it flips to a "manual action required"
+                # warning (see _set_setup_notice_warning) on a captcha or when auto-login gives up.
+                await _inject_setup_notice(context)
                 if bootstrap_url:
                     await _bootstrap_browser_profile(page, status_callback, bootstrap_url, account_label)
                 try:
@@ -557,6 +589,7 @@ async def _wait_for_market_cookies(
                 if page_challenge:
                     challenge_active = True
                     challenge_ever_seen = True
+                    await _set_setup_notice_warning(page, SETUP_NOTICE_CAPTCHA_MESSAGE)
                 pa_cookie_consent_result = COOKIE_CONSENT_SKIPPED
                 if not pa_cookie_consent_completed:
                     pa_cookie_consent_result = await _maybe_prepare_pa_cookie_consent(
@@ -584,6 +617,8 @@ async def _wait_for_market_cookies(
                         )
                 if auto_login_result in {STEAM_AUTO_LOGIN_CLICKED, STEAM_AUTO_LOGIN_MANUAL_NEEDED}:
                     auth_flow_seen = True
+                if auto_login_result == STEAM_AUTO_LOGIN_MANUAL_NEEDED:
+                    await _set_setup_notice_warning(page, SETUP_NOTICE_MANUAL_LOGIN_MESSAGE)
                 pa_login_result = PA_AUTO_LOGIN_SKIPPED
                 if not pa_credentials_auto_stopped and not page_challenge:
                     pa_login_result = await _maybe_run_pa_credentials_login(
@@ -600,6 +635,7 @@ async def _wait_for_market_cookies(
                     auth_flow_seen = True
                 if pa_login_result == PA_AUTO_LOGIN_MANUAL_NEEDED:
                     pa_credentials_auto_stopped = True
+                    await _set_setup_notice_warning(page, SETUP_NOTICE_MANUAL_LOGIN_MESSAGE)
 
             # Edge-triggered: announce a challenge once when it appears, and re-arm when it clears
             # so a second, later challenge is announced again rather than swallowed.

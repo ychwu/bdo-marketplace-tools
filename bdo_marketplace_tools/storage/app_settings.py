@@ -73,8 +73,8 @@ def default_app_settings():
             # While False, the next automatic Steam refresh probes for the consent banner and
             # dismisses it ("Only Accept Required") before clicking "Log in with Steam"; once the
             # banner is handled (or confirmed absent) this flips True and the probe is skipped on
-            # later refreshes. Reset to False by clearing the Steam browser cookies or resetting
-            # Steam setup (also self-reset if a Steam refresh fails while this was skipping it).
+            # later refreshes. Reset to False only by clearing the Steam browser cookies or
+            # resetting Steam setup; refresh failures do not mean browser-profile consent was lost.
             "pa_cookie_consent_prepared": False,
         },
         "pa_browser": {

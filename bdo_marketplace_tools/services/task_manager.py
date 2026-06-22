@@ -1200,6 +1200,22 @@ class BackgroundTasks:
             auto_submit_credentials = saved_credentials_ready if auto_pa_login is None else bool(auto_pa_login)
             auto_submit_credentials = auto_submit_credentials and saved_credentials_ready
 
+            if not saved_credentials_ready:
+                self.api_handler.login_status = False
+                self._set_saved_session_last_known_valid(False)
+                if credential_error:
+                    details.append(f"Saved credentials unavailable: {credential_error}.")
+                elif email:
+                    details.append(
+                        "Pearl Abyss Account credentials are incomplete. Save the account password before refreshing."
+                    )
+                else:
+                    details.append(
+                        "Pearl Abyss Account credentials are not saved. Save credentials before refreshing the session."
+                    )
+                self.add_event(" ".join(details), "warning")
+                return False
+
             if credential_error:
                 details.append(f"Saved credentials unavailable: {credential_error}.")
             if auto_submit_credentials:

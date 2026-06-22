@@ -935,19 +935,108 @@ class APIResultTests(unittest.TestCase):
             )
         return fake_context
 
-    def test_first_time_setup_notice_injected_when_handling_cookie_consent(self):
+    def test_setup_notice_injected_on_auth_popup(self):
         fake_context = self._run_acquire_for_notice(handle_pa_cookie_consent=True)
 
         self.assertEqual(len(fake_context.init_scripts), 1)
         script = fake_context.init_scripts[0]
-        self.assertIn("First-time setup in progress", script)
+        self.assertIn("Setup in progress", script)
+        # Exposes the hook used to flip the box to its manual-action warning state.
+        self.assertIn("__bdoSetupNotice", script)
         # Cosmetic only: it must never be able to intercept a click.
         self.assertIn("pointer-events:none", script)
 
-    def test_first_time_setup_notice_skipped_when_not_handling_cookie_consent(self):
+    def test_setup_notice_injected_even_without_cookie_consent_handling(self):
+        # The notice is no longer gated on first-time cookie-consent handling; it shows on every
+        # embedded auth pop-up (login / reauth) so the user doesn't click during slow page loads.
         fake_context = self._run_acquire_for_notice(handle_pa_cookie_consent=False)
 
-        self.assertEqual(fake_context.init_scripts, [])
+        self.assertEqual(len(fake_context.init_scripts), 1)
+        self.assertIn("Setup in progress", fake_context.init_scripts[0])
+
+    def test_set_setup_notice_warning_evaluates_in_page(self):
+        from bdo_marketplace_tools.market.browser_auth import (
+            SETUP_NOTICE_CAPTCHA_MESSAGE,
+            _set_setup_notice_warning,
+        )
+
+        calls = []
+
+        class FakePage:
+            async def evaluate(self, script, arg=None):
+                calls.append((script, arg))
+
+        asyncio.run(_set_setup_notice_warning(FakePage(), SETUP_NOTICE_CAPTCHA_MESSAGE))
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("__bdoSetupNotice", calls[0][0])
+        self.assertEqual(calls[0][1], SETUP_NOTICE_CAPTCHA_MESSAGE)
+
+    def test_set_setup_notice_warning_is_best_effort(self):
+        from bdo_marketplace_tools.market.browser_auth import _set_setup_notice_warning
+
+        class FakePageNoEvaluate:
+            pass
+
+        class FakePageRaises:
+            async def evaluate(self, script, arg=None):
+                raise RuntimeError("boom")
+
+        # A missing evaluate or an exception must never propagate out of the cosmetic notice helper.
+        asyncio.run(_set_setup_notice_warning(FakePageNoEvaluate(), "x"))
+        asyncio.run(_set_setup_notice_warning(FakePageRaises(), "x"))
+
+    def test_market_cookie_wait_captcha_flips_notice_to_warning(self):
+        warn = AsyncMock()
+
+        class FakePage:
+            url = "https://account.pearlabyss.com/en-US/Member/Login"
+            frames = []
+
+            def is_closed(self):
+                return False
+
+            def locator(self, _selector):
+                return None
+
+        class FakeContext:
+            pages = [FakePage()]
+
+            def on(self, event, handler):
+                pass
+
+            def remove_listener(self, event, handler):
+                pass
+
+            async def cookies(self, *_args):
+                return []
+
+        async def run():
+            with patch(
+                "bdo_marketplace_tools.market.browser_auth._auth_challenge_visible",
+                new=AsyncMock(return_value=True),
+            ), patch(
+                "bdo_marketplace_tools.market.browser_auth._maybe_prepare_pa_cookie_consent",
+                new=AsyncMock(return_value=None),
+            ), patch(
+                "bdo_marketplace_tools.market.browser_auth._set_setup_notice_warning",
+                new=warn,
+            ), patch("bdo_marketplace_tools.market.browser_auth.BROWSER_AUTH_POLL_SECONDS", 0.01):
+                with self.assertRaisesRegex(BrowserAuthError, "verification"):
+                    await _wait_for_market_cookies(
+                        FakeContext(),
+                        status_callback=None,
+                        timeout_seconds=0.05,
+                        auto_pa_login=True,
+                        pa_email="user@example.com",
+                        pa_password="secret",
+                        account_label="Pearl Abyss Account",
+                    )
+
+        asyncio.run(run())
+
+        self.assertGreaterEqual(warn.await_count, 1)
+        self.assertIn("verification", warn.await_args.args[1])
 
     def test_browser_context_close_closes_pages_before_context(self):
         async def run_close():
@@ -3563,7 +3652,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(browser_auth.await_args.kwargs["bootstrap_url"])
         await manager.stop_login_status_checker()
 
-    async def test_pa_login_in_memory_credentials_without_saved_password_do_not_auto_submit(self):
+    async def test_pa_login_in_memory_credentials_without_saved_password_blocks_browser_refresh(self):
         manager = self.make_task_manager()
         manager.api_handler.email = "user@example.com"
         manager.api_handler.password = "secret"
@@ -3579,12 +3668,13 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         ) as browser_auth:
             await manager.login()
 
-        browser_auth.assert_awaited_once()
-        self.assertFalse(browser_auth.await_args.kwargs["auto_pa_login"])
-        self.assertIsNone(browser_auth.await_args.kwargs["pa_email"])
-        self.assertIsNone(browser_auth.await_args.kwargs["pa_password"])
+        browser_auth.assert_not_awaited()
+        manager.api_handler.validate_and_save_imported_session.assert_not_awaited()
+        self.assertFalse(manager.api_handler.login_status)
+        self.assertFalse(manager.saved_session_last_known_valid)
+        self.assertTrue(any("Pearl Abyss Account credentials are not saved" in event for event in manager.events))
 
-    async def test_pa_login_without_saved_credentials_uses_manual_browser_refresh(self):
+    async def test_pa_login_without_saved_credentials_blocks_browser_refresh(self):
         manager = self.make_task_manager()
         manager.api_handler.email = None
         manager.api_handler.password = None
@@ -3600,10 +3690,11 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         ) as browser_auth:
             await manager.login()
 
-        browser_auth.assert_awaited_once()
-        self.assertFalse(browser_auth.await_args.kwargs["auto_pa_login"])
-        self.assertIsNone(browser_auth.await_args.kwargs["pa_email"])
-        self.assertIsNone(browser_auth.await_args.kwargs["pa_password"])
+        browser_auth.assert_not_awaited()
+        manager.api_handler.validate_and_save_imported_session.assert_not_awaited()
+        self.assertFalse(manager.api_handler.login_status)
+        self.assertFalse(manager.saved_session_last_known_valid)
+        self.assertTrue(any("Pearl Abyss Account credentials are not saved" in event for event in manager.events))
 
     async def test_pa_browser_refresh_loads_saved_credentials_for_auto_login(self):
         manager = self.make_task_manager()
@@ -4782,7 +4873,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("3")
                 self.assertEqual(app.current_view, "stats")
                 self.assertEqual(len(list(app.query("#stats-output"))), 0)
-                self.assertEqual(len(list(app.query(".stats-tile"))), 6)
+                self.assertEqual(len(list(app.query(".stats-tile"))), 4)
                 await pilot.press("escape")
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertTrue(app.query_one("#banner").display)
@@ -4996,6 +5087,33 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Saved marketplace session cleared", app.status_message)
         self.assertTrue(any("Manual session reset. Marketplace session cleared" in event for event in app.task_manager.events))
 
+    async def test_app_settings_manual_update_check_logs_once(self):
+        app = self.make_app()
+        result = update_checker_module.UpdateCheckResult(
+            "up-to-date",
+            APP_VERSION,
+            latest_version=APP_VERSION,
+        )
+
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)), patch(
+            "bdo_marketplace_tools.services.task_manager.run_update_check",
+            return_value=result,
+        ):
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.press("1")
+                await app.check_for_updates_from_settings()
+
+                self.assertEqual(
+                    str(app.query_one("#settings-update-status", Static).content),
+                    f"You are on the latest version (v{APP_VERSION}).",
+                )
+
+        latest_events = [
+            event for event in app.task_manager.events_for_channel("ui") if "latest version" in event
+        ]
+        self.assertEqual(len(latest_events), 1)
+        self.assertEqual(app.status_message, f"You are on the latest version (v{APP_VERSION}).")
+
     async def test_dashboard_live_metrics_refresh(self):
         app = self.make_app()
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
@@ -5112,14 +5230,14 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertEqual(type(app.screen_stack[-1]).__name__, "SessionModal")
                 self.assertEqual(len(list(app.screen_stack[-1].query("#session-status-tile"))), 0)
-                self.assertFalse(app.query_visible_one("#refresh-session", Button).disabled)
+                self.assertTrue(app.query_visible_one("#refresh-session", Button).disabled)
                 self.assertFalse(app.query_visible_one("#refresh-session", Button).can_focus)
                 console = Console(width=100, color_system=None)
                 with console.capture() as capture:
                     console.print(app.query_visible_one("#session-credentials-tile", Static).content)
                 session_credentials_text = capture.get()
-                self.assertIn("Optional", session_credentials_text)
-                self.assertIn("Manual browser login available", session_credentials_text)
+                self.assertIn("Required", session_credentials_text)
+                self.assertIn("Save PA credentials first", session_credentials_text)
                 await pilot.press("escape")
                 await pilot.click("#tile-success")
                 self.assertEqual(app.current_view, "dashboard")
@@ -5365,31 +5483,29 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
                 await pilot.press("3")
-                self.assertIsInstance(app.query_one("#refresh-stats"), ModalAction)
-                self.assertEqual(list(app.query("#stats-actions Button")), [])
+                # The Stats page live-refreshes, so there is no manual refresh control.
+                self.assertEqual(list(app.query("#refresh-stats")), [])
+                self.assertEqual(len(list(app.query(".stats-tile"))), 4)
                 stat_tiles = [
                     app.query_one("#stats-session-detected", Static),
                     app.query_one("#stats-session-purchases", Static),
                     app.query_one("#stats-session-rate", Static),
                     app.query_one("#stats-session-spent", Static),
-                    app.query_one("#stats-lifetime-purchases", Static),
-                    app.query_one("#stats-lifetime-spent", Static),
                 ]
                 console = Console(width=100, color_system=None)
                 with console.capture() as capture:
                     for tile in stat_tiles:
                         console.print(tile.content)
+                    console.print(app.query_one("#stats-lifetime-list", Static).content)
                 rendered = capture.get()
                 border_titles = "\n".join(str(tile.border_title) for tile in stat_tiles)
-                await pilot.click("#refresh-stats")
-                await pilot.pause()
 
         self.assertIn("Success Rate", border_titles)
         self.assertIn("80%", rendered)
         self.assertIn("2B silver", rendered)
+        # Lifetime totals now render as a compact list rather than tiles.
         self.assertIn("12B silver", rendered)
         self.assertNotIn("Local Data File", rendered)
-        self.assertEqual(app.status_message, "Stats refreshed.")
 
     async def test_marketplace_inventory_page_is_wip_and_uses_standard_action(self):
         app = self.make_app()
