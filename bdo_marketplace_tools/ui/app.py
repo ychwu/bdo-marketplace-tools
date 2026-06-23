@@ -294,7 +294,7 @@ class MarketplaceToolsApp(App[None]):
 
     .dashboard-tile-row {
         height: 3;
-        padding-left: 2;
+        padding-left: 1;
     }
 
     #dashboard-primary-tiles {
