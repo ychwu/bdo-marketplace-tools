@@ -2,7 +2,6 @@ import asyncio
 import json
 import random
 import stat
-from urllib.parse import urlparse
 
 import requests
 

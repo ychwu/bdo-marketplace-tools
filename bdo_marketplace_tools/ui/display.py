@@ -1,6 +1,3 @@
-from bdo_marketplace_tools.version import APP_CHANNEL, APP_VERSION
-
-
 APP_TITLE = "Marketplace Tools"
 
 COLOR_BRAND = "rgb(255,145,60)"

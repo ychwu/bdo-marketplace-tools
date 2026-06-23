@@ -1,4 +1,4 @@
-﻿from bdo_marketplace_tools.ui.display import COLOR_BRAND, COLOR_CAUTION, COLOR_ERROR, COLOR_INFO, COLOR_SUCCESS, COLOR_WARNING
+﻿from bdo_marketplace_tools.ui.display import COLOR_CAUTION, COLOR_ERROR, COLOR_INFO, COLOR_SUCCESS, COLOR_WARNING
 
 from bdo_marketplace_tools.ui.display import COLOR_GOLD, COLOR_STEAM
 

@@ -1,12 +1,10 @@
 import asyncio
-import os
 import random
 import time
 from collections import deque
 from datetime import datetime
 
 from bdo_marketplace_tools.market.api_handler import (
-    DEFAULT_PURCHASE_DELAY_BOUNDS,
     MarketplaceAPIError,
 )
 from bdo_marketplace_tools.market.browser_auth import (
@@ -15,7 +13,6 @@ from bdo_marketplace_tools.market.browser_auth import (
     acquire_market_cookies,
     clear_market_cookies_keep_steam_login,
     clear_steam_browser_profile_cookies,
-    open_blank_steam_browser_diagnostic,
     prepare_steam_browser_profile,
 )
 from bdo_marketplace_tools.market.pricing import apply_price_rules, purchase_record_count, purchase_record_spend
@@ -904,19 +901,6 @@ class BackgroundTasks:
             self.debug_force_purchase_session_expired = False
         return result
 
-    async def debug_open_blank_browser_diagnostic(self):
-        if not self.test_mode_enabled:
-            return False
-
-        try:
-            await open_blank_steam_browser_diagnostic(status_callback=self._browser_auth_status)
-        except BrowserAuthError as exc:
-            self.add_event(f"Blank browser diagnostic failed: {exc}", "error")
-            return False
-
-        self.add_event("Blank browser diagnostic closed.", "info")
-        return True
-
     def reset_steam_initial_setup_status(self):
         """Mark Steam initial setup incomplete and clear the one-time consent flag.
 
@@ -936,13 +920,13 @@ class BackgroundTasks:
 
         return self.reset_steam_initial_setup_status()
 
-    async def debug_dump_cookies_keep_steam_login(self):
+    async def debug_clear_market_cookies_keep_steam_login(self):
         if not self.test_mode_enabled:
             return False
 
         if not self.uses_steam_browser_session():
             self.add_event(
-                "Dump cookies (keep Steam login) is only available in Steam Account mode.",
+                "Clear cookies (keep Steam login) is only available in Steam Account mode.",
                 "warning",
             )
             return False
@@ -950,7 +934,7 @@ class BackgroundTasks:
         try:
             cleared_count = await clear_market_cookies_keep_steam_login(profile_path=STEAM_MARKET_PROFILE_PATH)
         except BrowserAuthError as exc:
-            self.add_event(f"Test cookie dump failed: {exc}", "error")
+            self.add_event(f"Test cookie clear failed: {exc}", "error")
             return False
 
         # Re-arm the re-auth flow so the next refresh runs the full cookie-box + Steam-button path,
@@ -1354,13 +1338,6 @@ class BackgroundTasks:
                 bootstrap_url = None
                 if not self.pa_browser_profile_prepared:
                     bootstrap_url = BDO_SITE_BOOTSTRAP_URL
-
-                # DIAGNOSTIC (temporary): set BDO_PA_SKIP_BOOTSTRAP=1 to skip the fresh-start bootstrap
-                # detour and test whether it is what makes the PA login submission bounce back. Off by
-                # default, so normal behavior and the test suite are unchanged. Remove once diagnosed.
-                if bootstrap_url and os.environ.get("BDO_PA_SKIP_BOOTSTRAP"):
-                    bootstrap_url = None
-                    self.add_event("DIAGNOSTIC: skipping fresh-start bootstrap for this PA refresh.", "warning")
 
                 if cleanup_browser_cache:
                     await self._clean_browser_cache_before_auth(PA_MARKET_PROFILE_PATH, "Pearl Abyss Account")

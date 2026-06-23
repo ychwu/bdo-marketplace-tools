@@ -23,16 +23,15 @@ from bdo_marketplace_tools.market.api_handler import (
 from bdo_marketplace_tools.market.browser_auth import (
     BDO_SITE_BOOTSTRAP_URL,
     BrowserAuthError,
+    BrowserAuthUnavailable,
     AUTH_DIALOG_INVALID_CREDENTIALS,
     AUTH_DIALOG_VERIFICATION_REQUIRED,
     COOKIE_CONSENT_NOT_FOUND,
     COOKIE_CONSENT_SAVED,
-    COOKIE_CONSENT_SKIPPED,
     STEAM_AUTO_LOGIN_CLICKED,
     STEAM_AUTO_LOGIN_DISABLED,
     STEAM_AUTO_LOGIN_MANUAL_NEEDED,
     STEAM_AUTO_LOGIN_SKIPPED,
-    STEAM_AUTO_LOGIN_WAITING,
     PA_AUTO_LOGIN_DISABLED,
     PA_AUTO_LOGIN_MANUAL_NEEDED,
     PA_AUTO_LOGIN_SUBMITTED,
@@ -41,7 +40,6 @@ from bdo_marketplace_tools.market.browser_auth import (
     STEAM_BROWSER_CHANNEL,
     STEAM_COMMUNITY_URL,
     STEAM_LOGIN_COOKIE_NAMES,
-    STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH,
     STEAM_MARKET_PROFILE_PATH,
     STEAM_PROFILE_COOKIE_URLS,
     STEAM_STORE_URL,
@@ -52,6 +50,7 @@ from bdo_marketplace_tools.market.browser_auth import (
     clear_market_cookies_keep_steam_login,
     clear_steam_browser_profile_cookies,
     _handle_auth_dialog,
+    _import_async_playwright,
     _close_browser_context,
     _has_steam_login_cookie,
     _install_auth_dialog_handlers,
@@ -272,6 +271,21 @@ class PricingTests(unittest.TestCase):
 
 
 class APIResultTests(unittest.TestCase):
+    def test_async_playwright_import_error_preserves_install_message(self):
+        expected_message = "Install requirements before opening Chrome."
+        real_import = __import__
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "patchright.async_api" and "async_playwright" in fromlist:
+                raise ImportError("missing patchright")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with patch("builtins.__import__", side_effect=fake_import):
+            with self.assertRaises(BrowserAuthUnavailable) as context:
+                _import_async_playwright(expected_message)
+
+        self.assertEqual(str(context.exception), expected_message)
+
     def test_browser_auth_launch_error_names_missing_patchright_browser_install(self):
         message = _browser_launch_error_message(
             RuntimeError("Executable doesn't exist at C:/ms-playwright/chromium/chrome.exe")
@@ -3133,8 +3147,6 @@ class LocalRuntimeFileTests(unittest.TestCase):
         self.assertEqual(STEAM_MARKET_PROFILE_PATH.name, "steam-market")
         self.assertIn("data", PA_MARKET_PROFILE_PATH.parts)
         self.assertEqual(PA_MARKET_PROFILE_PATH.name, "pa-market")
-        self.assertIn("data", STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH.parts)
-        self.assertEqual(STEAM_MARKET_DIAGNOSTIC_PROFILE_PATH.name, "steam-market-diagnostic")
 
     def test_browser_profile_storage_measures_total_and_disposable_cache(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5037,18 +5049,6 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         manager.refresh_pa_browser_session.assert_awaited_once()
         self.assertTrue(any("Re-authentication succeeded. Retrying purchase request" in event for event in manager.events))
 
-    async def test_debug_blank_browser_diagnostic_opens_without_session_import(self):
-        manager = self.make_task_manager(test_mode_enabled=True)
-
-        with patch("bdo_marketplace_tools.services.task_manager.open_blank_steam_browser_diagnostic", new=AsyncMock()) as browser_diag:
-            opened = await manager.debug_open_blank_browser_diagnostic()
-
-        self.assertTrue(opened)
-        browser_diag.assert_awaited_once()
-        self.assertFalse(manager.api_handler.session_cleared)
-        self.assertFalse(manager.api_handler.login_status)
-        self.assertTrue(any("Blank browser diagnostic closed" in event for event in manager.events))
-
     async def test_debug_clear_steam_initial_setup_status_is_test_mode_only(self):
         manager = self.make_task_manager(test_mode_enabled=False)
         manager.steam_browser_profile_prepared = True
@@ -5114,7 +5114,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result)
         cookie_clear.assert_not_called()
 
-    async def test_debug_dump_cookies_keep_steam_login_rearms_reauth_without_steam_relogin(self):
+    async def test_debug_clear_market_cookies_keep_steam_login_rearms_reauth_without_steam_relogin(self):
         manager = self.make_task_manager(test_mode_enabled=True)
         manager.account_mode = STEAM_BROWSER_MODE
         manager.api_handler.account_mode = STEAM_BROWSER_MODE
@@ -5125,12 +5125,12 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             "bdo_marketplace_tools.services.task_manager.clear_market_cookies_keep_steam_login",
             new=AsyncMock(return_value=4),
-        ) as cookie_dump:
-            result = await manager.debug_dump_cookies_keep_steam_login()
+        ) as cookie_clear:
+            result = await manager.debug_clear_market_cookies_keep_steam_login()
 
         self.assertTrue(result)
-        cookie_dump.assert_awaited_once()
-        self.assertTrue(str(cookie_dump.await_args.kwargs["profile_path"]).endswith("steam-market"))
+        cookie_clear.assert_awaited_once()
+        self.assertTrue(str(cookie_clear.await_args.kwargs["profile_path"]).endswith("steam-market"))
         # Re-armed for a fresh re-auth run, but the Steam setup/login is intentionally preserved.
         self.assertFalse(manager.steam_pa_cookie_consent_prepared)
         self.assertFalse(manager.saved_session_last_known_valid)
@@ -5139,25 +5139,25 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("4 non-Steam cookies" in event for event in manager.events))
         self.assertFalse(any("steamLoginSecure" in event for event in manager.events))
 
-    async def test_debug_dump_cookies_keep_steam_login_is_test_mode_only(self):
+    async def test_debug_clear_market_cookies_keep_steam_login_is_test_mode_only(self):
         manager = self.make_task_manager(test_mode_enabled=False)
         manager.account_mode = STEAM_BROWSER_MODE
         manager.api_handler.account_mode = STEAM_BROWSER_MODE
 
-        with patch("bdo_marketplace_tools.services.task_manager.clear_market_cookies_keep_steam_login") as cookie_dump:
-            result = await manager.debug_dump_cookies_keep_steam_login()
+        with patch("bdo_marketplace_tools.services.task_manager.clear_market_cookies_keep_steam_login") as cookie_clear:
+            result = await manager.debug_clear_market_cookies_keep_steam_login()
 
         self.assertFalse(result)
-        cookie_dump.assert_not_called()
+        cookie_clear.assert_not_called()
 
-    async def test_debug_dump_cookies_keep_steam_login_requires_steam_mode(self):
+    async def test_debug_clear_market_cookies_keep_steam_login_requires_steam_mode(self):
         manager = self.make_task_manager(test_mode_enabled=True)  # defaults to Pearl Abyss mode
 
-        with patch("bdo_marketplace_tools.services.task_manager.clear_market_cookies_keep_steam_login") as cookie_dump:
-            result = await manager.debug_dump_cookies_keep_steam_login()
+        with patch("bdo_marketplace_tools.services.task_manager.clear_market_cookies_keep_steam_login") as cookie_clear:
+            result = await manager.debug_clear_market_cookies_keep_steam_login()
 
         self.assertFalse(result)
-        cookie_dump.assert_not_called()
+        cookie_clear.assert_not_called()
         self.assertTrue(any("only available in Steam Account mode" in event for event in manager.events))
 
     async def test_check_session_expired_honors_force_flag(self):
@@ -6515,7 +6515,6 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(list(test_app.query("#toggle-auto-reauth"))), 1)
                 self.assertEqual(len(list(test_app.query("#expire-test-session"))), 1)
                 self.assertEqual(len(list(test_app.query("#run-reauth-check"))), 1)
-                self.assertEqual(len(list(test_app.query("#open-blank-browser"))), 1)
                 self.assertEqual(len(list(test_app.query("#reset-steam-setup"))), 1)
                 self.assertEqual(len(list(test_app.query("#clear-browser-cookies"))), 1)
                 self.assertEqual(len(list(test_app.query("#start-test-monitor"))), 1)
@@ -6552,20 +6551,6 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
                 app.task_manager.debug_run_reauthentication_check.assert_awaited_once()
                 self.assertIn("re-authentication check succeeded", app.status_message)
-
-    async def test_blank_browser_debug_button_starts_worker(self):
-        app = self.make_app(launch_mode="test")
-        app.task_manager.debug_open_blank_browser_diagnostic = AsyncMock(return_value=True)
-
-        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
-            async with app.run_test(size=(100, 36)) as pilot:
-                self.assertIn("Blank Browser", str(app.query_one("#open-blank-browser", Button).render()))
-
-                await pilot.click("#open-blank-browser")
-                await pilot.pause(0.2)
-
-                app.task_manager.debug_open_blank_browser_diagnostic.assert_awaited_once()
-                self.assertIn("Blank Chrome diagnostic browser closed", app.status_message)
 
     async def test_steam_setup_debug_buttons_call_test_hooks(self):
         app = self.make_app(launch_mode="test")

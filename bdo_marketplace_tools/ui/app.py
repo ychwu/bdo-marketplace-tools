@@ -1,4 +1,3 @@
-import asyncio
 import random
 from typing import Optional
 
@@ -14,22 +13,19 @@ from textual.widgets import Button, Input, Label, RichLog, Select, Static, Switc
 
 from bdo_marketplace_tools.market.api_handler import marketplace_silver_balance
 from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET
-from bdo_marketplace_tools.storage.app_settings import ACCOUNT_MODE_LABELS, PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE
+from bdo_marketplace_tools.storage.app_settings import PA_CREDENTIALS_MODE, STEAM_BROWSER_MODE
 from bdo_marketplace_tools.storage.browser_profile_cache import (
     format_storage_size,
 )
 from bdo_marketplace_tools.storage.credentials import CredentialStoreError, clear_credentials, load_credentials, save_credentials
 from bdo_marketplace_tools.services.update_checker import RELEASES_URL
-from bdo_marketplace_tools.version import SETTINGS_SCHEMA_VERSION
+from bdo_marketplace_tools.version import APP_CHANNEL, APP_VERSION, SETTINGS_SCHEMA_VERSION
 from bdo_marketplace_tools.ui.display import (
-    APP_CHANNEL,
     APP_TITLE,
-    APP_VERSION,
     COLOR_BRAND,
     COLOR_CAUTION,
     COLOR_ERROR,
     COLOR_INFO,
-    COLOR_SUCCESS,
     COLOR_TEXT_MUTED,
     COLOR_WARNING,
     format_compact_number,
@@ -613,10 +609,9 @@ class MarketplaceToolsApp(App[None]):
                         yield Button("Expire Session", id="expire-test-session", compact=True)
                         yield Button("Run Session Check", id="run-session-check", compact=True)
                         yield Button("Reauth Check", id="run-reauth-check", compact=True)
-                        yield Button("Blank Browser", id="open-blank-browser", compact=True)
                         yield Button("Reset Steam Setup", id="reset-steam-setup", compact=True)
                         yield Button("Clear Browser Cookies", id="clear-browser-cookies", compact=True)
-                        yield Button("Clear (Keep Steam)", id="dump-cookies-keep-steam", compact=True)
+                        yield Button("Clear (Keep Steam)", id="clear-cookies-keep-steam", compact=True)
                         yield Button("Start Test Scan", id="start-test-monitor", compact=True)
                         yield Button("Start Test Buy", id="start-test-buy", compact=True)
                         yield Button("Stop Test Scan", id="stop-test-monitor", compact=True)
@@ -1604,7 +1599,7 @@ class MarketplaceToolsApp(App[None]):
         account = self.session_account_label()
         self.refresh_modal_tile("session-account-tile", "Account", account, self.task_manager.account_mode_label())
         try:
-            credentials_row = self.query_visible_one("#session-credentials-row")
+            self.query_visible_one("#session-credentials-row")
             refresh_button = self.query_visible_one("#refresh-session", Button)
         except Exception:
             return
@@ -1850,14 +1845,6 @@ class MarketplaceToolsApp(App[None]):
                 group="actions",
                 exclusive=True,
             )
-        elif button_id == "open-blank-browser":
-            if self._debug_action_allowed():
-                self.run_worker(
-                    self.open_blank_browser_diagnostic(),
-                    name="blank-browser-diagnostic",
-                    group="actions",
-                    exclusive=True,
-                )
         elif button_id == "reset-steam-setup":
             await self.reset_test_steam_setup_status()
         elif button_id == "clear-browser-cookies":
@@ -1868,11 +1855,11 @@ class MarketplaceToolsApp(App[None]):
                     group="actions",
                     exclusive=True,
                 )
-        elif button_id == "dump-cookies-keep-steam":
+        elif button_id == "clear-cookies-keep-steam":
             if self._debug_action_allowed():
                 self.run_worker(
-                    self.dump_test_cookies_keep_steam(),
-                    name="dump-cookies-keep-steam",
+                    self.clear_test_cookies_keep_steam(),
+                    name="clear-cookies-keep-steam",
                     group="actions",
                     exclusive=True,
                 )
@@ -2263,15 +2250,6 @@ class MarketplaceToolsApp(App[None]):
         self.refresh_modal_summaries()
         await self.return_to_dashboard()
 
-    async def open_blank_browser_diagnostic(self) -> None:
-        self.set_status("Opening blank Chrome diagnostic browser.")
-        opened = await self.task_manager.debug_open_blank_browser_diagnostic()
-        if opened:
-            self.set_status("Blank Chrome diagnostic browser closed.")
-        else:
-            self.set_status("Blank Chrome diagnostic browser failed.")
-        self.refresh_live_widgets()
-
     async def reset_test_steam_setup_status(self) -> None:
         if not self._debug_action_allowed():
             return
@@ -2294,21 +2272,20 @@ class MarketplaceToolsApp(App[None]):
         else:
             self.set_status("Browser cookie clear failed.", "warning")
 
-    async def dump_test_cookies_keep_steam(self) -> None:
+    async def clear_test_cookies_keep_steam(self) -> None:
         if not self._debug_action_allowed():
             return
 
-        dumped = await self.task_manager.debug_dump_cookies_keep_steam_login()
-        if dumped:
+        cleared = await self.task_manager.debug_clear_market_cookies_keep_steam_login()
+        if cleared:
             self.set_status("Cleared non-Steam cookies; kept Steam login. Run Reauth Check to test.", "warning")
         else:
-            self.set_status("Cookie dump skipped (Steam Account mode only) or failed; see log.", "warning")
+            self.set_status("Cookie clear skipped (Steam Account mode only) or failed; see log.", "warning")
 
     async def start_single_item_test_monitor(self, allow_purchase: bool = False) -> None:
         if not self._debug_action_allowed():
             return
 
-        item_name = SINGLE_ITEM_TEST_TARGET["name"]
         if self.task_manager.single_item_test_checker_enabled:
             self.set_status("Single-item test monitor already running; no additional task started.", "info")
             await self.return_to_dashboard()
