@@ -99,7 +99,14 @@ from bdo_marketplace_tools.storage.browser_profile_cache import (
     measure_browser_profile_storage,
 )
 from bdo_marketplace_tools.services.task_manager import BackgroundTasks
-from bdo_marketplace_tools.ui.app import BANNER_ART, DEFAULT_THEME, STATUS_STYLES, DashboardTile, MarketplaceToolsApp, ModalAction
+from bdo_marketplace_tools.ui.app import (
+    BANNER_ART,
+    DEFAULT_THEME,
+    STATUS_STYLES,
+    DashboardTile,
+    MarketplaceToolsApp,
+    ModalAction,
+)
 from bdo_marketplace_tools.version import APP_CHANNEL, APP_VERSION, PROJECT_NAME, SETTINGS_SCHEMA_VERSION
 
 
@@ -5685,34 +5692,34 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
         app.startup_update_check = AsyncMock()
         return app
 
-    async def test_app_launches_and_navigates_sidebar(self):
+    async def test_app_launches_and_navigates_tabs(self):
         app = self.make_app()
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
-            async with app.run_test(size=(100, 36)) as pilot:
+            async with app.run_test(size=(100, 40)) as pilot:
                 self.assertEqual(app.current_view, "dashboard")
                 self.assertEqual(app.theme, DEFAULT_THEME)
-                self.assertEqual(len(list(app.query("AppHeader"))), 1)
-                self.assertEqual(len(list(app.query("HeaderIcon"))), 0)
-                self.assertEqual(len(list(app.query("HeaderClock"))), 1)
-                self.assertEqual(app.query_one("#app-header-title", Static).content, "Marketplace Tools")
+                self.assertEqual(len(list(app.query("#tabs .nav-tab"))), 3)
+                self.assertEqual(app.query_one("#tab-settings", Static).content, "⚙")
+                self.assertEqual(app.query_one("#tab-settings").styles.width.value, 2)
+                self.assertEqual(app.query_one("#tab-settings").styles.margin.right, 5)
+                self.assertNotIn("Settings", [str(tab.content) for tab in app.query("#tabs .nav-tab")])
                 self.assertEqual(app.query_one("#brand", Static).content, "Marketplace Tools")
                 self.assertEqual(app.query_one("#build-info", Static).content, f"v{APP_VERSION}")
                 self.assertLessEqual(
                     len(str(app.query_one("#build-info", Static).content)),
                     int(len(f"build v{APP_VERSION}") * 0.7),
                 )
-                self.assertNotIn("BETA", str(app.query_one("#app-header-title", Static).content))
                 self.assertNotIn("BETA", str(app.query_one("#brand", Static).content))
-                await pilot.click("#app-header")
-                self.assertFalse(app.query_one("#app-header").has_class("-tall"))
+                self.assertTrue(app.query_one("#tab-dashboard").has_class("nav-tab-active"))
+                self.assertTrue(app.query_one("#tab-dashboard").styles.text_style.bold)
+                self.assertFalse(app.query_one("#tab-dashboard").styles.text_style.underline)
                 self.assertEqual(app.query_one("#banner").render(), BANNER_ART)
-                self.assertTrue(app.query_one("#banner").display)
-                self.assertFalse(app.query_one("#screen-title").display)
-                await pilot.press("1")
+                self.assertTrue(app.query_one("#welcome-card").display)
+                await pilot.press("s")
                 self.assertEqual(app.current_view, "settings")
-                self.assertFalse(app.query_one("#banner").display)
-                self.assertTrue(app.query_one("#screen-title").display)
-                self.assertEqual(app.query_one("#screen-title", Static).content, "App Settings")
+                self.assertFalse(app.query_one("#welcome-card").display)
+                self.assertTrue(app.query_one("#tab-settings").has_class("nav-tab-active"))
+                self.assertFalse(app.query_one("#tab-dashboard").has_class("nav-tab-active"))
                 self.assertEqual(app.query_one("#settings-danger-card").border_title, "Danger zone")
                 self.assertIn("Update", str(app.query_one("#settings-update", Static).render()))
                 self.assertEqual(len(list(app.query(".stats-tile"))), 2)
@@ -5721,21 +5728,32 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("2")
                 self.assertEqual(app.current_view, "wallet")
                 self.assertIn(("wallet", "Inventory"), app.NAV_ITEMS)
-                self.assertEqual(app.query_one("#screen-title", Static).content, "Marketplace Inventory")
+                self.assertTrue(app.query_one("#tab-wallet").has_class("nav-tab-active"))
                 await pilot.press("3")
                 self.assertEqual(app.current_view, "stats")
                 self.assertEqual(len(list(app.query("#stats-output"))), 0)
                 self.assertEqual(len(list(app.query(".stats-tile"))), 4)
                 await pilot.press("escape")
                 self.assertEqual(app.current_view, "dashboard")
-                self.assertTrue(app.query_one("#banner").display)
+                self.assertTrue(app.query_one("#welcome-card").display)
+                await pilot.press("1")
+                self.assertEqual(app.current_view, "dashboard")
+                await pilot.click("#tab-settings")
+                await pilot.pause()
+                self.assertEqual(app.current_view, "settings")
+                self.assertTrue(app.query_one("#tab-settings").has_class("nav-tab-active"))
+                await pilot.click("#tab-stats")
+                await pilot.pause()
+                self.assertEqual(app.current_view, "stats")
+                self.assertTrue(app.query_one("#tab-stats").has_class("nav-tab-active"))
 
     async def test_dashboard_banner_shows_when_terminal_is_large_enough(self):
         app = self.make_app()
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(150, 45)):
                 self.assertEqual(app.current_view, "dashboard")
-                self.assertTrue(app.query_one("#banner").display)
+                self.assertTrue(app.query_one("#welcome-card").display)
+                self.assertEqual(app.query_one("#banner").render(), BANNER_ART)
 
     async def test_dashboard_content_remains_scrollable(self):
         app = self.make_app()
@@ -5746,7 +5764,10 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.query_one("#content").styles.scrollbar_size_vertical, 1)
                 self.assertEqual(app.query_one("#content").styles.scrollbar_color, Color(52, 52, 52))
                 self.assertGreaterEqual(app.query_one("#event-log").size.height, 6)
-                self.assertLessEqual(app.query_one("#sidebar").region.width, 23)
+                self.assertEqual(app.query_one("#topbar").region.y, 0)
+                self.assertEqual(app.query_one("#statusbar").styles.height.value, 1)
+                self.assertEqual(app.query_one("#statusbar").styles.background, Color(16, 16, 16))
+                self.assertEqual(len(list(app.query("#sidebar"))), 0)
                 self.assertEqual(app.query_one("#event-log").styles.border_title_color, Color(216, 211, 200))
                 self.assertEqual(app.query_one("#event-log").styles.scrollbar_color, Color(52, 52, 52))
                 self.assertEqual(app.query_one("#event-log").styles.scrollbar_size_vertical, 1)
@@ -5915,7 +5936,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
-                await pilot.press("1")
+                await pilot.press("s")
                 self.assertEqual(app.current_view, "settings")
                 self.assertEqual(len(list(app.query("#clear-saved-session"))), 1)
                 self.assertIsInstance(app.query_one("#clear-saved-session"), ModalAction)
@@ -5952,7 +5973,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
             return_value=result,
         ):
             async with app.run_test(size=(100, 36)) as pilot:
-                await pilot.press("1")
+                await pilot.press("s")
                 await app.check_for_updates_from_settings()
 
                 self.assertEqual(
@@ -6001,8 +6022,22 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("2/4 bought", rendered_tiles)
                 self.assertIn("50%", rendered_tiles)
                 self.assertIn("1.5B silver", rendered_tiles)
-                self.assertIs(app.query_one("#tile-session").parent, app.query_one("#dashboard-monitor-column"))
-                self.assertIs(app.query_one("#tile-buy-delay").parent, app.query_one("#dashboard-delay-column"))
+                self.assertIn("Cap: ∞", rendered_tiles)
+                footer_state = str(app.query_one("#status-state", Static).render())
+                self.assertIn("cap", footer_state)
+                self.assertIn("∞", footer_state)
+                self.assertNotIn("silver", footer_state)
+                app.task_manager.max_spend = 10_000_000_000
+                app.refresh_live_widgets()
+                footer_state = str(app.query_one("#status-state", Static).render())
+                self.assertIn("10B", footer_state)
+                self.assertNotIn("silver", footer_state)
+                app.task_manager.max_spend = None
+                app.refresh_live_widgets()
+                self.assertIs(app.query_one("#tile-session").parent, app.query_one("#dashboard-primary-tiles"))
+                self.assertIs(app.query_one("#tile-buy-delay").parent, app.query_one("#dashboard-primary-tiles"))
+                self.assertIs(app.query_one("#tile-monitor").parent, app.query_one("#dashboard-secondary-tiles"))
+                self.assertEqual(app.query_one("#tile-session").styles.height.value, 3)
 
                 await pilot.click("#tile-monitor")
                 await pilot.pause()
@@ -6103,7 +6138,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
             return_value=STEAM_BROWSER_MODE,
         ):
             async with app.run_test(size=(100, 36)) as pilot:
-                await pilot.press("1")
+                await pilot.press("s")
                 self.assertEqual(len(list(app.query("#account-mode-select"))), 0)
                 self.assertEqual(len(list(app.query("#save-settings"))), 0)
 
@@ -6366,7 +6401,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("2")
                 self.assertEqual(app.current_view, "wallet")
                 self.assertIn(("wallet", "Inventory"), app.NAV_ITEMS)
-                self.assertEqual(app.query_one("#screen-title", Static).content, "Marketplace Inventory")
+                self.assertTrue(app.query_one("#tab-wallet").has_class("nav-tab-active"))
                 self.assertIn("WIP", str(app.query_one("#wallet-wip-note", Static).content))
                 self.assertEqual(app.query_one("#wallet-wip-note", Static).styles.margin.top, 1)
                 self.assertIsInstance(app.query_one("#refresh-wallet"), ModalAction)
@@ -6423,7 +6458,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
                 event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
                 self.assertIn("Persistent event before navigation.", event_text)
 
-                await pilot.press("1")
+                await pilot.press("s")
                 self.assertEqual(app.current_view, "settings")
                 await pilot.press("escape")
                 self.assertEqual(app.current_view, "dashboard")
@@ -6564,7 +6599,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
-                await pilot.press("1")
+                await pilot.press("s")
                 self.assertEqual(app.current_view, "settings")
                 self.assertFalse(app.is_test_mode)
 
@@ -6619,7 +6654,7 @@ class TextualAppTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
             async with app.run_test(size=(100, 36)) as pilot:
-                await pilot.press("1")
+                await pilot.press("s")
                 rendered = str(app.query_one("#settings-storage-facts", Static).render())
                 cache_input = app.query_one("#settings-cache-threshold-input", Input)
                 cache_input_value = cache_input.value

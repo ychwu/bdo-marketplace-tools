@@ -66,6 +66,20 @@ class LogFilterOption(Static):
         self.post_message(self.Pressed(self))
 
 
+class NavTab(Static):
+    class Pressed(Message):
+        def __init__(self, tab: "NavTab") -> None:
+            super().__init__()
+            self.tab = tab
+
+    def __init__(self, key: str, label: str) -> None:
+        super().__init__(label, id=f"tab-{key}", classes="nav-tab")
+        self.key = key
+
+    def on_click(self) -> None:
+        self.post_message(self.Pressed(self))
+
+
 
 class DashboardTile(Static, can_focus=True):
     BINDINGS = [

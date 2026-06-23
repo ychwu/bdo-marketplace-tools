@@ -10,7 +10,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Input, Label, ListItem, ListView, RichLog, Select, Static, Switch
+from textual.widgets import Button, Input, Label, RichLog, Select, Static, Switch
 
 from bdo_marketplace_tools.market.api_handler import marketplace_silver_balance
 from bdo_marketplace_tools.market.test_mode import SINGLE_ITEM_TEST_TARGET
@@ -49,13 +49,19 @@ from bdo_marketplace_tools.ui.modals import (
     SessionRefreshConfirmScreen,
     SpendCapModal,
 )
-from bdo_marketplace_tools.ui.theme import BANNER_ART, DEFAULT_THEME, STATUS_DOT, STATUS_STYLES, TEST_LOG_MESSAGES
+from bdo_marketplace_tools.ui.theme import (
+    BANNER_ART,
+    DEFAULT_THEME,
+    STATUS_DOT,
+    STATUS_STYLES,
+    TEST_LOG_MESSAGES,
+)
 from bdo_marketplace_tools.ui.widgets import (
-    AppHeader,
     CredentialActionTile,
     DashboardTile,
     LogFilterOption,
     ModalAction,
+    NavTab,
     PollingPresetTile,
     SteamSetupTile,
 )
@@ -72,47 +78,117 @@ class MarketplaceToolsApp(App[None]):
         height: 1fr;
     }
 
-    #sidebar {
-        width: 23;
-        min-width: 20;
+    #topbar {
+        dock: top;
+        height: 2;
         background: #171717;
-        border-right: solid __COLOR_BRAND__;
-        padding: 1 1 0 1;
+        border-bottom: solid __COLOR_BRAND__;
+        padding: 0 2;
     }
 
     #brand {
+        width: auto;
         color: __COLOR_BRAND__;
         text-style: bold;
-        margin-bottom: 1;
+        margin-right: 0;
+        content-align: left middle;
+    }
+
+    #tabs {
+        width: auto;
+        height: 1;
+    }
+
+    .nav-tab {
+        width: auto;
+        height: 1;
+        margin: 0 2;
+        color: __COLOR_TEXT_MUTED__;
+        content-align: center middle;
+    }
+
+    .nav-tab:hover {
+        color: __COLOR_BRAND__;
+    }
+
+    .nav-tab-active {
+        color: __COLOR_BRAND__;
+        text-style: bold;
+    }
+
+    #tab-settings {
+        width: 2;
+        height: 1;
+        margin: 0 5 0 1;
+        color: __COLOR_TEXT_MUTED__;
+        content-align: center middle;
+    }
+
+    #tab-settings:hover {
+        color: __COLOR_BRAND__;
+        background: #242424;
+    }
+
+    #tab-settings.nav-tab-active {
+        color: __COLOR_BRAND__;
+        background: #1e1e1e;
+        text-style: bold;
+    }
+
+    #topbar-spacer {
+        width: 1fr;
+    }
+
+    #header-session {
+        width: auto;
+        margin-left: 2;
+        content-align: right middle;
+    }
+
+    #build-info {
+        width: auto;
+        margin-left: 2;
+        color: __COLOR_TEXT_MUTED__;
+        text-style: dim;
+        content-align: right middle;
+    }
+
+    #main {
+        height: 1fr;
+        padding: 0 2;
+    }
+
+    #welcome-card {
+        height: auto;
+        border: round #3a3a3a;
+        padding: 0 1;
+        margin: 1 0;
     }
 
     #banner {
         height: 12;
         color: __COLOR_BRAND__;
         text-style: bold;
+        content-align: center middle;
         overflow: hidden;
-        margin-bottom: 1;
     }
 
-    #nav {
-        height: auto;
-        margin-bottom: 1;
-    }
-
-    #sidebar-spacer {
-        height: 1fr;
-    }
-
-    #build-info {
-        height: 1;
+    #welcome-footer {
+        height: 2;
         color: __COLOR_TEXT_MUTED__;
-        text-style: dim;
+        content-align: center middle;
+        border-top: solid #2b2b2b;
+    }
+
+    #body {
+        height: 1fr;
     }
 
     #test-controls {
+        width: 26;
+        min-width: 22;
         height: 1fr;
-        min-height: 6;
-        margin-top: 1;
+        margin-left: 1;
         overflow-y: auto;
     }
 
@@ -124,9 +200,23 @@ class MarketplaceToolsApp(App[None]):
         content-align: left middle;
     }
 
-    #main {
+    #statusbar {
+        dock: bottom;
+        height: 1;
+        background: #101010;
+        padding: 0 1;
+    }
+
+    #status-keys {
         width: 1fr;
-        padding: 0 2;
+        color: __COLOR_TEXT_MUTED__;
+        content-align: left middle;
+    }
+
+    #status-state {
+        width: auto;
+        color: __COLOR_TEXT_MUTED__;
+        content-align: right middle;
     }
 
     .screen-heading {
@@ -195,64 +285,51 @@ class MarketplaceToolsApp(App[None]):
 
     #dashboard-panel {
         height: auto;
-        margin-bottom: 1;
+        margin-bottom: 0;
     }
 
     #dashboard-tiles {
-        height: 8;
-    }
-
-    #dashboard-action-tiles {
-        width: 1fr;
-        height: 8;
-        margin-right: 1;
-    }
-
-    #dashboard-info-tiles {
-        width: 21;
-        height: 8;
+        height: 7;
     }
 
     .dashboard-tile-row {
-        height: 4;
+        height: 3;
+        padding-left: 2;
     }
 
-    .dashboard-tile-column {
-        width: 1fr;
-        height: 8;
+    #dashboard-primary-tiles {
+        margin-bottom: 1;
     }
 
     .dashboard-tile {
-        width: 1fr;
-        height: 4;
-        min-width: 10;
-        margin-right: 1;
+        width: 23;
+        height: 3;
+        min-width: 13;
+        margin: 0 1 1 0;
         padding: 0 1;
-        content-align: center middle;
-        border-title-align: center;
+        content-align: left middle;
+    }
+
+    .dashboard-tile-gap {
+        width: 1fr;
+        min-width: 2;
     }
 
     .tile-clickable {
-        border: round #d8d3c8;
-        border-title-color: #d8d3c8;
-        border-title-style: bold;
+        background: #262626;
         color: #d8d3c8;
     }
 
     .tile-clickable:hover {
-        border: round __COLOR_BRAND__;
-        border-title-color: __COLOR_BRAND__;
+        background: #333231;
     }
 
     .tile-clickable:focus {
-        border: round __COLOR_BRAND__;
-        border-title-color: __COLOR_BRAND__;
+        background: #333231;
     }
 
     .tile-muted {
-        border: round #2b2b2b;
-        border-title-color: #777777;
-        border-title-style: bold;
+        background: #151515;
         color: #777777;
     }
 
@@ -275,6 +352,7 @@ class MarketplaceToolsApp(App[None]):
 
     #event-log-toolbar {
         height: 1;
+        margin-top: 0;
         margin-bottom: 0;
         align-horizontal: right;
     }
@@ -460,10 +538,11 @@ class MarketplaceToolsApp(App[None]):
     Button {
         margin-right: 1;
     }
-    """.replace("__COLOR_BRAND__", COLOR_BRAND).replace("__COLOR_TEXT_MUTED__", COLOR_TEXT_MUTED).replace("__COLOR_ERROR__", COLOR_ERROR)
+    """.replace("__COLOR_BRAND__", COLOR_BRAND).replace("__COLOR_TEXT_MUTED__", COLOR_TEXT_MUTED).replace("__COLOR_ERROR__", COLOR_ERROR).replace("__COLOR_CAUTION__", COLOR_CAUTION)
 
     BINDINGS = [
         Binding("escape", "show_dashboard", "Dashboard"),
+        Binding("space", "toggle_monitor", "Start/Stop", show=False),
         Binding("q", "quit_app", "Quit"),
         Binding("ctrl+c", "quit_app", "Quit", show=False),
     ]
@@ -481,11 +560,18 @@ class MarketplaceToolsApp(App[None]):
     }
 
     NUMBER_NAV = {
-        "1": "settings",
+        "1": "dashboard",
         "2": "wallet",
         "3": "stats",
+        "s": "settings",
         "4": "exit",
     }
+
+    TAB_ITEMS = [
+        ("dashboard", "Dashboard"),
+        ("wallet", "Inventory"),
+        ("stats", "Stats"),
+    ]
 
     def __init__(self, task_manager, api_handler, launch_mode: str = "live") -> None:
         super().__init__()
@@ -502,18 +588,24 @@ class MarketplaceToolsApp(App[None]):
         self._syncing_controls = False
 
     def compose(self) -> ComposeResult:
-        yield AppHeader(id="app-header")
-        with Horizontal(id="shell"):
-            with Vertical(id="sidebar"):
-                yield Static(APP_TITLE, id="brand")
-                yield ListView(
-                    *[
-                        ListItem(Label(label), id=f"nav-{key}")
-                        for key, label in self.NAV_ITEMS
-                    ],
-                    id="nav",
-                )
-                if self.is_test_mode:
+        with Horizontal(id="topbar"):
+            yield Static(APP_TITLE, id="brand")
+            settings_gear = NavTab("settings", "⚙")
+            settings_gear.add_class("settings-gear")
+            yield settings_gear
+            with Horizontal(id="tabs"):
+                for key, label in self.TAB_ITEMS:
+                    yield NavTab(key, label)
+            yield Static("", id="topbar-spacer")
+            yield Static("", id="header-session")
+            yield Static(f"v{APP_VERSION}", id="build-info")
+        with Vertical(id="main"):
+            with Vertical(id="welcome-card"):
+                yield Static(BANNER_ART, id="banner")
+                yield Static("", id="welcome-footer")
+            if self.is_test_mode:
+                with Horizontal(id="body"):
+                    yield Container(id="content")
                     with VerticalScroll(id="test-controls"):
                         yield Button("Add Test Log", id="add-test-log", compact=True)
                         yield Button("Toggle Test Session", id="toggle-test-session", compact=True)
@@ -530,13 +622,11 @@ class MarketplaceToolsApp(App[None]):
                         yield Button("Stop Test Scan", id="stop-test-monitor", compact=True)
                         yield Button("Fake Detection", id="fake-detection", compact=True)
                         yield Button("Fake Buy Success", id="fake-buy-success", compact=True)
-                else:
-                    yield Static("", id="sidebar-spacer")
-                yield Static(f"v{APP_VERSION}", id="build-info")
-            with Vertical(id="main"):
-                yield Static(BANNER_ART, id="banner")
-                yield Static("", id="screen-title", classes="screen-heading")
+            else:
                 yield Container(id="content")
+        with Horizontal(id="statusbar"):
+            yield Static("", id="status-keys")
+            yield Static("", id="status-state")
 
     @property
     def is_test_mode(self) -> bool:
@@ -547,7 +637,13 @@ class MarketplaceToolsApp(App[None]):
         return bool(getattr(self.task_manager, "simulated_session_enabled", False))
 
     async def on_mount(self) -> None:
-        self.query_one("#nav", ListView).index = 0
+        keys = Text()
+        for cap, label in (("space", "Start/Stop"), ("esc", "Dashboard"), ("1-3", "Tabs"), ("q", "Quit")):
+            if len(keys):
+                keys.append("  ", style="#555555")
+            keys.append(f" {cap} ", style="#161616 on #c8b99f")
+            keys.append(f" {label}", style="#8f8f8f")
+        self.query_one("#status-keys", Static).update(keys)
         await self.show_view("dashboard")
         self.set_interval(1, self.refresh_live_widgets)
         self.run_worker(self.startup_update_check(), name="startup-update-check", group="updates")
@@ -569,10 +665,9 @@ class MarketplaceToolsApp(App[None]):
             event.stop()
             await self.handle_nav(target)
 
-    async def on_list_view_selected(self, event: ListView.Selected) -> None:
-        item_id = event.item.id or ""
-        if item_id.startswith("nav-"):
-            await self.handle_nav(item_id.removeprefix("nav-"))
+    async def on_nav_tab_pressed(self, event: NavTab.Pressed) -> None:
+        event.stop()
+        await self.handle_nav(event.tab.key)
 
     async def handle_nav(self, target: str) -> None:
         if target == "login":
@@ -622,37 +717,27 @@ class MarketplaceToolsApp(App[None]):
         content = self.query_one("#content", Container)
         await content.remove_children()
 
-        title = self.VIEW_TITLES.get(view_name, dict(self.NAV_ITEMS).get(view_name, "Dashboard"))
-        self.query_one("#screen-title", Static).update(title)
         self.update_chrome_visibility()
 
         if view_name == "dashboard":
-            dashboard_tiles = Horizontal(
+            dashboard_tiles = Vertical(
                 Horizontal(
-                    Vertical(
-                        DashboardTile("monitor", "Monitor"),
-                        DashboardTile("session", "Session"),
-                        id="dashboard-monitor-column",
-                        classes="dashboard-tile-column",
-                    ),
-                    Vertical(
-                        DashboardTile("spent", "Spent"),
-                        DashboardTile("credentials", "Credentials"),
-                        id="dashboard-account-column",
-                        classes="dashboard-tile-column",
-                    ),
-                    Vertical(
-                        DashboardTile("polling", "Polling"),
-                        DashboardTile("buy-delay", "Buy Delay"),
-                        id="dashboard-delay-column",
-                        classes="dashboard-tile-column",
-                    ),
-                    id="dashboard-action-tiles",
-                ),
-                Vertical(
+                    DashboardTile("session", "Session"),
+                    DashboardTile("spent", "Spent"),
+                    DashboardTile("buy-delay", "Buy Delay"),
+                    Static("", classes="dashboard-tile-gap"),
                     DashboardTile("success", "Success Rate", interactive=False),
+                    id="dashboard-primary-tiles",
+                    classes="dashboard-tile-row",
+                ),
+                Horizontal(
+                    DashboardTile("monitor", "Monitor"),
+                    DashboardTile("polling", "Polling"),
+                    DashboardTile("credentials", "Credentials"),
+                    Static("", classes="dashboard-tile-gap"),
                     DashboardTile("runtime", "Runtime", interactive=False),
-                    id="dashboard-info-tiles",
+                    id="dashboard-secondary-tiles",
+                    classes="dashboard-tile-row",
                 ),
                 id="dashboard-tiles",
             )
@@ -775,6 +860,12 @@ class MarketplaceToolsApp(App[None]):
             return mask_email(self.api_handler.email)
         return "No account configured"
 
+    def spend_cap_short_label(self) -> str:
+        cap = self.task_manager.max_spend
+        if cap is None or cap <= 0:
+            return "∞"
+        return format_compact_number(cap)
+
     def dashboard_snapshot(self) -> tuple[str, ...]:
         credential_status, credential_detail, credential_level, _, _ = self.credential_state()
         login_status, _, _ = self.session_status_state()
@@ -788,7 +879,7 @@ class MarketplaceToolsApp(App[None]):
             f"{self.task_manager.session_successful_purchases}/"
             f"{self.task_manager.session_detected_outfits} bought this session"
         )
-        spend_detail = f"Cap: {format_compact_silver(self.task_manager.max_spend)} this session"
+        spend_detail = f"Cap: {self.spend_cap_short_label()} this session"
 
         return (
             credential_status,
@@ -886,9 +977,42 @@ class MarketplaceToolsApp(App[None]):
         return Align.center(body, vertical="middle")
 
     def refresh_dashboard_tiles(self, snapshot: tuple[str, ...]) -> None:
+        tm = self.task_manager
         for tile_key, value, detail, level, show_dot in self.dashboard_tile_data(snapshot):
             tile = self.query_one(f"#tile-{tile_key}", DashboardTile)
-            tile.update(self.tile_renderable(value, detail, level, show_dot, muted=not tile.interactive))
+            muted = not tile.interactive
+            if tile_key == "spent":
+                cap_text = self.spend_cap_short_label()
+                spent_text = format_compact_number(tm.session_silver_spent)
+                if spent_text == "0":
+                    spent_text = "0B"
+                value_text = Text(spent_text, style=STATUS_STYLES["info"])
+                value_text.append(f" / {cap_text}", style="#777777")
+            elif tile_key == "success":
+                value_text = Text(
+                    f"{tm.session_successful_purchases} / {tm.session_detected_outfits}", style=COLOR_INFO
+                )
+                value_text.append(" · ", style="#777777")
+                value_text.append(value, style=STATUS_STYLES.get(level, f"bold {COLOR_INFO}"))
+            elif level == "muted":
+                value_text = Text(value, style="dim #aaaaaa")
+            else:
+                value_text = self.status_text(value, level, show_dot=show_dot)
+            tile.update(self.dashboard_chip(str(tile.border_title), value_text, muted))
+
+    def dashboard_chip(self, title: str, value_text: Text, muted: bool) -> RenderableType:
+        label_text = Text(title, style="#6f6f6f" if muted else "bold #8f8f8f")
+        body = Table.grid(expand=True)
+        if muted:
+            body.add_column(justify="center")
+            body.add_row(label_text)
+            body.add_row(value_text)
+        else:
+            body.add_column(justify="left", ratio=1)
+            body.add_column(justify="right")
+            body.add_row(label_text, Text("›", style="#7a7a7a"))
+            body.add_row(value_text, Text(""))
+        return body
 
     def status_table(self, snapshot: tuple[str, ...] | None = None) -> Group:
         snapshot = snapshot or self.dashboard_snapshot()
@@ -941,6 +1065,7 @@ class MarketplaceToolsApp(App[None]):
         return "error"
 
     def refresh_live_widgets(self) -> None:
+        self.refresh_chrome_status()
         if self.current_view == "dashboard":
             try:
                 snapshot = self.dashboard_snapshot()
@@ -958,20 +1083,61 @@ class MarketplaceToolsApp(App[None]):
         elif self.current_view == "stats":
             self.refresh_stats()
 
+    def refresh_chrome_status(self) -> None:
+        tm = self.task_manager
+        try:
+            session_label, _detail, session_level = self.session_status_state()
+            session_text = Text()
+            session_style = STATUS_STYLES.get(session_level, f"bold {COLOR_TEXT_MUTED}")
+            session_text.append(f"{STATUS_DOT} ", style=session_style)
+            session_text.append(session_label, style=session_style)
+            self.query_one("#header-session", Static).update(session_text)
+        except Exception:
+            pass
+
+        running = tm.monitor_running()
+        try:
+            state = Text()
+            state.append(f"{STATUS_DOT} ", style=STATUS_STYLES["success"] if tm.purchase_submission_enabled else "#777777")
+            state.append("Buy mode" if tm.purchase_submission_enabled else "Watch only", style="#8f8f8f")
+            state.append("  ·  cap ", style="#5f5f5f")
+            state.append(self.spend_cap_short_label(), style="#8f8f8f")
+            self.query_one("#status-state", Static).update(state)
+        except Exception:
+            pass
+
+        try:
+            footer = Text()
+            footer.append("Welcome back", style=COLOR_TEXT_MUTED)
+            footer.append("   ·   ", style=COLOR_TEXT_MUTED)
+            if running:
+                footer.append(f"{STATUS_DOT} Running", style=STATUS_STYLES["success"])
+                footer.append("  ·  watching the marketplace", style=COLOR_TEXT_MUTED)
+            else:
+                footer.append(f"{STATUS_DOT} Idle", style="#777777")
+                footer.append("  ·  press space to start the monitor", style=COLOR_TEXT_MUTED)
+            self.query_one("#welcome-footer", Static).update(footer)
+        except Exception:
+            pass
+
     def should_show_banner(self) -> bool:
         size = self.size
-        return self.current_view == "dashboard" and size.width >= 96 and size.height >= 34
+        return self.current_view == "dashboard" and size.width >= 96 and size.height >= 38
 
     def refresh_layout_density(self) -> None:
         try:
-            self.query_one("#banner", Static).display = self.should_show_banner()
+            self.query_one("#welcome-card", Vertical).display = self.should_show_banner()
             self.update_chrome_visibility()
         except Exception:
             pass
 
     def update_chrome_visibility(self) -> None:
-        title = self.query_one("#screen-title", Static)
-        title.display = self.current_view != "dashboard"
+        for key in ("settings", *[item_key for item_key, _label in self.TAB_ITEMS]):
+            try:
+                tab = self.query_one(f"#tab-{key}", NavTab)
+            except Exception:
+                continue
+            tab.set_class(key == self.current_view, "nav-tab-active")
 
     def sync_event_log(self) -> None:
         self.refresh_event_log_filter_controls()
@@ -2576,6 +2742,10 @@ class MarketplaceToolsApp(App[None]):
 
     def action_show_dashboard(self) -> None:
         self.run_worker(self.show_view("dashboard"), name="show-dashboard", group="navigation", exclusive=True)
+
+    async def action_toggle_monitor(self) -> None:
+        if self.current_view == "dashboard" and not isinstance(self.focused, Input):
+            await self.toggle_monitor_from_dashboard()
 
     async def action_quit_app(self) -> None:
         await self.task_manager.stop_checker()
