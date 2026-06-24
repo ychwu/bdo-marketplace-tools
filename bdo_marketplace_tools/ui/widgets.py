@@ -1,38 +1,6 @@
-﻿from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.events import Click
 from textual.message import Message
-from textual.widget import Widget
 from textual.widgets import Static
-from textual.widgets._header import HeaderClock
-
-from bdo_marketplace_tools.ui.display import APP_TITLE
-
-class AppHeader(Widget):
-    DEFAULT_CSS = """
-    AppHeader {
-        dock: top;
-        width: 100%;
-        height: 1;
-        background: $panel;
-        color: $foreground;
-    }
-
-    #app-header-title {
-        width: 100%;
-        content-align: center middle;
-        text-wrap: nowrap;
-        text-overflow: ellipsis;
-    }
-    """
-
-    def compose(self) -> ComposeResult:
-        yield Static(APP_TITLE, id="app-header-title")
-        yield HeaderClock()
-
-    def on_click(self, event: Click) -> None:
-        event.stop()
-
 
 
 class ModalAction(Static):
