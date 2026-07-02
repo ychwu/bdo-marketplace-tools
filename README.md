@@ -59,7 +59,7 @@ This app is currently undergoing a codebase rewrite. Features may be incomplete,
 
 ## Supported Versions
 
-Last verified compatibility: July 14, 2025.
+Last verified compatibility: June 30, 2026.
 
 Pearl Abyss launcher accounts are supported through saved email/password credentials.
 Steam accounts are supported through a visible browser session: choose `Steam Account` in the Credentials dashboard modal, run Steam Initial Setup once, then use `Refresh Session` from the dashboard. Initial setup uses the app-owned browser profile to visit the main Black Desert site, handle required-only cookie consent when available, and open Steam's official login page so you can manually log into Steam. The app only observes local browser state, such as Steam login cookie names or the loaded Store account menu, then closes the browser when Steam login is detected. Steam credentials and OTP values are never stored by the app.
