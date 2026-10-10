@@ -406,6 +406,12 @@ class MarketplaceToolsApp(App[None]):
             )
             await content.mount(event_toolbar)
             await content.mount(Static("", id="event-log-rule"))
+            diagnostics = self.task_manager.event_log.diagnostics
+            if diagnostics is not None:
+                await content.mount(Static(
+                    f"Support reports: {diagnostics.directory} (send the error ZIP file)",
+                    id="diagnostic-folder-hint", markup=False,
+                ))
             await content.mount(event_log)
             self._rendered_events = None
             self.task_manager.mark_alerts_seen()

@@ -205,7 +205,7 @@ class BackgroundTasks:
             if self.persist_ui_settings
             else default_app_settings()["maintenance"]["browser_cache_cleanup_threshold_mb"]
         )
-        self.event_log = EventLog()
+        self.event_log = EventLog(diagnostics=getattr(api_handler, "diagnostics", None))
         self.purchase_submission_enabled = bool(ui_settings["buy_mode"])
         self.buy_mode_resume_pending = False
         self.max_spend = ui_settings["spend_cap"]
@@ -333,7 +333,7 @@ class BackgroundTasks:
                 if attempt < STATS_WRITE_RETRY_LIMIT:
                     await asyncio.sleep(STATS_WRITE_RETRY_DELAY_SECONDS * (attempt + 1))
         detail = str(last_error).strip() or last_error.__class__.__name__
-        self.add_event(f"Stats write failed for {job['label']}: {detail}", "warning")
+        self.add_event(f"Stats write failed for {job['label']}: {detail}", "warning", exception=last_error)
         return False
 
     async def flush_stats_writes(self):
@@ -601,8 +601,8 @@ class BackgroundTasks:
 
     # Event log delegates: storage, rendering, and the classification policy live in
     # services.event_log; these keep the call sites and tests on one façade.
-    def add_event(self, message, level="info", notable=False, divider=None):
-        self.event_log.add(message, level, notable=notable, divider=divider)
+    def add_event(self, message, level="info", notable=False, divider=None, *, exception=None):
+        self.event_log.add(message, level, notable=notable, divider=divider, exception=exception)
 
     @property
     def events(self):

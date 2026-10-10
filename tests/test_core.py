@@ -24,6 +24,7 @@ from bdo_marketplace_tools.market.api_handler import (
     marketplace_silver_balance,
     purchase_result_message,
 )
+from bdo_marketplace_tools.services.diagnostics import DiagnosticRecorder
 from bdo_marketplace_tools.market.browser_auth import (
     BDO_SITE_BOOTSTRAP_URL,
     BrowserAuthError,
@@ -9054,6 +9055,22 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TextualAppTests(unittest.IsolatedAsyncioTestCase):
+    async def test_logs_show_shareable_diagnostic_folder_and_error_path(self):
+        app = self.make_app()
+        directory = app.task_manager.stats_db_path.parent / "diagnostics"
+        app.task_manager.event_log.diagnostics = DiagnosticRecorder(directory)
+        app.task_manager.add_event("Monitor cycle failed: test failure", "error")
+        with patch("bdo_marketplace_tools.ui.app.load_credentials", return_value=(None, None)):
+            async with app.run_test(size=(100, 40)) as pilot:
+                await app.show_view("logs")
+                await pilot.pause()
+                self.assertIn(str(directory), str(app.query_one("#diagnostic-folder-hint", Static).content))
+                event_text = "\n".join(line.text for line in app.query_one("#event-log").lines)
+                self.assertIn("Diagnostic file:", event_text)
+                self.assertIn(".zip", event_text)
+                self.assertGreaterEqual(app.query_one("#event-log").size.height, 6)
+        self.assertEqual(len(list(directory.glob("*.zip"))), 1)
+
     def make_app(self, launch_mode="live"):
         stats_temp = tempfile.TemporaryDirectory()
         self.addCleanup(stats_temp.cleanup)

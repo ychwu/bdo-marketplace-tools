@@ -6,6 +6,7 @@ import stat
 import requests
 
 from bdo_marketplace_tools.market.decoder import unpack
+from bdo_marketplace_tools.services.diagnostics import safe_parameters
 from bdo_marketplace_tools.ui.display import highlight, highlight_silver
 from bdo_marketplace_tools.storage.app_settings import (
     PA_CREDENTIALS_MODE,
@@ -128,7 +129,8 @@ def marketplace_silver_balance(wallet_response):
 
 
 class APIHandler:
-    def __init__(self):
+    def __init__(self, *, diagnostics=None):
+        self.diagnostics = diagnostics
         self.trade_url = TRADE_URL
         self.game_trade_url = GAME_TRADE_URL
         self.session = requests.Session()
@@ -191,14 +193,25 @@ class APIHandler:
         request_kwargs.setdefault("timeout", REQUEST_TIMEOUT)
 
         def send_request():
+            response = None
             try:
                 response = client.request(method, url, **request_kwargs)
+                response._diagnostic_request = {
+                    "method": method, "url": url,
+                    "parameters": safe_parameters(request_kwargs.get("json") or request_kwargs.get("data")),
+                }
                 response.raise_for_status()
                 return response
             except requests.Timeout as exc:
-                raise MarketplaceNetworkError(f"{context} timed out") from exc
+                error = MarketplaceNetworkError(f"{context} timed out")
+                error.__cause__ = exc
+                self._diagnostic_error(error, response=response, method=method, url=url)
+                raise error from exc
             except requests.RequestException as exc:
-                raise MarketplaceNetworkError(f"{context} failed: {exc}") from exc
+                error = MarketplaceNetworkError(f"{context} failed: {exc}")
+                error.__cause__ = exc
+                self._diagnostic_error(error, response=response, method=method, url=url)
+                raise error from exc
 
         return await asyncio.to_thread(send_request)
 
@@ -206,14 +219,29 @@ class APIHandler:
         async with self._session_lock:
             return await self._request(self.session, method, url, context, **kwargs)
 
+    def _diagnostic_error(self, error, *, response=None, method=None, url=None):
+        diagnostics = getattr(self, "diagnostics", None)
+        if diagnostics is not None:
+            path = diagnostics.record(str(error), exception=error, response=response, method=method, url=url)
+            error.diagnostic_path = path
+            if path:
+                error.args = (f"{error} · Diagnostic file: {path}",)
+            else:
+                error.args = (f"{error} · Diagnostic save failed: {diagnostics.last_failure}",)
+
     def _json_response(self, response, context):
         try:
             data = response.json()
         except ValueError as exc:
-            raise MarketplaceResponseError(f"{context} returned invalid JSON") from exc
+            error = MarketplaceResponseError(f"{context} returned invalid JSON")
+            error.__cause__ = exc
+            self._diagnostic_error(error, response=response)
+            raise error from exc
 
         if not isinstance(data, dict):
-            raise MarketplaceResponseError(f"{context} returned an unexpected JSON shape")
+            error = MarketplaceResponseError(f"{context} returned an unexpected JSON shape")
+            self._diagnostic_error(error, response=response)
+            raise error
         return data
 
     async def get_world_market_sublist(self, main_key, *, key_type=0, context=None):
@@ -260,7 +288,11 @@ class APIHandler:
 
         stock = []
         for response, (_category_key, context, _subcategory) in zip(responses, categories):
-            stock.extend(self._parse_world_market_response(response.content, context))
+            try:
+                stock.extend(self._parse_world_market_response(response.content, context))
+            except Exception as exc:
+                await asyncio.to_thread(self._diagnostic_error, exc, response=response)
+                raise
         return stock
 
     def _parse_world_market_response(self, content, context):
@@ -390,7 +422,19 @@ class APIHandler:
                 data=payload,
             )
             response_json = self._json_response(response, "purchase request")
-            result_code = self._purchase_result_code(response_json)
+            try:
+                result_code = self._purchase_result_code(response_json)
+            except MarketplaceResponseError as exc:
+                self._diagnostic_error(exc, response=response)
+                raise
+            diagnostics = getattr(self, "diagnostics", None)
+            if result_code != 0 and diagnostics is not None:
+                path = diagnostics.record(f"Purchase failed: resultCode {result_code}", response=response)
+                summary["events"].append({
+                    "level": "warning",
+                    "message": f"Purchase resultCode {result_code} · Diagnostic file: {path}"
+                    if path else f"Diagnostic save failed: {diagnostics.last_failure}",
+                })
             result_details = self._purchase_result_details(response_json, item_id, price)
             if result_code != 0:
                 result_details["outcome"] = "failed"
@@ -767,7 +811,14 @@ class APIHandler:
             data={"_isCalc": "false"},
         )
         response_json = self._json_response(response, "session refresh")
-        result_code = self._session_refresh_result_code(response_json)
+        try:
+            result_code = self._session_refresh_result_code(response_json)
+        except MarketplaceResponseError as exc:
+            self._diagnostic_error(exc, response=response)
+            raise
+        diagnostics = getattr(self, "diagnostics", None)
+        if result_code != 0 and diagnostics is not None:
+            diagnostics.record(f"Session refresh failed: resultCode {result_code}", response=response)
         return 0 if result_code == 0 else -1
 
     def _session_refresh_result_code(self, response_json):

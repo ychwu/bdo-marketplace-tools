@@ -32,15 +32,18 @@ DIVIDER_RULE_STYLE = "#3a3a3a"
 
 
 class EventLog:
-    def __init__(self, limit=EVENT_LOG_LIMIT):
+    def __init__(self, limit=EVENT_LOG_LIMIT, *, diagnostics=None):
         self.records = deque(maxlen=limit)
         self.unseen_alerts = False
+        self.diagnostics = diagnostics
 
-    def add(self, message, level="info", notable=False, divider=None):
+    def add(self, message, level="info", notable=False, divider=None, *, exception=None):
         # Errors are always notable; everything else opts in at the call site.
         notable = bool(notable) or level == "error"
 
         message = str(message)
+        if self.diagnostics is not None:
+            message = self.diagnostics.event_message(message, level, exception=exception)
         last = self.records[-1] if self.records else None
         if last is not None and last["message"] == message and last["level"] == level:
             last["count"] += 1
