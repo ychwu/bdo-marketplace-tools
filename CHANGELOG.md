@@ -6,6 +6,23 @@ All notable released changes for `bdo-marketplace-tools` are documented here.
 
 No released changes yet.
 
+## 1.4.2-beta - 2026-10-10
+
+### Added
+
+- Added automatic, shareable diagnostic ZIP reports for API transport/parsing failures, failed purchase and session-refresh result codes, handled app errors, exception-backed warnings, and uncaught application/async errors.
+- Added support-report folder information to the Logs tab and exact report paths to handled error messages and failed purchase events.
+
+### Changed
+
+- Error reports now preserve application/Python version, UTC timestamps, exception chains and stack locations, HTTP status, selected response headers, and safe endpoint/request metadata. Stock decoding failures retain the original compressed public response bytes; JSON and public error-page text are redacted, while authenticated non-JSON bodies are omitted. Request headers, cookies, local settings, browser profiles, frame locals, and source text are not collected.
+- Diagnostic storage retains the newest 20 ZIPs, caps each response member at 2 MiB with explicit truncation metadata, and coalesces identical failures with occurrence counts. Developer reports use a separate `diagnostics.test` folder; live reports use `diagnostics` under the per-user data directory.
+- Diagnostic saves are best effort: write failures are surfaced without replacing the original error or stopping monitoring. Successful responses and routine warnings do not create reports.
+
+### Tests
+
+- Added coverage for response preservation, sensitive-field redaction, HTTP failures and timeouts, exception chains, retention and size limits, concurrent/repeated report coalescing, best-effort disk failures, failed purchase reporting, and developer-runtime error capture.
+
 ## 1.4.1-beta - 2026-08-29
 
 ### Added
