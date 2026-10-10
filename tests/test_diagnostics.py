@@ -240,6 +240,26 @@ class DiagnosticApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("Diagnostic file:" in item["message"] for item in result["events"]))
         self.assertEqual(result["purchased"], 0)
 
+    async def test_expected_purchase_rejections_keep_warning_without_diagnostics(self):
+        self.handler.login_status = True
+        self.handler.session = requests.Session()
+        self.handler.session.cookies.set("TradeAuth_Session", "secret")
+        for code, reason in ((30, "an identical order already exists"),
+                             (34, "item was unavailable or would create a duplicate pre-order")):
+            with self.subTest(result_code=code):
+                value = response(json.dumps({"resultCode": code}).encode(), url="https://example.com/GameTradeMarket/BuyItem")
+                self.handler._session_request = AsyncMock(return_value=value)
+                result = await self.handler.buy_item([["10007", "2", "100"]])
+                self.assertEqual(result["attempted"], 1)
+                self.assertEqual(result["purchased"], 0)
+                self.assertEqual(result["results"][0]["result_code"], code)
+                self.assertTrue(any(reason in event["message"] for event in result["events"]))
+                log = EventLog(diagnostics=self.recorder)
+                for event in result["events"]:
+                    log.add(event["message"], event["level"], notable=True)
+                self.assertFalse(any("Diagnostic" in line for line in log.plain_events))
+                self.assertFalse(self.recorder.directory.exists())
+
     async def test_diagnostic_disk_failure_does_not_replace_original_error(self):
         self.recorder.directory.write_text("not a directory")
         self.handler._request = AsyncMock(return_value=response(b"broken"))

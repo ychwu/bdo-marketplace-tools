@@ -428,7 +428,7 @@ class APIHandler:
                 self._diagnostic_error(exc, response=response)
                 raise
             diagnostics = getattr(self, "diagnostics", None)
-            if result_code != 0 and diagnostics is not None:
+            if result_code != 0 and result_code not in ITEM_LOCAL_PURCHASE_RESULT_CODES and diagnostics is not None:
                 path = diagnostics.record(f"Purchase failed: resultCode {result_code}", response=response)
                 summary["events"].append({
                     "level": "warning",

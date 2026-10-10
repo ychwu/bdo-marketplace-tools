@@ -6,6 +6,16 @@ All notable released changes for `bdo-marketplace-tools` are documented here.
 
 No released changes yet.
 
+## 1.4.3-beta - 2026-10-10
+
+### Fixed
+
+- Stopped creating diagnostic ZIPs and extra diagnostic log entries for expected purchase results `30` (identical order already exists) and `34` (item unavailable or duplicate pre-order). Normal purchase warnings and item-local batch continuation remain unchanged, and other failures still produce diagnostic reports.
+
+### Tests
+
+- Added regression coverage confirming both expected purchase results retain their warnings without generating diagnostic files or diagnostic log entries.
+
 ## 1.4.2-beta - 2026-10-10
 
 ### Added
